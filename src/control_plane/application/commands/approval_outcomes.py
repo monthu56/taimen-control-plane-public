@@ -8,7 +8,9 @@ declared actions in order:
 
 * **authority** — every action goes through the ordinary command with an
   ``AuthContext`` rebuilt from the decider's credential snapshot, checked by
-  the same authorizer the API uses. The credential must still be active, and
+  the same authorizer the API uses (for a decision from a channel the
+  snapshot carries the binding's rights, see :func:`decision_authority`).
+  The credential must still be active, and
   what the actions read from the decision context the decider must be able to
   read. An action the decider may not perform fails the outcome (``forbidden``);
 * **idempotency** — ``(approval_id, action_index)`` is the key: an index with
@@ -99,6 +101,7 @@ from control_plane.domain.errors import (
     ValidationError,
 )
 from control_plane.domain.work_item import WorkItemStatusCategory
+from control_plane.infrastructure.auth.iam import SCOPE_READ, SCOPE_WRITE, narrow_permissions
 from control_plane.infrastructure.db.models import (
     ApiKey,
     Approval,
@@ -207,6 +210,33 @@ def authority_snapshot(ctx: AuthContext) -> dict[str, Any]:
         "permissions": sorted(ctx.permissions),
         "iamPrincipalId": str(ctx.iam_principal_id) if ctx.iam_principal_id else None,
     }
+
+
+async def decision_authority(session: AsyncSession, ctx: AuthContext) -> dict[str, Any]:
+    """The authority an outcome of THIS decision runs with.
+
+    Usually the deciding credential itself (:func:`authority_snapshot`). A
+    decision token from a channel (``control-plane:decide``, CP-ADR-0070)
+    can do nothing but decide, so its own permissions would refuse every
+    other declared action; by the owner's decision its outcome runs with the
+    permissions of the human's binding instead, under the ceiling a web
+    session gets (read and write scopes, never ``admin``). The credential
+    stays the binding, so revoking it still stops the outcome at every
+    attempt. The token itself writes nothing beyond the decision: only the
+    actions the task type declares get the wider authority.
+    """
+    snapshot = authority_snapshot(ctx)
+    if ctx.purpose_ref is None or ctx.iam_principal_id is None:
+        return snapshot
+    binding = await session.get(IamPrincipalBinding, ctx.api_key_id)
+    if binding is None or binding.principal_id != ctx.principal_id:
+        return snapshot
+    snapshot["permissions"] = sorted(
+        narrow_permissions(binding.permissions, frozenset({SCOPE_READ, SCOPE_WRITE}))
+    )
+    snapshot["authoritySource"] = "binding"
+    snapshot["channel"] = ctx.channel
+    return snapshot
 
 
 def _decider_context(

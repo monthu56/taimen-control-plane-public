@@ -17,7 +17,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from control_plane.application.authorization import AuthContext, ResourceRef, authorize
 from control_plane.application.commands.approval_outcomes import (
     OUTCOME_PENDING,
-    authority_snapshot,
+    decision_authority,
     declared_actions,
 )
 from control_plane.application.commands.approval_preconditions import require_preconditions
@@ -297,10 +297,11 @@ async def decide_approval(
         approval.comment = comment
     # A gate on a task whose type declares outcomes for this decision: the
     # worker executes them after commit, with the authority of THIS credential
-    # (CP-ADR-0061). Otherwise nothing is pending — as before that ADR.
+    # (CP-ADR-0061), or of its binding for a channel decision (CP-ADR-0070).
+    # Otherwise nothing is pending — as before that ADR.
     if await declared_actions(session, approval):
         approval.outcome_status = OUTCOME_PENDING
-        approval.decision_authority = authority_snapshot(ctx)
+        approval.decision_authority = await decision_authority(session, ctx)
         approval.outcome_next_attempt_at = now
     approval.version += 1
     approval.updated_at = now

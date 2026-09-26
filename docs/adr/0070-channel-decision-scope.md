@@ -1,6 +1,7 @@
 # ADR-0070: Решение из канала — scope `control-plane:decide`, `purpose_ref`, `channel` в событии
 
 Статус: Accepted (2026-09-25), фича `notifications`, задача N005 (TASK-000414).
+Амендмент 2026-09-26 (TASK-000510): исход решения из канала — правами binding.
 Spec/plan — `specs/notifications/` суперпроекта (FR-006, FR-007, SC-004);
 дизайн одобрен владельцем в TASK-000408. Платформенное решение — ADR IAM
 «Канал как способ входа» (N001); токен выпускает IAM (N004,
@@ -67,15 +68,32 @@ purpose_ref = <что решается>, credential_id = id привязки, с
 - Утечка токена канала за его 60 секунд открывает одно решение одного
   approval, и только если человек вправе его принять (права binding и
   организационная пригодность ADR-0018).
-- **Исходы gate-решения (ADR-0061)** снимают полномочия решившего с
-  контекста решения, то есть `{approvals.decide}`. В режимах local/shadow
-  действия исхода, которым нужны другие права (записать задачу, вызвать
-  скилл), падают на проверке прав. Решение при этом остаётся в силе, заводится
-  задача-разбор, и решивший повторяет исход через веб
-  (`:replay-outcome` с полной учёткой). Это осознанный выбор: токен канала
-  не пишет ничего, кроме решения. Если нужно, чтобы исход решения из канала
-  исполнялся с полными правами binding, это отдельное решение владельца
-  (например, снимок прав binding, а не токена).
+- **Исходы gate-решения (ADR-0061)** решения из канала исполняются правами
+  binding человека, а не узким scope токена (амендмент 2026-09-26, решение
+  владельца, сценарий 6 фичи notifications, N009, TASK-000510). Прежде снимок
+  брался с контекста решения, то есть `{approvals.decide}`, и любое действие
+  исхода, которому нужны другие права (`invokeSkill`, `comment`,
+  `transition`), падало `forbidden`; человек повторял исход через веб
+  (`:replay-outcome`). На staging так падало согласование invoice-payment
+  (`notify.send@1`). Теперь:
+  - если решение принято токеном со scope `control-plane:decide`
+    (`purpose_ref` задан), `decision_authority.permissions` — права
+    активного binding этого IAM principal под потолком веб-сессии (scope
+    `read` + `write`: `admin` не переносится, как и у веб-входа без scope
+    `admin`). `credentialId` (binding) и `iamPrincipalId` — прежние;
+  - снимок несёт отметку источника: `authoritySource: "binding"`,
+    `channel: "telegram"` (имя канала из `acr`). У решения из веба и по API
+    key снимок прежний, без этих полей;
+  - `require_active_credential` проверяет binding на каждой попытке, как
+    и раньше: отзыв или отключение binding между решением и попыткой
+    останавливает исход (`forbidden`, `cause: credential_inactive`); право,
+    которого нет у binding, по-прежнему даёт `forbidden`. Привязку канала
+    хранит IAM, ядро её не видит: её отзыв закрывает новые решения из канала
+    (IAM не выпустит токен), а уже записанный исход останавливает только
+    отзыв binding (как для любого IAM-отзыва, ADR-0053);
+  - расширяется **только полномочие исходов, объявленных типом задачи**
+    (ADR-0061): кнопка выбирает решение, а не действия. Сам токен канала
+    по-прежнему не пишет ничего, кроме решения и его комментария (п.1–2).
 - Для bootstrap: audience `control-plane` в IAM должен разрешать scope
   `control-plane:decide` (N009).
 
@@ -87,6 +105,11 @@ purpose_ref = <что решается>, credential_id = id привязки, с
   отклоняется, повтор с ключом — replay. Событие несёт `channel=telegram`,
   прямой вызов — `channel=null`. Токен без `purpose_ref`, токен с лишними
   scope и binding без права получают отказ.
+- `tests/integration/test_iam_enforcement.py` (амендмент 2026-09-26):
+  решение из канала — исход с `invokeSkill` и `comment` исполняется, снимок
+  несёт права binding и `authoritySource`; binding без `skills.invoke` —
+  исход `forbidden`; binding отозван между решением и попыткой — исход не
+  исполняется; веб-решение — снимок токена, без отметки источника.
 - `tests/unit/test_authorizer.py`: контекст с `purpose_ref` не проходит мимо
   своих прав в режимах shadow и policy.
 
@@ -102,5 +125,11 @@ purpose_ref = <что решается>, credential_id = id привязки, с
 - grep: {path: src/control_plane/api/write_flow.py, pattern: 'idempotency_key is None and ctx\.purpose_ref is not None'}
   repo: control-plane
 - grep: {path: tests/integration/test_iam_enforcement.py, pattern: 'def test_channel_token_decides_only_its_own_approval'}
+  repo: control-plane
+- grep: {path: src/control_plane/application/commands/approvals.py, pattern: 'approval\.decision_authority = await decision_authority\(session, ctx\)'}
+  repo: control-plane
+- grep: {path: src/control_plane/application/commands/approval_outcomes.py, pattern: 'snapshot\["authoritySource"\] = "binding"'}
+  repo: control-plane
+- grep: {path: tests/integration/test_iam_enforcement.py, pattern: 'def test_channel_decision_outcome_runs_with_the_binding_rights'}
   repo: control-plane
 ```

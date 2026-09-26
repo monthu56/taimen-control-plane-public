@@ -137,7 +137,8 @@ guard размера и secret scan, что прочие JSON-документы
 непустой список действий для этого решения, ставит
 `approvals.outcome_status = 'pending'`, `outcome_next_attempt_at = now` и
 сохраняет **снимок полномочий решившего** (`decision_authority`: permissions,
-credential, IAM subject) — в той же транзакции, что и решение. Для прочих
+credential, IAM subject; у решения из канала — права binding человека,
+CP-ADR-0070) — в той же транзакции, что и решение. Для прочих
 approval'ов `outcome_status` остаётся `NULL`, и ничего не меняется. Обычный
 (не gate) approval совещательный: тип задачи не может знать, о чём был
 произвольный approval, лишь упоминающий задачу.

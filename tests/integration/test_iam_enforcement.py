@@ -46,6 +46,7 @@ from control_plane.infrastructure.auth.iam import (
     narrow_permissions,
 )
 from control_plane.main import create_app
+from control_plane.worker.main import Worker
 from tests.helpers import BOOTSTRAP_TOKEN, auth, do_bootstrap
 
 ISSUER = "https://iam.test"
@@ -787,3 +788,240 @@ def test_unparsed_path_falls_back_to_the_default_feature() -> None:
     assert feature_for_path("/api/v1/workspaces", "api") == "workspaces"
     assert feature_for_path("/healthz", "api") == "api"
     assert feature_for_path("/", "api") == "api"
+
+
+# --- outcome of a channel decision (CP-ADR-0070, owner's decision N009) --------
+
+# The accountant is told through a skill and the decision is noted on the task:
+# both need rights a decision token does not carry.
+INVOICE_PAYMENT_SCHEMA: dict[str, Any] = {
+    "gates": {
+        "default": {
+            "outcomes": {
+                "approved": [
+                    {"invokeSkill": {"skill": "notify.send@1", "inputs": {"to": "accounting"}}},
+                    {"comment": {"body": "Payment approved: $.approval.comment"}},
+                ]
+            }
+        }
+    }
+}
+PAYER_BINDING = [*DECIDER_BINDING, "skills.invoke"]
+
+
+@pytest.fixture
+async def worker(iam_settings: Settings) -> AsyncIterator[Worker]:
+    instance = Worker(iam_settings)
+    yield instance
+    await instance.engine.dispose()
+
+
+async def _invoice_setup(
+    client: httpx.AsyncClient, engine: Engine, *, permissions: list[str]
+) -> dict[str, Any]:
+    """An invoice-payment task whose gate is assigned to a person bound in IAM."""
+    result, iam_principal, iam_tenant = await bootstrap_with_binding(
+        client, engine, permissions=permissions
+    )
+    admin_key = result["apiKey"]["key"]
+    person = result["adminPrincipal"]["id"]
+    skill = await client.post(
+        "/api/v1/skills",
+        json={
+            "name": "notify.send",
+            "version": "1",
+            "sideEffects": "none",
+            "riskLevel": "low",
+            "contract": {
+                "inputs": {"type": "object"},
+                "outputs": {"type": "object"},
+                "timeoutSeconds": 10,
+                "idempotency": "natural",
+                "implementation": {"protocol": "local", "entrypoint": "notify:send"},
+            },
+        },
+        headers=auth(admin_key),
+    )
+    assert skill.status_code == 201, skill.text
+    task_type = await client.post(
+        "/api/v1/task-types",
+        json={
+            "key": "invoice-payment",
+            "displayName": "Invoice payment",
+            "approvalSchema": INVOICE_PAYMENT_SCHEMA,
+        },
+        headers=auth(admin_key),
+    )
+    assert task_type.status_code == 201, task_type.text
+    task = (
+        await client.post(
+            "/api/v1/tasks",
+            json={"title": "Pay invoice 42", "typeKey": "invoice-payment"},
+            headers=auth(admin_key),
+        )
+    ).json()
+    approval = await client.post(
+        "/api/v1/approvals",
+        json={"task": task["id"], "assignedPrincipalId": person, "gate": True},
+        headers=auth(admin_key),
+    )
+    assert approval.status_code == 201, approval.text
+    return {
+        "admin_key": admin_key,
+        "person": person,
+        "task": task,
+        "approval": approval.json(),
+        "iam_principal": iam_principal,
+        "iam_tenant": iam_tenant,
+    }
+
+
+async def _decide_from_channel(
+    client: httpx.AsyncClient, key: SigningKey, s: dict[str, Any]
+) -> None:
+    approval_id = s["approval"]["id"]
+    token = _decision_token(key, s["iam_principal"], s["iam_tenant"], approval_id)
+    decided = await client.post(
+        f"/api/v1/approvals/{approval_id}:approve",
+        json={"comment": "ok"},
+        headers={**auth(token), "Idempotency-Key": f"callback-{approval_id}"},
+    )
+    assert decided.status_code == 200, decided.text
+    assert decided.json()["outcomeStatus"] == "pending"
+
+
+def _decision_authority(engine: Engine, approval_id: str) -> dict[str, Any]:
+    with engine.connect() as conn:
+        authority: dict[str, Any] = conn.execute(
+            text("SELECT decision_authority FROM approvals WHERE id = :id"), {"id": approval_id}
+        ).scalar_one()
+    return authority
+
+
+async def _outcome_of(client: httpx.AsyncClient, key: str, approval_id: str) -> dict[str, Any]:
+    response = await client.get(f"/api/v1/approvals/{approval_id}/outcome", headers=auth(key))
+    assert response.status_code == 200, response.text
+    outcome: dict[str, Any] = response.json()
+    return outcome
+
+
+async def test_channel_decision_outcome_runs_with_the_binding_rights(
+    iam_app: FastAPI,
+    iam_client: httpx.AsyncClient,
+    sync_engine: Engine,
+    signing_key: SigningKey,
+    worker: Worker,
+) -> None:
+    enable_iam(iam_app, signing_key)
+    s = await _invoice_setup(iam_client, sync_engine, permissions=PAYER_BINDING)
+    approval_id = s["approval"]["id"]
+
+    await _decide_from_channel(iam_client, signing_key, s)
+    authority = _decision_authority(sync_engine, approval_id)
+    # Same credential and identity as the token; the rights are the binding's
+    # under a web session's ceiling, and the snapshot says where they came from.
+    with sync_engine.connect() as conn:
+        binding_id = conn.execute(
+            text("SELECT id FROM iam_principal_bindings WHERE iam_principal_id = :iam"),
+            {"iam": s["iam_principal"]},
+        ).scalar_one()
+    assert authority["credentialId"] == str(binding_id)
+    assert authority["iamPrincipalId"] == str(s["iam_principal"])
+    assert authority["permissions"] == sorted(PAYER_BINDING)
+    assert (authority["authoritySource"], authority["channel"]) == ("binding", "telegram")
+
+    await worker.run_once()
+
+    outcome = await _outcome_of(iam_client, s["admin_key"], approval_id)
+    assert outcome["outcomeStatus"] == "executed", outcome
+    queued = outcome["actions"][0]["result"]
+    assert queued["skill"] == "notify.send@1"
+    invocation = (
+        await iam_client.get(
+            f"/api/v1/skill-invocations/{queued['invocationId']}", headers=auth(s["admin_key"])
+        )
+    ).json()
+    assert invocation["inputs"] == {"to": "accounting"}
+    comments = (
+        await iam_client.get(
+            f"/api/v1/tasks/{s['task']['id']}/comments", headers=auth(s["admin_key"])
+        )
+    ).json()["items"]
+    assert [(c["body"], c["authorPrincipalId"]) for c in comments] == [
+        ("Payment approved: ok", s["person"])
+    ]
+
+
+async def test_channel_decision_outcome_needs_the_right_on_the_binding(
+    iam_app: FastAPI,
+    iam_client: httpx.AsyncClient,
+    sync_engine: Engine,
+    signing_key: SigningKey,
+    worker: Worker,
+) -> None:
+    """The binding bounds the outcome: without skills.invoke it is still refused."""
+    enable_iam(iam_app, signing_key)
+    s = await _invoice_setup(iam_client, sync_engine, permissions=DECIDER_BINDING)
+
+    await _decide_from_channel(iam_client, signing_key, s)
+    await worker.run_once()
+
+    outcome = await _outcome_of(iam_client, s["admin_key"], s["approval"]["id"])
+    assert outcome["outcomeStatus"] == "failed"
+    failed, rest = outcome["actions"]
+    assert (failed["action"], failed["status"]) == ("invokeSkill", "failed")
+    assert failed["error"]["code"] == "forbidden"
+    assert rest["status"] == "not_executed"
+
+
+async def test_channel_decision_outcome_stops_when_the_binding_is_revoked(
+    iam_app: FastAPI,
+    iam_client: httpx.AsyncClient,
+    sync_engine: Engine,
+    signing_key: SigningKey,
+    worker: Worker,
+) -> None:
+    enable_iam(iam_app, signing_key)
+    s = await _invoice_setup(iam_client, sync_engine, permissions=PAYER_BINDING)
+
+    await _decide_from_channel(iam_client, signing_key, s)
+    with sync_engine.begin() as conn:
+        conn.execute(
+            text(
+                "UPDATE iam_principal_bindings SET status = 'revoked', revoked_at = now() "
+                "WHERE iam_principal_id = :iam"
+            ),
+            {"iam": s["iam_principal"]},
+        )
+    await worker.run_once()
+
+    outcome = await _outcome_of(iam_client, s["admin_key"], s["approval"]["id"])
+    assert outcome["outcomeStatus"] == "failed"
+    error = outcome["actions"][0]["error"]
+    assert (error["code"], error["cause"]) == ("forbidden", "credential_inactive")
+    assert [a["status"] for a in outcome["actions"]] == ["failed", "not_executed"]
+    with sync_engine.connect() as conn:
+        assert conn.execute(text("SELECT count(*) FROM skill_invocations")).scalar() == 0
+
+
+async def test_web_decision_authority_is_the_token_as_before(
+    iam_app: FastAPI, iam_client: httpx.AsyncClient, sync_engine: Engine, signing_key: SigningKey
+) -> None:
+    """Only a decision token is widened; a web session keeps its own snapshot."""
+    enable_iam(iam_app, signing_key)
+    s = await _invoice_setup(iam_client, sync_engine, permissions=PAYER_BINDING)
+    approval_id = s["approval"]["id"]
+    write_only = signing_key.issue(
+        subject=s["iam_principal"], tenant_id=s["iam_tenant"], scopes=[SCOPE_WRITE]
+    )
+
+    decided = await iam_client.post(
+        f"/api/v1/approvals/{approval_id}:approve", headers=auth(write_only)
+    )
+    assert decided.status_code == 200, decided.text
+
+    authority = _decision_authority(sync_engine, approval_id)
+    assert "authoritySource" not in authority
+    assert "channel" not in authority
+    # The write scope alone: the binding's read rights are not carried over.
+    assert authority["permissions"] == sorted(p for p in PAYER_BINDING if not p.endswith(".read"))
