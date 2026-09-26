@@ -85,7 +85,8 @@ Control Plane; official-клиентство не даёт Claude Code ника�
 | `cp_start_run` / `cp_get_run` / `cp_get_run_context` | исполнение |
 | `cp_checkpoint` | durable operational state для resume |
 | `cp_record_action` | audit trail действий/skills |
-| `cp_create_artifact` / `cp_list_artifacts` | результаты работы |
+| `cp_create_artifact` / `cp_list_artifacts` | результаты работы: ссылка, небольшой JSON или локальный файл (`file=`, байты загружаются в ядро, CP-ADR-0072) |
+| `cp_get_artifact_content` | скачать содержимое артефакта — обычно входа текущей задачи (`for_task`) — в локальный файл; небольшой текст ещё и в ответе |
 | `cp_request_approval` / `cp_list_approvals` / `cp_approve` / `cp_reject` | approvals (gate поддерживается) |
 | `cp_suspend_run` | пауза на время ожидания approval |
 | `cp_prepare_handoff` | атомарный checkpoint + suspend + release для смены harness |

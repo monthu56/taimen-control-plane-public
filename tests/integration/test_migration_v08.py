@@ -30,8 +30,8 @@ V08_TYPES = "c8a51d70b394"
 # Second revision of the v0.8 line: custom fields and planned dates (ADR-0049).
 V08_FIELDS = "a1c7e94b2f60"
 # The current head of the chain the v0.8 tests upgrade back to (the last
-# revision adds attention feedback, CP-ADR-0071).
-V08_HEAD = "e8a4c2f6b1d9"
+# revision adds the artifact schema of a task type, CP-ADR-0072).
+V08_HEAD = "c3f8a2d6e1b7"
 # The revision right before attention feedback (CP-ADR-0068 approval workspaces).
 BEFORE_ATTENTION_FEEDBACK = "d2f8b4a6e1c3"
 # Observation dedup keys (CP-ADR-0057) and the revision right before them.

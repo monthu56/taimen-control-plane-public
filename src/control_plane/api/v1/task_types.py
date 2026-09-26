@@ -60,6 +60,7 @@ async def create_task_type(
             context_schema=payload.context_schema,
             instructions=payload.instructions,
             completion_schema=payload.completion_schema,
+            artifact_schema=payload.artifact_schema,
         )
         return 201, dump(TaskTypeOut, task_type)
 

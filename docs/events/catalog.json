@@ -634,10 +634,119 @@
         }
       }
     },
+    "artifact.content_purged": {
+      "entityType": "artifact",
+      "description": "The bytes of an artifact were removed by an administrator; the record stays.",
+      "currentVersion": 1,
+      "versions": {
+        "1": {
+          "schema": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+            "properties": {
+              "artifactId": {
+                "type": "string",
+                "format": "uuid"
+              },
+              "taskId": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "format": "uuid"
+              },
+              "sha256": {
+                "type": "string",
+                "pattern": "^[0-9a-f]{64}$"
+              },
+              "sizeBytes": {
+                "type": "integer"
+              },
+              "reason": {
+                "type": "string",
+                "maxLength": 1000,
+                "description": "Reason given; credential-shaped material redacted, cut to the limit"
+              },
+              "objectDeleted": {
+                "type": "boolean",
+                "description": "False when other artifacts or uploads still need the object"
+              }
+            },
+            "additionalProperties": true,
+            "required": [
+              "artifactId",
+              "objectDeleted",
+              "reason",
+              "sha256",
+              "sizeBytes",
+              "taskId"
+            ]
+          }
+        }
+      }
+    },
+    "artifact.content_read": {
+      "entityType": "artifact",
+      "description": "The bytes of an artifact were handed out (CP-ADR-0072 §5).",
+      "currentVersion": 1,
+      "versions": {
+        "1": {
+          "schema": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+            "properties": {
+              "artifactId": {
+                "type": "string",
+                "format": "uuid"
+              },
+              "taskId": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "format": "uuid"
+              },
+              "forTaskId": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "format": "uuid",
+                "description": "Receiving task when read as its input"
+              },
+              "runId": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "format": "uuid",
+                "description": "The reader's running run on that task, if any"
+              },
+              "sha256": {
+                "type": "string",
+                "pattern": "^[0-9a-f]{64}$"
+              },
+              "sizeBytes": {
+                "type": "integer"
+              }
+            },
+            "additionalProperties": true,
+            "required": [
+              "artifactId",
+              "forTaskId",
+              "runId",
+              "sha256",
+              "sizeBytes",
+              "taskId"
+            ]
+          }
+        }
+      }
+    },
     "artifact.created": {
       "entityType": "artifact",
       "description": "An artifact was recorded.",
-      "currentVersion": 1,
+      "currentVersion": 2,
       "versions": {
         "1": {
           "schema": {
@@ -693,6 +802,142 @@
               "taskId",
               "type",
               "uri"
+            ]
+          }
+        },
+        "2": {
+          "changes": "sizeBytes, mediaType, sha256, contentState, typeVersion (CP-ADR-0072)",
+          "schema": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+            "properties": {
+              "type": {
+                "type": "string"
+              },
+              "name": {
+                "type": "string"
+              },
+              "taskId": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "format": "uuid"
+              },
+              "runId": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "format": "uuid"
+              },
+              "uri": {},
+              "supersedesArtifactId": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "format": "uuid"
+              },
+              "sizeBytes": {
+                "type": [
+                  "integer",
+                  "null"
+                ],
+                "description": "Size of the stored content; null without one"
+              },
+              "mediaType": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "sha256": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "pattern": "^[0-9a-f]{64}$"
+              },
+              "contentState": {
+                "type": "string",
+                "enum": [
+                  "none",
+                  "stored",
+                  "purged"
+                ]
+              },
+              "typeVersion": {
+                "type": [
+                  "integer",
+                  "null"
+                ],
+                "description": "Version of the registered artifact type it was checked against"
+              },
+              "skillInvocationId": {
+                "type": "string",
+                "format": "uuid"
+              },
+              "ruleEvaluationId": {
+                "type": "string",
+                "format": "uuid"
+              },
+              "verificationId": {
+                "type": "string",
+                "format": "uuid"
+              }
+            },
+            "additionalProperties": true,
+            "required": [
+              "contentState",
+              "mediaType",
+              "name",
+              "runId",
+              "sha256",
+              "sizeBytes",
+              "supersedesArtifactId",
+              "taskId",
+              "type",
+              "typeVersion",
+              "uri"
+            ]
+          }
+        }
+      }
+    },
+    "artifact_type.created": {
+      "entityType": "artifact_type",
+      "description": "An artifact type version was created (CP-ADR-0072).",
+      "currentVersion": 1,
+      "versions": {
+        "1": {
+          "schema": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+            "properties": {
+              "key": {
+                "type": "string"
+              },
+              "version": {
+                "type": "integer"
+              },
+              "mediaTypes": {
+                "type": "array"
+              },
+              "maxBytes": {
+                "type": "integer"
+              },
+              "declaresMetadataSchema": {
+                "type": "boolean"
+              }
+            },
+            "additionalProperties": true,
+            "required": [
+              "declaresMetadataSchema",
+              "key",
+              "maxBytes",
+              "mediaTypes",
+              "version"
             ]
           }
         }
@@ -4299,7 +4544,7 @@
     "task_type.created": {
       "entityType": "task_type",
       "description": "A task type version was created (ADR-0048).",
-      "currentVersion": 1,
+      "currentVersion": 2,
       "versions": {
         "1": {
           "schema": {
@@ -4342,6 +4587,66 @@
               "execution",
               "initialStatus",
               "key",
+              "version"
+            ]
+          }
+        },
+        "2": {
+          "changes": "declaresArtifactSchema, inputs, outputs (CP-ADR-0072)",
+          "schema": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+            "properties": {
+              "key": {
+                "type": "string"
+              },
+              "version": {
+                "type": "integer"
+              },
+              "displayName": {
+                "type": "string"
+              },
+              "initialStatus": {},
+              "completionStatus": {},
+              "execution": {},
+              "declaresApprovalOutcomes": {
+                "type": "boolean"
+              },
+              "declaresContextProfile": {
+                "type": "boolean"
+              },
+              "declaresInstructions": {
+                "type": "boolean"
+              },
+              "declaresCompletionWork": {
+                "type": "boolean"
+              },
+              "declaresArtifactSchema": {
+                "type": "boolean"
+              },
+              "inputs": {
+                "type": "integer",
+                "description": "Number of declared artifact inputs"
+              },
+              "outputs": {
+                "type": "integer",
+                "description": "Number of declared artifact outputs"
+              }
+            },
+            "additionalProperties": true,
+            "required": [
+              "completionStatus",
+              "declaresApprovalOutcomes",
+              "declaresArtifactSchema",
+              "declaresCompletionWork",
+              "declaresContextProfile",
+              "declaresInstructions",
+              "displayName",
+              "execution",
+              "initialStatus",
+              "inputs",
+              "key",
+              "outputs",
               "version"
             ]
           }

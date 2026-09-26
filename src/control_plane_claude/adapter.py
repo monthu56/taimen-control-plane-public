@@ -31,11 +31,12 @@ from __future__ import annotations
 import logging
 import os
 import uuid
-from collections.abc import Awaitable
+from collections.abc import Awaitable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from control_plane_agent.inputs import LocalInput
 from control_plane_agent.instructions import (
     build_prompt,
     prompt_file_from_environment,
@@ -57,6 +58,7 @@ from control_plane_claude.cli import (
     write_mcp_config,
 )
 from control_plane_client import ControlPlaneClient, ControlPlaneError
+from control_plane_mcp.environment import MCP_RUN_ENV, MCP_TASK_ENV
 
 logger = logging.getLogger("control_plane_claude")
 
@@ -83,6 +85,10 @@ the branch goes to people, not into a void.
 Your final message is published as the run's summary; your messages and tool
 calls are recorded as a bounded transcript for audit, your hidden reasoning is
 not.
+
+A file that is a result of this task and not part of the code — a document, a
+report — is handed in with `cp_create_artifact(type=..., name=..., file=...)`:
+the file is uploaded to the Control Plane and becomes an artifact of this run.
 """
 
 
@@ -108,6 +114,7 @@ class ClaudeCodeAdapter:
         run: dict[str, Any],
         client: ControlPlaneClient,
         workspace: Workspace | None,
+        inputs: Sequence[LocalInput] | None = None,
     ) -> list[ArtifactSpec]:
         run_id = str(run["id"])
         public_id = str(task.get("publicId") or task["id"])
@@ -121,7 +128,7 @@ class ClaudeCodeAdapter:
         )
 
         await self._narrow_tools()
-        prompt = self._build_prompt(task, await self._context(client, task, run_id))
+        prompt = self._build_prompt(task, await self._context(client, task, run_id), inputs)
         action = await client.record_action(
             run_id,
             action="claude-code.turn",
@@ -145,6 +152,10 @@ class ClaudeCodeAdapter:
                 cwd=cwd,
                 session_id=session_id,
                 resume=resume,
+                # The MCP server the agent starts inherits these: what it
+                # records — artifacts, checkpoints, actions — belongs to this
+                # run. Ids, not credentials; the lease stays with the daemon.
+                env={MCP_TASK_ENV: str(task["id"]), MCP_RUN_ENV: run_id},
                 log_name=public_id,
                 on_event=lambda event: consume_stream_event(recorder, event),
             )
@@ -246,12 +257,18 @@ class ClaudeCodeAdapter:
             return {}
         return context if isinstance(context, dict) else {}
 
-    def _build_prompt(self, task: dict[str, Any], context: dict[str, Any]) -> str:
+    def _build_prompt(
+        self,
+        task: dict[str, Any],
+        context: dict[str, Any],
+        inputs: Sequence[LocalInput] | None = None,
+    ) -> str:
         return build_prompt(
             task,
             context,
             harness_note=SYSTEM_NOTE,
             conventions=read_conventions(self.prompt_file),
+            inputs=inputs,
         )
 
     async def _checkpoint(

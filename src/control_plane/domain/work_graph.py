@@ -27,6 +27,14 @@ from enum import StrEnum
 from typing import Any
 
 from control_plane.domain.approval_outcomes import MAX_INPUT_LENGTH, expressions_in
+from control_plane.domain.artifact_schema import (
+    CONTENT_OPTIONAL,
+    CONTENT_REQUIRED,
+    MAX_OUTPUT_MEDIA_TYPES,
+    TYPE_KEY_RE,
+    ArtifactSchema,
+)
+from control_plane.domain.artifact_type import is_media_pattern
 from control_plane.domain.errors import ValidationError
 from control_plane.domain.project import guard_json_document, reject_secret_material
 from control_plane.domain.redaction import reject_secret_text
@@ -87,7 +95,7 @@ MAX_SPEC_BYTES = 16 * 1024
 INVALID_ACCEPTANCE_SPEC = "invalid_acceptance_spec"
 # Keys a spec of each kind may carry; anything else is refused.
 SPEC_KEYS: dict[str, frozenset[str]] = {
-    CheckKind.DETERMINISTIC: frozenset({"skill", "inputs", "expect"}),
+    CheckKind.DETERMINISTIC: frozenset({"skill", "inputs", "expect", "artifact"}),
     CheckKind.EXTERNAL_STATE: frozenset({"event"}),
     CheckKind.HUMAN: frozenset({"approver", "approverRole"}),
     CheckKind.LLM_JUDGE: frozenset({"approver", "approverRole", "rubric"}),
@@ -100,6 +108,11 @@ CHECK_KIND_RANK: dict[str, int] = {
     CheckKind.HUMAN: 2,
     CheckKind.LLM_JUDGE: 2,
 }
+# What a ``deterministic`` check on an artifact of the task may say (CP-ADR-0072 §9).
+ARTIFACT_SPEC_KEYS = frozenset({"type", "mediaTypes", "content"})
+# Keys of the implicit checks of a task type's required outputs: reserved, an
+# acceptance may not declare one (CP-ADR-0067, amendment 2026-09-26).
+OUTPUT_CHECK_PREFIX = "output."
 # Skill inputs of a check read the task being verified, nothing else.
 SPEC_INPUT_ROOTS = frozenset({"task"})
 
@@ -411,6 +424,13 @@ def normalize_checks(
                 f"{path}.key must match {CHECK_KEY_RE.pattern}",
                 f"{path}.key",
             )
+        if typed_spec and key.startswith(OUTPUT_CHECK_PREFIX):
+            raise _invalid(
+                "invalid_acceptance",
+                f"{path}.key: the prefix {OUTPUT_CHECK_PREFIX!r} is reserved for "
+                "the required outputs of the task type",
+                f"{path}.key",
+            )
         if key in keys:
             raise _invalid("duplicate_check_key", f"{path}.key {key!r} is repeated", f"{path}.key")
         keys.add(key)
@@ -453,7 +473,8 @@ def check_spec(kind: str, spec: dict[str, Any], *, field: str = "spec") -> None:
     * ``deterministic`` — ``{skill: "name@version", inputs?, expect?}``: the
       same call as an approval outcome's ``invokeSkill`` (CP-ADR-0061) —
       inputs may read the task (``$.task.…``), ``expect`` holds the literal
-      output values success requires;
+      output values success requires; or ``{artifact: {type, mediaTypes?,
+      content?}}``: an artifact of the task (CP-ADR-0072 §9) — never both;
     * ``external_state`` — ``{}`` or ``{event: "<observation kind or event
       type>"}``: passed by evidence tied to the check;
     * ``human`` — ``{}``, ``{approver: <principal id>}`` or
@@ -461,13 +482,21 @@ def check_spec(kind: str, spec: dict[str, Any], *, field: str = "spec") -> None:
     * ``llm_judge`` — as ``human``, plus an optional ``rubric`` for the
       person who decides: a model does not close the gate.
 
-    Only the form is checked: whether the skill exists or which side effects
-    it declares is for the application layer, which knows the registry.
+    Only the form is checked: whether the skill or the artifact type exists
+    or which side effects the skill declares is for the application layer,
+    which knows the registries.
     """
     unknown = sorted(set(spec) - SPEC_KEYS[kind])
     if unknown:
         raise _spec_error(field, kind, f"unknown keys for kind {kind!r}: {unknown}")
-    if kind == CheckKind.DETERMINISTIC:
+    if kind == CheckKind.DETERMINISTIC and "artifact" in spec:
+        beside = sorted(set(spec) - {"artifact"})
+        if beside:
+            raise _spec_error(
+                field, kind, f"artifact excludes skill, inputs and expect, got {beside}"
+            )
+        _check_spec_artifact(spec["artifact"], field=f"{field}.artifact", kind=kind)
+    elif kind == CheckKind.DETERMINISTIC:
         skill = spec.get("skill")
         if not isinstance(skill, str) or not PINNED_SKILL_RE.match(skill):
             raise _spec_error(
@@ -512,6 +541,69 @@ def _is_uuid(value: Any) -> bool:
         return str(uuid.UUID(value)) == value.lower()
     except ValueError:
         return False
+
+
+def _check_spec_artifact(value: Any, *, field: str, kind: str) -> None:
+    """``{type, mediaTypes?, content?}``: which artifact of the task passes."""
+    if not isinstance(value, dict):
+        raise _spec_error(field, kind, "artifact must be an object")
+    unknown = sorted(set(value) - ARTIFACT_SPEC_KEYS)
+    if unknown:
+        raise _spec_error(field, kind, f"unknown keys for artifact: {unknown}")
+    type_key = value.get("type")
+    if not isinstance(type_key, str) or not TYPE_KEY_RE.match(type_key):
+        raise _spec_error(f"{field}.type", kind, "type must be an artifact type key")
+    if "mediaTypes" in value:
+        media_types = value["mediaTypes"]
+        if (
+            not isinstance(media_types, list)
+            or not media_types
+            or len(media_types) > MAX_OUTPUT_MEDIA_TYPES
+        ):
+            raise _spec_error(
+                f"{field}.mediaTypes",
+                kind,
+                f"mediaTypes must be a list of 1 to {MAX_OUTPUT_MEDIA_TYPES} media types",
+            )
+        for index, item in enumerate(media_types):
+            if not isinstance(item, str) or not is_media_pattern(item.strip().lower()):
+                raise _spec_error(
+                    f"{field}.mediaTypes[{index}]",
+                    kind,
+                    "must be 'type/subtype', 'type/*' or '*/*'",
+                )
+    if "content" in value and value["content"] not in (CONTENT_REQUIRED, CONTENT_OPTIONAL):
+        raise _spec_error(
+            f"{field}.content",
+            kind,
+            f"content must be {CONTENT_REQUIRED!r} or {CONTENT_OPTIONAL!r}",
+        )
+
+
+def output_checks(schema: ArtifactSchema) -> list[dict[str, Any]]:
+    """The implicit checks of a task type's required outputs, in declared order.
+
+    Every completion runs them first, before the task's own acceptance
+    (CP-ADR-0067, amendment 2026-09-26): a task whose type expects an output
+    is not done without it, whatever its acceptance says.
+    """
+    checks: list[dict[str, Any]] = []
+    for output in schema.outputs:
+        if not output.required:
+            continue
+        artifact: dict[str, Any] = {"type": output.type}
+        if output.media_types is not None:
+            artifact["mediaTypes"] = list(output.media_types)
+        artifact["content"] = output.content
+        checks.append(
+            {
+                "key": f"{OUTPUT_CHECK_PREFIX}{output.key}",
+                "kind": CheckKind.DETERMINISTIC.value,
+                "description": f"Required output {output.key} ({output.type})",
+                "spec": {"artifact": artifact},
+            }
+        )
+    return checks
 
 
 def _check_spec_inputs(value: Any, *, field: str, kind: str) -> None:

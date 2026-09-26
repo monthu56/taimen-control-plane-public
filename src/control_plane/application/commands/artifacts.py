@@ -1,24 +1,181 @@
 """Artifact commands: append-oriented work products.
 
 Artifacts are immutable records (create + read only). Revisions are new
-artifacts; large binaries live in external storage behind ``uri`` — the
-database keeps references and small JSON content, never blobs.
+artifacts. An artifact is handed in as a reference (``uri``), as small JSON
+(``content``) or as bytes in the content store (``contentRef``, CP-ADR-0072):
+the database keeps references, checksums and sizes, never blobs.
+
+Bytes arrive in two steps: ``PUT /artifact-contents`` spools the body to disk
+and stores it as an upload (``artifact_contents``), then ``POST /artifacts``
+references the upload. Objects are shared by content inside a tenant; every
+change of who needs an object — an upload, a reference, a purge, a sweep —
+happens under one advisory lock per (tenant, sha256), so an object is never
+deleted while something is about to point at it.
+
+An artifact whose ``type`` is registered in the tenant is checked against the
+latest version of that type — metadata, and media type and size of stored
+content — and records it (``type_version``, CP-ADR-0072 §6); any other type
+is accepted unchecked, as before the registry.
 """
 
 import uuid
+from dataclasses import dataclass
+from datetime import datetime, timedelta
 from typing import Any
 
-from sqlalchemy import select
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import and_, delete, exists, func, or_, select
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from control_plane.application.authorization import AuthContext, authorize
+from control_plane.application.authorization import (
+    AuthContext,
+    ResourceRef,
+    authorize,
+)
+from control_plane.application.commands._artifact_content import (
+    CONTENT_NONE,
+    CONTENT_PURGED,
+    CONTENT_STORED,
+    artifact_event_fields,
+)
 from control_plane.application.commands._child_ceiling import enforce_run_ceiling
+from control_plane.application.commands.approvals import event_comment
+from control_plane.application.commands.artifact_types import definition_of, latest_artifact_type
 from control_plane.application.commands.relations import resolve_task
+from control_plane.application.commands.task_inputs import is_input_of
 from control_plane.application.common import new_uuid, utcnow
 from control_plane.application.events import record_event
+from control_plane.domain.artifact_type import check_artifact_against_type
 from control_plane.domain.enums import Permission
-from control_plane.domain.errors import NotFoundError, ValidationError
-from control_plane.infrastructure.db.models import Artifact, Run
+from control_plane.domain.errors import (
+    AuthorizationError,
+    ConflictError,
+    DependencyUnavailableError,
+    DomainError,
+    NotFoundError,
+    ValidationError,
+)
+from control_plane.infrastructure.content_store import (
+    ContentObjectMissing,
+    ContentStore,
+    ContentStoreUnavailable,
+    ContentStream,
+    SpooledFile,
+    object_key,
+)
+from control_plane.infrastructure.db.engine import transaction
+from control_plane.infrastructure.db.models import Artifact, ArtifactContent, Run, Task
+
+CONTENT_REF_PREFIX = "cref_"
+
+
+class ContentUnavailableError(DomainError):
+    """The artifact exists but carries no bytes to hand out (404)."""
+
+    http_status = 404
+
+
+class ContentPurgedError(DomainError):
+    """The bytes were there and an administrator removed them (410)."""
+
+    http_status = 410
+
+
+def content_store_unavailable() -> DependencyUnavailableError:
+    return DependencyUnavailableError(
+        "Artifact content store is not configured or not reachable",
+        code="content_store_unavailable",
+    )
+
+
+def require_store(store: ContentStore | None) -> ContentStore:
+    if store is None:
+        raise content_store_unavailable()
+    return store
+
+
+def content_ref(upload_id: uuid.UUID) -> str:
+    return f"{CONTENT_REF_PREFIX}{upload_id}"
+
+
+def _parse_content_ref(ref: str) -> uuid.UUID | None:
+    if not ref.startswith(CONTENT_REF_PREFIX):
+        return None
+    try:
+        return uuid.UUID(ref[len(CONTENT_REF_PREFIX) :])
+    except ValueError:
+        return None
+
+
+def artifact_resource(
+    task_id: uuid.UUID | None, workspace_id: uuid.UUID | None
+) -> ResourceRef | None:
+    """What ``artifacts.*`` is decided on (CP-ADR-0072 §5): the artifact's
+    task, else its workspace, else the tenant (``None``)."""
+    if task_id is not None:
+        return ResourceRef("task", str(task_id))
+    if workspace_id is not None:
+        return ResourceRef("workspace", str(workspace_id))
+    return None
+
+
+async def _lock_content(session: AsyncSession, tenant_id: uuid.UUID, sha256: str) -> None:
+    """Serialize every change of who needs the object (tenant, sha256)."""
+    await session.execute(
+        select(func.pg_advisory_xact_lock(func.hashtextextended(f"cp:ac:{tenant_id}:{sha256}", 0)))
+    )
+
+
+async def _object_needed(
+    session: AsyncSession, tenant_id: uuid.UUID, sha256: str, now: datetime
+) -> bool:
+    """Is the object still referenced by a stored artifact or a live upload?"""
+    stored = exists().where(
+        Artifact.tenant_id == tenant_id,
+        Artifact.sha256 == sha256,
+        Artifact.content_state == CONTENT_STORED,
+    )
+    live_upload = exists().where(
+        ArtifactContent.tenant_id == tenant_id,
+        ArtifactContent.sha256 == sha256,
+        ArtifactContent.expires_at > now,
+    )
+    return bool(await session.scalar(select(or_(stored, live_upload))))
+
+
+# --- create ------------------------------------------------------------------
+
+
+async def _take_upload(session: AsyncSession, ctx: AuthContext, ref: str) -> ArtifactContent:
+    """The caller's own live upload behind ``ref``, locked for referencing.
+
+    Unknown, foreign and expired references fail alike: knowing a checksum or
+    somebody else's reference must not let the caller point at their bytes.
+    """
+    not_found = ValidationError(
+        "content_ref_not_found",
+        "contentRef does not name a live upload of this principal",
+        details={"contentRef": ref},
+    )
+    upload_id = _parse_content_ref(ref)
+    if upload_id is None:
+        raise not_found
+    mine = (
+        ArtifactContent.id == upload_id,
+        ArtifactContent.tenant_id == ctx.tenant_id,
+        ArtifactContent.uploaded_by_principal_id == ctx.principal_id,
+    )
+    sha256 = await session.scalar(select(ArtifactContent.sha256).where(*mine))
+    if sha256 is None:
+        raise not_found
+    await _lock_content(session, ctx.tenant_id, sha256)
+    upload = await session.scalar(
+        select(ArtifactContent)
+        .where(*mine, ArtifactContent.expires_at > utcnow())
+        .with_for_update()
+    )
+    if upload is None:
+        raise not_found
+    return upload
 
 
 async def create_artifact(
@@ -32,14 +189,20 @@ async def create_artifact(
     workspace_id: uuid.UUID | None = None,
     uri: str | None = None,
     content: dict[str, Any] | None = None,
+    content_ref_value: str | None = None,
     metadata: dict[str, Any] | None = None,
     supersedes_artifact_id: uuid.UUID | None = None,
 ) -> Artifact:
-    await authorize(ctx, Permission.ARTIFACTS_WRITE)
     if not type_.strip():
         raise ValidationError("invalid_type", "type must not be empty")
     if not name.strip():
         raise ValidationError("invalid_name", "name must not be empty")
+    if content_ref_value is not None and (content is not None or uri is not None):
+        raise ValidationError(
+            "invalid_artifact_content",
+            "contentRef excludes content and uri",
+            details={"fields": ["contentRef", "content" if content is not None else "uri"]},
+        )
 
     if supersedes_artifact_id is not None:
         superseded = await session.scalar(
@@ -64,7 +227,6 @@ async def create_artifact(
         )
         if run is None:
             raise NotFoundError("Run not found", details={"runId": str(run_id)})
-        await enforce_run_ceiling(session, ctx, run=run, permission=Permission.ARTIFACTS_WRITE)
         if task_id is None:
             task_id = run.task_id
         elif task_id != run.task_id:
@@ -79,6 +241,37 @@ async def create_artifact(
 
         await get_tenant_workspace(session, ctx, workspace_id)
 
+    # Decided on the artifact's task (CP-ADR-0072 §5), before any state changes.
+    await authorize(
+        ctx, Permission.ARTIFACTS_WRITE, resource=artifact_resource(task_id, workspace_id)
+    )
+    if run is not None:
+        await enforce_run_ceiling(session, ctx, run=run, permission=Permission.ARTIFACTS_WRITE)
+
+    now = utcnow()
+    upload: ArtifactContent | None = None
+    if content_ref_value is not None:
+        upload = await _take_upload(session, ctx, content_ref_value)
+
+    type_key = type_.strip()
+    type_version: int | None = None
+    registered = await latest_artifact_type(session, ctx.tenant_id, type_key)
+    if registered is not None:
+        # Media type and size belong to stored content; a reference or small
+        # JSON artifact has neither and is checked on its metadata alone.
+        check_artifact_against_type(
+            definition_of(registered),
+            key=type_key,
+            version=registered.version,
+            metadata=metadata or {},
+            media_type=upload.media_type if upload else None,
+            size_bytes=upload.size_bytes if upload else None,
+        )
+        type_version = registered.version
+
+    if upload is not None and upload.referenced_at is None:
+        upload.referenced_at = now
+
     artifact = Artifact(
         id=new_uuid(),
         tenant_id=ctx.tenant_id,
@@ -86,13 +279,18 @@ async def create_artifact(
         task_id=task_id,
         run_id=run_id,
         created_by_principal_id=ctx.principal_id,
-        type=type_.strip(),
+        type=type_key,
         name=name.strip(),
         uri=uri,
         content=content,
         supersedes_artifact_id=supersedes_artifact_id,
         metadata_json=metadata or {},
-        created_at=utcnow(),
+        content_state=CONTENT_STORED if upload else CONTENT_NONE,
+        size_bytes=upload.size_bytes if upload else None,
+        media_type=upload.media_type if upload else None,
+        sha256=upload.sha256 if upload else None,
+        type_version=type_version,
+        created_at=now,
     )
     session.add(artifact)
     await session.flush()
@@ -118,6 +316,302 @@ async def create_artifact(
             "supersedesArtifactId": (
                 str(supersedes_artifact_id) if supersedes_artifact_id else None
             ),
+            **artifact_event_fields(artifact),
         },
     )
     return artifact
+
+
+# --- upload ------------------------------------------------------------------
+
+
+async def authorize_upload(ctx: AuthContext) -> None:
+    """Uploading needs ``artifacts.write``; the task is checked when an
+    artifact references the upload (CP-ADR-0072 §2)."""
+    await authorize(ctx, Permission.ARTIFACTS_WRITE)
+
+
+async def record_upload(
+    session: AsyncSession,
+    ctx: AuthContext,
+    store: ContentStore,
+    *,
+    spooled: SpooledFile,
+    media_type: str,
+    ttl_seconds: int,
+) -> ArtifactContent:
+    """Store the spooled file (once per content in the tenant) and record the upload."""
+    key = object_key(ctx.tenant_id, spooled.sha256)
+    await _lock_content(session, ctx.tenant_id, spooled.sha256)
+    try:
+        if not await store.exists(key):
+            await store.put(key, spooled.path, spooled.size)
+    except ContentStoreUnavailable as exc:
+        raise content_store_unavailable() from exc
+    now = utcnow()
+    upload = ArtifactContent(
+        id=new_uuid(),
+        tenant_id=ctx.tenant_id,
+        uploaded_by_principal_id=ctx.principal_id,
+        sha256=spooled.sha256,
+        size_bytes=spooled.size,
+        media_type=media_type,
+        storage_key=key,
+        created_at=now,
+        expires_at=now + timedelta(seconds=ttl_seconds),
+        referenced_at=None,
+    )
+    session.add(upload)
+    await session.flush()
+    return upload
+
+
+# --- read --------------------------------------------------------------------
+
+
+async def _read_artifact(
+    session: AsyncSession,
+    ctx: AuthContext,
+    artifact_id: uuid.UUID,
+    for_task_ref: str | None,
+) -> tuple[Artifact, Task | None]:
+    """The artifact and the receiving task it was granted for, if any.
+
+    ``for_task_ref`` (CP-ADR-0072 §5): the artifact is read as an input of
+    that task — allowed with ``tasks.read`` on the receiving task while the
+    artifact is one of its resolved inputs. Otherwise — and without it — the
+    read is decided on the artifact's task. 404 across tenants.
+    """
+    artifact = await session.scalar(
+        select(Artifact).where(Artifact.id == artifact_id, Artifact.tenant_id == ctx.tenant_id)
+    )
+    if artifact is None:
+        raise NotFoundError("Artifact not found", details={"artifactId": str(artifact_id)})
+    if for_task_ref is not None:
+        recipient = await resolve_task(session, ctx, for_task_ref)
+        try:
+            await authorize(
+                ctx, Permission.TASKS_READ, resource=ResourceRef("task", str(recipient.id))
+            )
+        except AuthorizationError:
+            pass
+        else:
+            if await is_input_of(session, ctx.tenant_id, artifact.id, recipient):
+                return artifact, recipient
+    await authorize(
+        ctx,
+        Permission.ARTIFACTS_READ,
+        resource=artifact_resource(artifact.task_id, artifact.workspace_id),
+    )
+    return artifact, None
+
+
+async def get_readable_artifact(
+    session: AsyncSession,
+    ctx: AuthContext,
+    artifact_id: uuid.UUID,
+    *,
+    for_task_ref: str | None = None,
+) -> Artifact:
+    """The artifact if the caller may read it (on its task, or as an input)."""
+    artifact, _ = await _read_artifact(session, ctx, artifact_id, for_task_ref)
+    return artifact
+
+
+@dataclass
+class OpenedContent:
+    artifact: Artifact
+    stream: ContentStream
+
+
+async def open_content(
+    session: AsyncSession,
+    ctx: AuthContext,
+    store: ContentStore | None,
+    artifact_id: uuid.UUID,
+    *,
+    for_task_ref: str | None = None,
+) -> OpenedContent:
+    """Open the bytes of an artifact for the caller and journal the read.
+
+    The object is opened before the event is written: a read the store could
+    not serve leaves no ``artifact.content_read``. The caller streams the
+    result after the transaction commits.
+    """
+    artifact, recipient = await _read_artifact(session, ctx, artifact_id, for_task_ref)
+    if artifact.content_state == CONTENT_NONE:
+        raise ContentUnavailableError(
+            "content_not_found",
+            "Artifact has no stored content",
+            details={"artifactId": str(artifact_id)},
+        )
+    if artifact.content_state == CONTENT_PURGED:
+        raise ContentPurgedError(
+            "content_purged",
+            "Artifact content was purged",
+            details={"artifactId": str(artifact_id)},
+        )
+    assert artifact.sha256 is not None
+    try:
+        stream = await require_store(store).open(object_key(ctx.tenant_id, artifact.sha256))
+    except (ContentStoreUnavailable, ContentObjectMissing) as exc:
+        # A missing object under a stored record is a broken store, not a
+        # missing artifact: the caller may retry once it is repaired.
+        raise content_store_unavailable() from exc
+
+    try:
+        run_id = None
+        # Read as an input, the reader works on the receiving task.
+        run_task_id = recipient.id if recipient is not None else artifact.task_id
+        if run_task_id is not None:
+            run_id = await session.scalar(
+                select(Run.id)
+                .where(
+                    Run.tenant_id == ctx.tenant_id,
+                    Run.task_id == run_task_id,
+                    Run.principal_id == ctx.principal_id,
+                    Run.status == "running",
+                )
+                .order_by(Run.attempt.desc())
+                .limit(1)
+            )
+        await record_event(
+            session,
+            tenant_id=ctx.tenant_id,
+            event_type="artifact.content_read",
+            entity_type="artifact",
+            entity_id=artifact.id,
+            actor_id=ctx.principal_id,
+            request_id=ctx.request_id,
+            correlation_id=ctx.correlation_id,
+            trace_run_id=ctx.trace_run_id,
+            payload={
+                "artifactId": str(artifact.id),
+                "taskId": str(artifact.task_id) if artifact.task_id else None,
+                "forTaskId": str(recipient.id) if recipient is not None else None,
+                "runId": str(run_id) if run_id else None,
+                "sha256": artifact.sha256,
+                "sizeBytes": artifact.size_bytes,
+            },
+        )
+    except BaseException:
+        await stream.aclose()
+        raise
+    return OpenedContent(artifact=artifact, stream=stream)
+
+
+# --- purge -------------------------------------------------------------------
+
+
+async def purge_content(
+    session: AsyncSession,
+    ctx: AuthContext,
+    store: ContentStore | None,
+    artifact_id: uuid.UUID,
+    *,
+    reason: str,
+) -> Artifact:
+    """Remove the bytes of an artifact; the record stays (CP-ADR-0072 §10)."""
+    await authorize(ctx, Permission.ADMIN)
+    artifact = await session.scalar(
+        select(Artifact)
+        .where(Artifact.id == artifact_id, Artifact.tenant_id == ctx.tenant_id)
+        .with_for_update()
+    )
+    if artifact is None:
+        raise NotFoundError("Artifact not found", details={"artifactId": str(artifact_id)})
+    if artifact.content_state == CONTENT_PURGED:
+        return artifact
+    if artifact.content_state != CONTENT_STORED:
+        raise ConflictError(
+            "content_not_stored",
+            "Artifact has no stored content to purge",
+            details={"artifactId": str(artifact_id), "contentState": artifact.content_state},
+        )
+    assert artifact.sha256 is not None and artifact.size_bytes is not None
+    active_store = require_store(store)
+
+    await _lock_content(session, ctx.tenant_id, artifact.sha256)
+    artifact.content_state = CONTENT_PURGED
+    await session.flush()
+    object_deleted = not await _object_needed(session, ctx.tenant_id, artifact.sha256, utcnow())
+    if object_deleted:
+        # Deleted before commit: a store that refuses leaves the record stored.
+        try:
+            await active_store.delete(object_key(ctx.tenant_id, artifact.sha256))
+        except ContentStoreUnavailable as exc:
+            raise content_store_unavailable() from exc
+
+    await record_event(
+        session,
+        tenant_id=ctx.tenant_id,
+        event_type="artifact.content_purged",
+        entity_type="artifact",
+        entity_id=artifact.id,
+        actor_id=ctx.principal_id,
+        request_id=ctx.request_id,
+        correlation_id=ctx.correlation_id,
+        trace_run_id=ctx.trace_run_id,
+        payload={
+            "artifactId": str(artifact.id),
+            "taskId": str(artifact.task_id) if artifact.task_id else None,
+            "sha256": artifact.sha256,
+            "sizeBytes": artifact.size_bytes,
+            "reason": event_comment(reason),
+            "objectDeleted": object_deleted,
+        },
+    )
+    return artifact
+
+
+# --- sweep (worker) ----------------------------------------------------------
+
+
+async def sweep_expired_uploads(
+    session_factory: async_sessionmaker[AsyncSession],
+    store: ContentStore,
+    *,
+    batch: int = 100,
+) -> int:
+    """Drop uploads no artifact referenced before they expired, and the
+    objects nothing needs any more (CP-ADR-0072 §10). Returns uploads removed.
+
+    Each (tenant, sha256) is settled in its own transaction under the content
+    lock; a store that does not answer leaves the rows for the next pass.
+    """
+    now = utcnow()
+    async with transaction(session_factory) as session:
+        keys = (
+            await session.execute(
+                select(ArtifactContent.tenant_id, ArtifactContent.sha256)
+                .where(ArtifactContent.expires_at <= now, ArtifactContent.referenced_at.is_(None))
+                .group_by(ArtifactContent.tenant_id, ArtifactContent.sha256)
+                .limit(batch)
+            )
+        ).all()
+
+    removed = 0
+    for tenant_id, sha256 in keys:
+        try:
+            async with transaction(session_factory) as session:
+                await _lock_content(session, tenant_id, sha256)
+                now = utcnow()
+                result = await session.execute(
+                    delete(ArtifactContent)
+                    .where(
+                        and_(
+                            ArtifactContent.tenant_id == tenant_id,
+                            ArtifactContent.sha256 == sha256,
+                            ArtifactContent.expires_at <= now,
+                            ArtifactContent.referenced_at.is_(None),
+                        )
+                    )
+                    .returning(ArtifactContent.id)
+                )
+                count = len(result.all())
+                if not await _object_needed(session, tenant_id, sha256, now):
+                    await store.delete(object_key(tenant_id, sha256))
+                removed += count
+        except ContentStoreUnavailable:
+            continue
+    return removed

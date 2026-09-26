@@ -22,15 +22,20 @@ control_plane_client.credentials) — never from MCP config or the repository.
 
 import asyncio
 import json
+import mimetypes
 import os
 import re
+import tempfile
+from collections.abc import Mapping
 from importlib import metadata as importlib_metadata
+from pathlib import Path
 from typing import Any
 
 from mcp.server import MCPServer
 from mcp.types import ToolAnnotations
 
 from control_plane_agent.context_pack import render_graph_pack
+from control_plane_agent.inputs import safe_file_name
 from control_plane_client import (
     ControlPlaneClient,
     ControlPlaneError,
@@ -40,6 +45,7 @@ from control_plane_client import (
     find_project_config,
     resolve_credential,
 )
+from control_plane_mcp.environment import MCP_RUN_ENV, MCP_TASK_ENV
 
 HARNESS_CAPABILITIES = [
     "tasks.interactive",
@@ -157,6 +163,27 @@ class _State:
 
 
 STATE = _State()
+
+#: Media types whose content cp_get_artifact_content also returns as text.
+_TEXT_MEDIA_TYPES = re.compile(
+    r"^(text/.+|application/(json|xml|yaml|x-yaml|toml|[a-z0-9.+-]+\+(json|xml)))$"
+)
+_INLINE_TEXT_BYTES = 64 * 1024
+
+
+def adopt_run_from_environment(environ: Mapping[str, str] | None = None) -> None:
+    """Take the task and run a harness adapter started this process for.
+
+    Under a runner the agent's MCP server would otherwise know neither, and
+    what the agent records would belong to no run (``environment.py``). The
+    claim is not adopted: the lifecycle stays with the runner.
+    """
+    env = os.environ if environ is None else environ
+    task = env.get(MCP_TASK_ENV, "").strip()
+    run = env.get(MCP_RUN_ENV, "").strip()
+    if task and run:
+        STATE.task_ref = task
+        STATE.run_id = run
 
 
 async def _start_heartbeats() -> None:
@@ -1760,33 +1787,95 @@ async def cp_prepare_handoff(
 @mcp.tool(
     description=(
         "Register a work product (git commit, PR, file, document, report) as a "
-        "Control Plane artifact. Lightweight reference: uri + metadata, no blobs. "
-        "file:// URIs are only meaningful in this environment."
+        "Control Plane artifact of the current task and run, in one of three "
+        "forms: a reference (uri + metadata), a small JSON 'content', or a local "
+        "'file' whose bytes are uploaded to the Control Plane (any media type, "
+        "e.g. a document that is a declared output of the task). 'file' excludes "
+        "'uri' and 'content'; 'name' defaults to the file name and 'media_type' "
+        "is guessed from its extension. file:// URIs are only meaningful in this "
+        "environment."
     ),
     annotations=MUTATING,
 )
 async def cp_create_artifact(
     type: str,
-    name: str,
+    name: str | None = None,
     uri: str | None = None,
     content: dict[str, Any] | None = None,
     metadata: dict[str, Any] | None = None,
     supersedes_artifact_id: str | None = None,
+    file: str | None = None,
+    media_type: str | None = None,
 ) -> str:
+    content_ref: str | None = None
     try:
-        artifact = await _client().create_artifact(
+        client = _client()
+        if file is not None:
+            if uri is not None or content is not None:
+                return _dump(
+                    {
+                        "error": "invalid_artifact_content",
+                        "message": "'file' excludes 'uri' and 'content'.",
+                    }
+                )
+            path = Path(file)
+            if not await asyncio.to_thread(path.is_file):
+                return _dump({"error": "file_not_found", "message": f"Not a readable file: {file}"})
+            guessed, _ = mimetypes.guess_type(path.name)
+            upload = await client.upload_artifact_content(
+                path, media_type=media_type or guessed or "application/octet-stream"
+            )
+            content_ref = str(upload["contentRef"])
+            name = name or path.name
+        if not name:
+            return _dump({"error": "invalid_request", "message": "'name' is required."})
+        artifact = await client.create_artifact(
             type=type,
             name=name,
             task_ref=STATE.task_ref,
             run_id=STATE.run_id,
             uri=uri,
             content=content,
+            content_ref=content_ref,
             metadata=metadata,
             supersedes_artifact_id=supersedes_artifact_id,
         )
     except ControlPlaneError as exc:
         return _error(exc)
     return _dump(artifact)
+
+
+@mcp.tool(
+    description=(
+        "Download the stored content of an artifact — typically an input of the "
+        "current task — into a local file and return its path. 'path' is where "
+        "to write it (default: a temporary directory outside the working copy). "
+        "The artifact is read as an input of 'for_task' (default: the current "
+        "task), which works even without access to the task that produced it. "
+        "Small text content is also returned inline as 'text'."
+    ),
+    annotations=READ_ONLY,
+)
+async def cp_get_artifact_content(
+    artifact_id: str, path: str | None = None, for_task: str | None = None
+) -> str:
+    try:
+        client = _client()
+        target = Path(path) if path else None
+        if target is None:
+            record = await client.get_artifact(artifact_id)
+            directory = Path(tempfile.gettempdir()) / "control-plane-artifacts" / artifact_id
+            target = directory / safe_file_name(str(record.get("name") or ""), artifact_id)
+        result = await client.download_artifact_content(
+            artifact_id, target, for_task=for_task or STATE.task_ref
+        )
+    except ControlPlaneError as exc:
+        return _error(exc)
+    base_type = str(result["mediaType"]).split(";")[0].strip().lower()
+    if _TEXT_MEDIA_TYPES.match(base_type) and result["sizeBytes"] <= _INLINE_TEXT_BYTES:
+        data = await asyncio.to_thread(target.read_bytes)
+        result["text"] = data.decode("utf-8", errors="replace")
+    return _dump(result)
 
 
 @mcp.tool(
@@ -1983,6 +2072,7 @@ async def cp_list_events(after: str = "", limit: int = 50) -> str:
 
 
 def main() -> None:  # pragma: no cover - process entrypoint
+    adopt_run_from_environment()
     mcp.run("stdio")
 
 

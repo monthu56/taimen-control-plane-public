@@ -27,6 +27,7 @@ from control_plane.application.authorization import (
     authorize,
     tenant_resource,
 )
+from control_plane.application.commands._artifact_content import artifact_event_fields
 from control_plane.application.commands._child_ceiling import (
     ceiling_of_run,
     enforce_run_ceiling,
@@ -1590,6 +1591,7 @@ async def _record_result_artifact(
             "uri": None,
             "supersedesArtifactId": None,
             "skillInvocationId": str(invocation.id),
+            **artifact_event_fields(artifact),
         },
     )
     return artifact.id

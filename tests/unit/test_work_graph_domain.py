@@ -10,6 +10,7 @@ from typing import Any
 import pytest
 
 from control_plane.application.context.mapping import map_event
+from control_plane.domain.artifact_schema import parse_artifact_schema
 from control_plane.domain.errors import ValidationError
 from control_plane.domain.work_graph import (
     CHECK_KINDS,
@@ -18,12 +19,14 @@ from control_plane.domain.work_graph import (
     SPEC_KEYS,
     check_evidence_against_acceptance,
     check_order_advice,
+    check_spec,
     context_pack_targets,
     evidence_targets,
     normalize_checks,
     normalize_evidence,
     normalize_origin,
     origin_summary,
+    output_checks,
 )
 from tests.unit.test_context_mapping import _event
 
@@ -151,6 +154,17 @@ VALID_SPECS: list[tuple[str, dict[str, Any]]] = [
             "expect": {"status": "ok", "count": 0, "clean": True, "reason": None},
         },
     ),
+    ("deterministic", {"artifact": {"type": "sample-doc"}}),
+    (
+        "deterministic",
+        {
+            "artifact": {
+                "type": "sample-doc",
+                "mediaTypes": ["text/markdown", "image/*"],
+                "content": "optional",
+            }
+        },
+    ),
     ("external_state", {}),
     ("external_state", {"event": "event.sample"}),
     ("human", {}),
@@ -221,6 +235,39 @@ INVALID_SPECS: list[tuple[str, dict[str, Any], str]] = [
         {"skill": "check.sample@1", "expect": {"not-a-field": "ok"}},
         "acceptance[0].spec.expect.not-a-field",
     ),
+    (
+        "deterministic",
+        {"artifact": {"type": "sample-doc"}, "skill": "check.sample@1"},
+        "acceptance[0].spec",
+    ),
+    (
+        "deterministic",
+        {"artifact": {"type": "sample-doc"}, "expect": {"ok": True}},
+        "acceptance[0].spec",
+    ),
+    ("deterministic", {"artifact": "sample-doc"}, "acceptance[0].spec.artifact"),
+    ("deterministic", {"artifact": {}}, "acceptance[0].spec.artifact.type"),
+    ("deterministic", {"artifact": {"type": "Sample Doc"}}, "acceptance[0].spec.artifact.type"),
+    (
+        "deterministic",
+        {"artifact": {"type": "sample-doc", "maxBytes": 1}},
+        "acceptance[0].spec.artifact",
+    ),
+    (
+        "deterministic",
+        {"artifact": {"type": "sample-doc", "mediaTypes": []}},
+        "acceptance[0].spec.artifact.mediaTypes",
+    ),
+    (
+        "deterministic",
+        {"artifact": {"type": "sample-doc", "mediaTypes": ["markdown"]}},
+        "acceptance[0].spec.artifact.mediaTypes[0]",
+    ),
+    (
+        "deterministic",
+        {"artifact": {"type": "sample-doc", "content": "maybe"}},
+        "acceptance[0].spec.artifact.content",
+    ),
     # external_state
     ("external_state", {"event": ""}, "acceptance[0].spec.event"),
     ("external_state", {"event": "Event Sample"}, "acceptance[0].spec.event"),
@@ -254,6 +301,59 @@ def test_every_kind_has_a_grammar_and_a_refusal() -> None:
     assert set(SPEC_KEYS) == CHECK_KINDS
     assert {kind for kind, _, _ in INVALID_SPECS} == CHECK_KINDS
     assert {kind for kind, _ in VALID_SPECS} == CHECK_KINDS
+
+
+def test_the_output_prefix_is_reserved_in_a_task_acceptance_only() -> None:
+    check = {"key": "output.plan", "kind": "human", "description": "d"}
+    with pytest.raises(ValidationError) as caught:
+        normalize_checks([check])
+    assert caught.value.code == "invalid_acceptance"
+    assert caught.value.details["field"] == "acceptance[0].key"
+    # Goal criteria are not verified: nothing is reserved there.
+    assert normalize_checks([check], field="criteria", typed_spec=False) == [check]
+
+
+def test_required_outputs_become_artifact_checks_in_declared_order() -> None:
+    schema = parse_artifact_schema(
+        {
+            "outputs": [
+                {"key": "draft", "type": "sample-doc", "required": False},
+                {"key": "plan", "type": "sample-doc", "required": True},
+                {
+                    "key": "scan",
+                    "type": "sample-scan",
+                    "required": True,
+                    "mediaTypes": ["Image/PNG"],
+                    "content": "optional",
+                },
+            ]
+        }
+    )
+    checks = output_checks(schema)
+    assert checks == [
+        {
+            "key": "output.plan",
+            "kind": "deterministic",
+            "description": "Required output plan (sample-doc)",
+            "spec": {"artifact": {"type": "sample-doc", "content": "required"}},
+        },
+        {
+            "key": "output.scan",
+            "kind": "deterministic",
+            "description": "Required output scan (sample-scan)",
+            "spec": {
+                "artifact": {
+                    "type": "sample-scan",
+                    "mediaTypes": ["image/png"],
+                    "content": "optional",
+                }
+            },
+        },
+    ]
+    # Their form is the grammar's own, only the key prefix is not a task's.
+    for check in checks:
+        check_spec(check["kind"], check["spec"])
+    assert output_checks(parse_artifact_schema({})) == []
 
 
 @pytest.mark.parametrize("kind", sorted(CHECK_KINDS))

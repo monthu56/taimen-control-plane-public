@@ -12,6 +12,9 @@ into the text an executor reads:
 * the repository conventions file of this executor (``CONTROL_PLANE_*_PROMPT_FILE``),
   the fourth layer, which only the executor knows;
 * the task itself and the project's status line;
+* the task's inputs (CP-ADR-0072 §8) — artifacts of other tasks, with the
+  local files the daemon downloaded — rendered by
+  :mod:`control_plane_agent.inputs` as data, not instructions;
 * the memory pack, rendered by :mod:`control_plane_agent.context_pack` as data,
   not instructions (ADR-0059) — kept apart from the layers above.
 
@@ -25,10 +28,12 @@ from __future__ import annotations
 
 import logging
 import os
+from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
 from control_plane_agent.context_pack import render_context_pack
+from control_plane_agent.inputs import LocalInput, inputs_of_context, render_inputs
 
 logger = logging.getLogger("control_plane_agent.instructions")
 
@@ -94,12 +99,15 @@ def build_prompt(
     *,
     harness_note: str = "",
     conventions: str = "",
+    inputs: Sequence[LocalInput] | None = None,
 ) -> str:
     """The whole prompt of one turn, identical in shape for every adapter.
 
     ``harness_note`` is what only this harness can say about its environment
     (whether Control Plane tools are available, where to work, what is
     recorded); everything else comes from the Control Plane or the task.
+    ``inputs`` are the task's inputs as the daemon downloaded them; without
+    them the inputs named by the working context are listed, with no files.
     """
     public_id = task.get("publicId") or task["id"]
     lines: list[str] = []
@@ -121,5 +129,8 @@ def build_prompt(
             f"- status: {project.get('statusKey')} ({project.get('systemStatusCategory')})",
             f"- template: {project.get('templateKey')} v{project.get('templateVersion')}",
         ]
+    section = render_inputs(inputs if inputs is not None else inputs_of_context(context))
+    if section:
+        lines += ["", section]
     lines += ["", render_context_pack(context)]
     return "\n".join(lines)

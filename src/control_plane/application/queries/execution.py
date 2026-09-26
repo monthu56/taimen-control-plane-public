@@ -9,7 +9,12 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from control_plane.application.authorization import AuthContext, authorize
+from control_plane.application.commands.artifacts import (
+    artifact_resource,
+    get_readable_artifact,
+)
 from control_plane.application.commands.relations import resolve_task
+from control_plane.application.commands.task_inputs import resolve_task_inputs
 from control_plane.application.common import decode_cursor, encode_cursor
 from control_plane.application.queries.instructions import instructions_for_task
 from control_plane.application.queries.lists import Page, _paginate, clamp_limit
@@ -190,7 +195,11 @@ async def list_artifacts(
     workspace_id: uuid.UUID | None = None,
     type_: str | None = None,
 ) -> Page[Artifact]:
-    await authorize(ctx, Permission.ARTIFACTS_READ)
+    # A listing narrowed to one task (or workspace) is decided there, like a
+    # single artifact (CP-ADR-0072 §5); an unfiltered one at tenant level.
+    await authorize(
+        ctx, Permission.ARTIFACTS_READ, resource=artifact_resource(task_id, workspace_id)
+    )
     stmt = select(Artifact).where(Artifact.tenant_id == ctx.tenant_id)
     if task_id is not None:
         stmt = stmt.where(Artifact.task_id == task_id)
@@ -210,14 +219,14 @@ async def list_artifacts(
     )
 
 
-async def get_artifact(session: AsyncSession, ctx: AuthContext, artifact_id: uuid.UUID) -> Artifact:
-    await authorize(ctx, Permission.ARTIFACTS_READ)
-    artifact = await session.scalar(
-        select(Artifact).where(Artifact.id == artifact_id, Artifact.tenant_id == ctx.tenant_id)
-    )
-    if artifact is None:
-        raise NotFoundError("Artifact not found", details={"artifactId": str(artifact_id)})
-    return artifact
+async def get_artifact(
+    session: AsyncSession,
+    ctx: AuthContext,
+    artifact_id: uuid.UUID,
+    *,
+    for_task_ref: str | None = None,
+) -> Artifact:
+    return await get_readable_artifact(session, ctx, artifact_id, for_task_ref=for_task_ref)
 
 
 def _seq_cursor(run_id: uuid.UUID, seq: int) -> str:
@@ -463,6 +472,8 @@ async def get_run_context(
     child_page = await list_child_handles(session, ctx, run.id, limit=RUN_CONTEXT_CHILD_LIMIT)
 
     instructions = await instructions_for_task(session, ctx.tenant_id, task)
+    # CP-ADR-0072 §8: what the task's type declares it takes in, resolved now.
+    inputs = await resolve_task_inputs(session, ctx.tenant_id, task)
 
     run_session = await session.get(Session, run.session_id)
     skills = await resolve_executable_skills(
@@ -529,6 +540,7 @@ async def get_run_context(
             }
             for r in relations
         ],
+        "inputs": inputs,
         "artifacts": [
             {
                 "id": str(a.id),

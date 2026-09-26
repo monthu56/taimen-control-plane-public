@@ -176,6 +176,23 @@ class Settings(BaseSettings):
     policy_timeout_seconds: float = 3.0
     policy_cache_ttl_seconds: float = 5.0
 
+    # --- Artifact content store (CP-ADR-0072 §3). Any S3-compatible service;
+    # without an endpoint the store is off and content routes answer 503
+    # content_store_unavailable, while artifact records keep working.
+    s3_endpoint_url: str | None = None
+    s3_bucket: str = "artifacts"
+    s3_region: str = "us-east-1"
+    s3_access_key_id: str | None = None
+    s3_secret_access_key: str | None = None
+    s3_connect_timeout_seconds: float = 5.0
+    s3_read_timeout_seconds: float = 60.0
+    # Ceiling of one uploaded file; PUT /artifact-contents gets it as its own
+    # body limit instead of max_body_bytes. An artifact type may only narrow
+    # it (maxBytes).
+    artifact_max_bytes: int = 104_857_600
+    # How long an upload may wait for an artifact to reference it (§2, §10).
+    artifact_upload_ttl_seconds: int = 86_400
+
 
 @lru_cache
 def get_settings() -> Settings:

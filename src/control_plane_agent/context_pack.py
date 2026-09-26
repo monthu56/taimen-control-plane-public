@@ -66,11 +66,18 @@ _SLASH = r"(?:/|&sol;|&#0*47;|&#x0*2f;|[\u2044\u2215\u29f8])"
 # Attributes are taken only up to a closing bracket within the same line and a
 # bounded distance; a tag left open loses its name alone, not the rest of the item.
 _MAX_TAG_ATTR_CHARS = 200
-_FENCE_TOKEN_RE = re.compile(
-    rf"{_LT}\s*{_SLASH}?\s*{FENCE_TAG}\b"
-    rf"(?:(?:(?!{_GT}|{_LT})[^\r\n]){{0,{_MAX_TAG_ATTR_CHARS}}}{_GT})?",
-    re.IGNORECASE,
-)
+
+
+def fence_token_re(tag: str) -> re.Pattern[str]:
+    """Any spelling of the fence ``tag`` an item might use to break out of it."""
+    return re.compile(
+        rf"{_LT}\s*{_SLASH}?\s*{re.escape(tag)}\b"
+        rf"(?:(?:(?!{_GT}|{_LT})[^\r\n]){{0,{_MAX_TAG_ATTR_CHARS}}}{_GT})?",
+        re.IGNORECASE,
+    )
+
+
+_FENCE_TOKEN_RE = fence_token_re(FENCE_TAG)
 # A section kind becomes a heading of the prompt: only a plain identifier may.
 _KIND_RE = re.compile(r"[a-z_][a-z0-9_]{0,63}")
 # The typed pack's own sections: its relations, and the line that says when
@@ -316,7 +323,11 @@ def _raw_source(item: dict[str, Any]) -> str:
 
 
 def _clean(value: Any) -> str:
-    """One line of pack data, safe to put inside the fence.
+    return clean_line(value, _FENCE_TOKEN_RE)
+
+
+def clean_line(value: Any, fence: re.Pattern[str]) -> str:
+    """One line of data, safe to put inside the fence ``fence`` matches.
 
     Redaction runs on the raw text so that a multi-line secret is still
     recognized; compatibility forms are folded (NFKC) so that a fullwidth
@@ -327,7 +338,7 @@ def _clean(value: Any) -> str:
     text = redact_credentials(redact_local_paths(str(value or "")))
     text = unicodedata.normalize("NFKC", text)
     while True:
-        stripped = _FENCE_TOKEN_RE.sub(" ", text)
+        stripped = fence.sub(" ", text)
         if stripped == text:
             return " ".join(text.split())
         text = stripped

@@ -5,6 +5,8 @@ from fastapi import APIRouter, Depends
 from control_plane.api.strict_query import reject_unknown_query_params
 from control_plane.api.v1 import (
     approvals,
+    artifact_contents,
+    artifact_types,
     artifacts,
     attention,
     bootstrap,
@@ -59,6 +61,8 @@ api_v1_router.include_router(task_comments.router)
 api_v1_router.include_router(claims.router)
 api_v1_router.include_router(runs.router)
 api_v1_router.include_router(child_handles.router)
+api_v1_router.include_router(artifact_types.router)
+api_v1_router.include_router(artifact_contents.router)
 api_v1_router.include_router(artifacts.router)
 api_v1_router.include_router(approvals.router)
 api_v1_router.include_router(attention.router)

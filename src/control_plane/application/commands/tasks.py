@@ -32,6 +32,7 @@ from control_plane.application.commands.goals import (
     verify_evidence,
 )
 from control_plane.application.commands.principals import get_tenant_principal
+from control_plane.application.commands.task_inputs import artifact_schema_of
 from control_plane.application.commands.task_types import (
     lifecycle_of,
     resolve_task_type,
@@ -58,6 +59,7 @@ from control_plane.domain.work_graph import (
     normalize_checks,
     normalize_evidence,
     origin_summary,
+    output_checks,
 )
 from control_plane.domain.work_item import (
     TransitionRoute,
@@ -726,14 +728,21 @@ async def finish_locked_task(
     the completion paths got here (``complete``, ``run``, ``approval``,
     ``rule``). ``implicit_checks`` are run instead when the task has no
     acceptance of its own: a rule closing work verifies it by the evidence it
-    wrote (CP-ADR-0063, amendment A1).
+    wrote (CP-ADR-0063, amendment A1). The required outputs of the task's
+    type come first on every path, even with an acceptance of its own: there
+    is no way to done without them (CP-ADR-0067, amendment 2026-09-26).
     """
     from control_plane.application.commands.verification import (
         open_attempt,
         open_verification,
     )
 
-    checks = list(task.acceptance or implicit_checks or [])
+    outputs = output_checks(await artifact_schema_of(session, task))
+    implicit = {check["key"] for check in outputs}
+    checks = [
+        *outputs,
+        *(c for c in task.acceptance or implicit_checks or [] if c["key"] not in implicit),
+    ]
     if await open_attempt(session, task.id) is not None:
         # Completed again while its checks run: the attempt already open is
         # the answer, a second one is never opened (FR-011).

@@ -1,9 +1,10 @@
 """Work discovery: which tasks could this principal claim right now? (v0.3)
 
 Advisory only. The query re-derives claimability from authoritative state
-(status, live claim, readiness, approval gate, organizational eligibility),
-but the CLAIM remains the authoritative gate: between discovery and claim the
-world may change, and claim re-checks every invariant in its own transaction.
+(status, live claim, readiness, required inputs, approval gate, organizational
+eligibility), but the CLAIM remains the authoritative gate: between discovery
+and claim the world may change, and claim re-checks every invariant in its own
+transaction.
 "shown as available" is never a promise that claim will succeed.
 """
 
@@ -18,6 +19,7 @@ from sqlalchemy.orm import aliased
 from control_plane.application.authorization import AuthContext, authorize
 from control_plane.application.commands.eligibility import explain_claim_eligibility
 from control_plane.application.commands.relations import resolve_task, unmet_prerequisites
+from control_plane.application.commands.task_inputs import missing_required_inputs
 from control_plane.application.commands.task_types import task_type_lifecycle, task_type_of
 from control_plane.application.commands.verification import OPEN_STATUSES, open_attempt
 from control_plane.application.commands.workspaces import workspace_subtree_ids
@@ -216,7 +218,9 @@ async def list_available_work(
     eligible: list[Task] = []
     for task in candidates:
         missing = await explain_claim_eligibility(session, ctx, task, ctx.principal_id)
-        if missing is None:
+        # A task without a required input would only be refused at claim
+        # (CP-ADR-0072 §8): a runner must not spin on it.
+        if missing is None and not await missing_required_inputs(session, ctx.tenant_id, task):
             eligible.append(task)
             if len(eligible) >= effective_limit:
                 break
@@ -306,6 +310,10 @@ async def explain_task_claimability(
     blocking = await unmet_prerequisites(session, ctx.tenant_id, task.id)
     if blocking:
         reasons.append({"code": "task_not_ready", "blockedBy": blocking})
+
+    missing_inputs = await missing_required_inputs(session, ctx.tenant_id, task)
+    if missing_inputs:
+        reasons.append({"code": "input_missing", "missing": missing_inputs})
 
     gates = await pending_gate_approvals(session, ctx.tenant_id, task.id)
     if gates:

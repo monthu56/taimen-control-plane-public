@@ -15,7 +15,8 @@ Permissions ключа: `principals.read|write`, `delegations.manage`,
 `events.read`, `workspaces.read|manage`, `org.read|manage`,
 `artifacts.read|write`, `approvals.read|manage|decide`,
 `observations.write`, `projects.read|manage`,
-`project_templates.read|manage`, `operations.read|manage`, `admin`
+`project_templates.read|manage`, `operations.read|manage`,
+`artifact_types.read|manage` (CP-ADR-0072), `admin`
 (подразумевает все). Права v0.5 не выдаются старым ключам неявно —
 их нужно назначить явно (см. [migration-v0.5](migration-v0.5.md)). Проверка выполняется и в route-слое, и в командах
 application-слоя.
@@ -107,6 +108,11 @@ endpoint не объявляет, — опечатка или фильтр, до
 
 ## Endpoint'ы
 
+Пометка `[план AXXX]` — контракт принят
+([CP-ADR-0072](adr/0072-artifact-content-types-task-io.md)), а реализует его
+названная задача фичи `artifact-handoff`; до её выкатки сервер маршрута или
+поля не знает.
+
 ```
 POST /api/v1/bootstrap                    (Bearer <CP_BOOTSTRAP_TOKEN>; одноразово)
 
@@ -141,7 +147,9 @@ GET  /api/v1/work/available               tasks.read   (advisory discovery: elig
                                           &assignedToMe=&limit=&cursor=; assignedToMe=true —
                                           только адресованное вызывающему, перекрывает assigneeId;
                                           страница может быть короче limit при непустом
-                                          nextCursor; архивный проект новую работу не выдаёт)
+                                          nextCursor; архивный проект новую работу не выдаёт;
+                                          CP-ADR-0072: задача без обязательного входа типа
+                                          не выдаётся)
 
 POST  /api/v1/task-types                  task_types.manage (следующая версия ключа; версию
                                           выдаёт сервер; lifecycleSchema валидируется локально;
@@ -166,6 +174,13 @@ POST  /api/v1/task-types                  task_types.manage (следующая 
                                           {when?, actions}}, действия ensureWork|comment,
                                           корни $.task/$.spawnedBy, иначе 422
                                           invalid_completion_schema;
+                                          artifactSchema — входы и выходы, CP-ADR-0072:
+                                          inputs[{key, type, from
+                                          depends_on|spawned_by|parent, required?}],
+                                          outputs[{key, type, required?, mediaTypes?,
+                                          content? required|optional}]; тип артефакта не
+                                          зарегистрирован — 422 unknown_artifact_type,
+                                          иначе 422 invalid_artifact_schema;
                                           изменение — только новой версией)
 GET   /api/v1/task-types                  task_types.read   (?key=&status=)
 GET   /api/v1/task-types/{id}             task_types.read
@@ -186,14 +201,19 @@ POST  /api/v1/tasks                       tasks.write  (optional parentTask со
                                           acceptance[].spec — по грамматике вида (ADR-0067),
                                           иначе 422 invalid_acceptance_spec; скилл критерия
                                           deterministic — зарегистрированный и не
-                                          external_write, иначе тоже 422)
+                                          external_write, тип артефакта критерия
+                                          spec.artifact — зарегистрированный, иначе
+                                          тоже 422; ключ с префиксом output. —
+                                          422 invalid_acceptance)
 GET   /api/v1/tasks                       tasks.read   (?status=&systemStatusCategory=&typeKey=
                                           &priority=&ownerId=&assigneeId=&workspaceId=
                                           &includeDescendants=&startFrom=&startTo=&dueFrom=&dueTo=
                                           &sort=createdAt|startDate|dueDate&goalId=)
 GET   /api/v1/tasks/{id|publicId}         tasks.read   (+ETag)
 GET   /api/v1/tasks/{ref}/claimability    tasks.read   (диагностика: claimable + reasons; ADR-0067:
-                                          verification_pending {verificationId, status})
+                                          verification_pending {verificationId, status};
+                                          CP-ADR-0072: input_missing
+                                          {missing[{key, type, from}]})
 GET   /api/v1/tasks/{ref}/verifications   tasks.read   (ADR-0067: попытки стадии проверки, новые
                                           сверху; ?limit=&cursor=)
 GET   /api/v1/tasks/{ref}/transitions     tasks.read   (объявленные цели перехода из текущего
@@ -260,9 +280,13 @@ GET   /api/v1/rules/{id}/evaluations      rules.read   (история оцен�
                                           already_closed|verification_pending|
                                           claim_not_released)
 POST  /api/v1/tasks/{id|publicId}:claim   tasks.claim  (body: sessionId, ttlSeconds?, intent?;
-                                          409 verification_pending, пока идёт проверка)
+                                          409 verification_pending, пока идёт проверка;
+                                          CP-ADR-0072: нет обязательного входа
+                                          типа — 409 input_missing, details.missing[{key,
+                                          type, from}])
 POST  /api/v1/tasks/{id|publicId}:complete tasks.write (If-Match; claimId+fencingToken при живом claim;
-                                          задача с acceptance не выполняется сразу —
+                                          задача с acceptance или с обязательными
+                                          выходами типа не выполняется сразу —
                                           открывается попытка проверки, см. ниже)
 
 Стадия проверки (CP-ADR-0067). У задачи с непустым `acceptance` каждый из
@@ -312,6 +336,17 @@ cancelled`), `trigger` (`complete|run|approval`), `triggerRef`,
 `authorityPrincipalId`, `checks` (acceptance на момент открытия), `results`
 (`[{key, kind, status, evidence, reason, message?}]`), `cursor`,
 `skillInvocationId`, `approvalId`, `nextCheckAt`, `startedAt`, `finishedAt`.
+
+Выходы типа как критерии (CP-ADR-0067, амендмент 2026-09-26; [план A006]).
+`deterministic` принимает `spec: {artifact: {type, mediaTypes?, content?
+required|optional}}` (взаимоисключает `skill`): пройден, если у задачи есть
+head-ревизия артефакта этого типа с подходящим media type и, при `content:
+required`, с содержимым; причины провала — `artifact_missing`,
+`artifact_media_type`, `artifact_content_missing`. Обязательные выходы
+`artifactSchema` типа задачи при каждом завершении становятся неявными
+критериями `output.<key>` **перед** acceptance задачи — задача с обязательным
+выходом проходит стадию, даже если её acceptance пуст. Ключ с префиксом
+`output.` в acceptance — `422 invalid_acceptance`.
 
 GET  /api/v1/claims                       tasks.read   (?taskId=&sessionId=&status=)
 GET  /api/v1/claims/{id}                  tasks.read
@@ -384,7 +419,11 @@ GET  /api/v1/runs/{id}/context            tasks.read   (Run Context: task/claim/
                                           version, text}], hash} — слои platform →
                                           project → taskType, как они стоят сейчас;
                                           run.instructionsHash/instructionsRefs — с
-                                          чем run был запущен)
+                                          чем run был запущен; CP-ADR-0072:
+                                          inputs[{key, type, artifactId, name, mediaType,
+                                          sizeBytes, sha256, contentState, uri,
+                                          sourceTask{id, publicId, relation}}] —
+                                          разрешённые входы типа задачи, head-ревизии)
 POST /api/v1/runs/{id}:succeed            tasks.claim  (владелец run; body: output?,
                                           completeTask=true -> атомарно завершает задачу)
 POST /api/v1/runs/{id}:fail               владелец или claims.manage (задачу не трогает)
@@ -447,9 +486,68 @@ GET  /api/v1/tools/{ref}                  tasks.read   (ref: uuid|name|name@vers
                                           вне policy — 404 tool_not_found, как и несуществующий)
 
 POST /api/v1/artifacts                    artifacts.write (append-only; task|runId|workspaceId?;
-                                          supersedesArtifactId? — ревизия, ADR-0020)
-GET  /api/v1/artifacts                    artifacts.read  (?taskId=&runId=&workspaceId=&type=)
-GET  /api/v1/artifacts/{id}               artifacts.read
+                                          supersedesArtifactId? — ревизия, ADR-0020;
+                                          CP-ADR-0072: contentRef — содержимое
+                                          из PUT /artifact-contents, исключает uri и content
+                                          (422 invalid_artifact_content); чужой, неизвестный
+                                          или истёкший — 422 content_ref_not_found;
+                                          type, зарегистрированный в tenant, проверяется по
+                                          последней версии: metadata (422
+                                          invalid_artifact_metadata, details.errors), media
+                                          type и размер содержимого из contentRef (422
+                                          media_type_not_allowed, 422 artifact_too_large);
+                                          ответ + sizeBytes, mediaType, sha256, contentState
+                                          none|stored|purged, typeVersion (null у
+                                          незарегистрированного type))
+GET  /api/v1/artifacts                    artifacts.read  (?taskId=&runId=&workspaceId=&type=;
+                                          с taskId — право на этой задаче, с workspaceId — на
+                                          воркспейсе, без них — уровня tenant)
+GET  /api/v1/artifacts/{id}               artifacts.read  (CP-ADR-0072: на задаче артефакта,
+                                          без задачи — на его воркспейсе, без обоих — tenant;
+                                          ?forTask=<ref> — как вход задачи-получателя:
+                                          tasks.read на ней и артефакт — её разрешённый
+                                          вход, иначе обычная проверка)
+
+Содержимое артефактов (CP-ADR-0072):
+PUT  /api/v1/artifact-contents            artifacts.write (тело — байты файла, Content-Type —
+                                          media type, обязателен; поток во временный файл,
+                                          лимит CP_ARTIFACT_MAX_BYTES = 100 МБ, сверх — 413
+                                          request_too_large; ответ 201 {contentRef,
+                                          sizeBytes, mediaType, sha256, expiresAt}; ссылаться
+                                          на contentRef может только загрузивший, 24 ч;
+                                          Idempotency-Key не поддерживается; хранилище
+                                          выключено или недоступно — 503
+                                          content_store_unavailable)
+GET  /api/v1/artifacts/{id}/content       artifacts.read на задаче артефакта |
+                                          ?forTask=<ref> с tasks.read на задаче-получателе
+                                          (поток байтов;
+                                          Content-Type = mediaType, ETag "sha256:<hex>",
+                                          X-Content-Type-Options: nosniff, Cache-Control:
+                                          private, no-store; Content-Disposition:
+                                          attachment для активного содержимого — HTML, SVG,
+                                          XML, JavaScript; без Range; 404 content_not_found
+                                          у артефакта без содержимого, 410 content_purged,
+                                          503 content_store_unavailable; каждая выдача —
+                                          событие artifact.content_read)
+POST /api/v1/artifacts/{id}:purge-content admin (body: reason 1..2000; запись остаётся с
+                                          contentState=purged, объект удаляется, если на
+                                          него не ссылаются другие артефакты tenant со
+                                          stored и неистёкшие загрузки; повтор —
+                                          200 без нового события; без содержимого — 409
+                                          content_not_stored; событие artifact.content_purged)
+
+Типы артефактов (CP-ADR-0072):
+POST /api/v1/artifact-types               artifact_types.manage (следующая версия ключа, версию
+                                          выдаёт сервер; key, displayName, description?,
+                                          metadataSchema (JSON Schema ≤ 16 KiB, по умолчанию
+                                          {}), mediaTypes ["type/sub" | "type/*" | "*/*"]
+                                          (1…50), maxBytes ≤ CP_ARTIFACT_MAX_BYTES (по
+                                          умолчанию — он); иначе 422 invalid_artifact_type
+                                          с details.field; версия неизменяема; событие
+                                          artifact_type.created)
+GET  /api/v1/artifact-types               artifact_types.read (?key=&status=)
+GET  /api/v1/artifact-types/{key}[@version]  artifact_types.read (без версии — последняя;
+                                          нет такой — 404)
 
 POST /api/v1/approvals                    approvals.manage (ровно одно из requiredRoleId |
                                           assignedPrincipalId; gate=true требует task и
@@ -566,7 +664,9 @@ POST /api/v1/context                      только аутентификац�
                                           профиля — ключа taskContext нет;
                                           CP-ADR-0066: при фокусе на задаче или run —
                                           instructions {layers, hash}, тот же блок, что
-                                          в GET /runs/{id}/context)
+                                          в GET /runs/{id}/context; CP-ADR-0072:
+                                          operational.focus.inputs — входы задачи
+                                          фокуса, как inputs в GET /runs/{id}/context)
 POST /api/v1/context/recall               events.read (+ tasks.read при task)  (CP-ADR-0064,
                                           MCP cp_recall: ровно одно из anchor (≤300) /
                                           query (≤2000), иначе 422 invalid_recall_request;
@@ -906,14 +1006,15 @@ bootstrap-admin они входят автоматически (как все п
 | 400 | `invalid_request` (нарушение контракта, в т.ч. неизвестный query-параметр), `invalid_if_match`, `invalid_skill_inputs`, `idempotency_key_required` |
 | 401 | `invalid_credentials` |
 | 403 | `permission_denied`, `principal_not_active`, `delegation_required`, `claim_holder_mismatch`, `session_owner_mismatch`, `bootstrap_disabled`, `permission_escalation`, `not_eligible`, `run_holder_mismatch`, `tool_not_authorized`, `child_grant_exceeded`, `skill_permission_denied`, `skill_side_effect_not_authorized`, `run_owner_mismatch`, `run_id_required` |
-| 404 | `not_found`, `tool_not_found` (в т.ч. чужой tenant и инструмент вне effective policy — существование не раскрывается) |
-| 409 | `project_exists`, `workspace_type_exists`, `external_reference_conflict`, `retention_blocked_by_consumer`, `task_already_claimed`, `version_conflict`, `stale_claim`, `task_claimed`, `session_expired`, `session_not_active`, `claim_expired`, `claim_not_active`, `claim_not_expired`, `idempotency_key_reused`, `idempotency_in_flight`, `already_bootstrapped`, `task_already_completed`, `task_not_ready`, `run_already_active`, `run_not_active`, `run_in_progress`, `workspace_slug_conflict`, `role_slug_conflict`, `capability_exists`, `skill_exists`, `relation_exists`, `approval_already_decided`, `approval_required` (v0.3 gate), `verification_pending` (ADR-0067), `budget_exceeded`, `action_already_finished`, `child_handle_revoked`, `child_handle_expired`, `child_run_already_bound`, `skill_not_invocable`, `skill_version_immutable`, `invalid_status_transition`, `idempotency_key_reuse`, `stale_invocation_lease`, `approval_already_used`, `task_terminal`, `outcome_not_replayable`, `approval_precondition_failed`, `snapshot_stale`, `pack_version_conflict` |
-| 413 | `request_too_large` |
-| 422 | `invalid_*` (доменная валидация), `task_not_claimable`, `task_cancelled`, `empty_update`, `unknown_requirement`, `dependency_cycle`, `workspace_cycle`, `workspace_archived`, `workspace_has_active_children`, `task_not_runnable`, `artifact_mismatch`, `invalid_approval`, `skill_disabled`, `unsupported_protocol_version`, `invalid_harness`, `invalid_budget`, `invalid_checkpoint`, `invalid_action`, `invalid_tool_query`, `invalid_correlation_id`, `invalid_child_grant`, `invalid_child_result`, `invalid_child_handle_ref`, `invalid_child_handle_token`, `invalid_entity_type`, `invalid_entity_reference`, `invalid_external_lookup`, `status_not_in_lifecycle`, `invalid_transition`, `invalid_lifecycle_schema`, `invalid_status_category`, `system_task_type_required`, `child_grant_exceeds_parent`, `child_depth_exceeded`, `child_result_too_large`, `invalid_skill_contract`, `unsupported_skill_condition`, `secret_material_rejected`, `invalid_approval_schema`, `workspace_not_root`, `pack_invalid`, `pack_not_found`, `pack_version_required`, `snapshot_invalid`, `invalid_context_schema`, `invalid_recall_request` |
+| 404 | `not_found`, `tool_not_found` (в т.ч. чужой tenant и инструмент вне effective policy — существование не раскрывается), `content_not_found` (у артефакта нет содержимого, CP-ADR-0072) |
+| 409 | `project_exists`, `workspace_type_exists`, `external_reference_conflict`, `retention_blocked_by_consumer`, `task_already_claimed`, `version_conflict`, `stale_claim`, `task_claimed`, `session_expired`, `session_not_active`, `claim_expired`, `claim_not_active`, `claim_not_expired`, `idempotency_key_reused`, `idempotency_in_flight`, `already_bootstrapped`, `task_already_completed`, `task_not_ready`, `run_already_active`, `run_not_active`, `run_in_progress`, `workspace_slug_conflict`, `role_slug_conflict`, `capability_exists`, `skill_exists`, `relation_exists`, `approval_already_decided`, `approval_required` (v0.3 gate), `verification_pending` (ADR-0067), `budget_exceeded`, `action_already_finished`, `child_handle_revoked`, `child_handle_expired`, `child_run_already_bound`, `skill_not_invocable`, `skill_version_immutable`, `invalid_status_transition`, `idempotency_key_reuse`, `stale_invocation_lease`, `approval_already_used`, `task_terminal`, `outcome_not_replayable`, `approval_precondition_failed`, `snapshot_stale`, `pack_version_conflict`, `input_missing` (CP-ADR-0072), `content_not_stored` (CP-ADR-0072) |
+| 410 | `content_purged` (содержимое удалено `:purge-content`, CP-ADR-0072) |
+| 413 | `request_too_large` (в т.ч. загрузка сверх `CP_ARTIFACT_MAX_BYTES`) |
+| 422 | `invalid_*` (доменная валидация), `task_not_claimable`, `task_cancelled`, `empty_update`, `unknown_requirement`, `dependency_cycle`, `workspace_cycle`, `workspace_archived`, `workspace_has_active_children`, `task_not_runnable`, `artifact_mismatch`, `invalid_approval`, `skill_disabled`, `unsupported_protocol_version`, `invalid_harness`, `invalid_budget`, `invalid_checkpoint`, `invalid_action`, `invalid_tool_query`, `invalid_correlation_id`, `invalid_child_grant`, `invalid_child_result`, `invalid_child_handle_ref`, `invalid_child_handle_token`, `invalid_entity_type`, `invalid_entity_reference`, `invalid_external_lookup`, `status_not_in_lifecycle`, `invalid_transition`, `invalid_lifecycle_schema`, `invalid_status_category`, `system_task_type_required`, `child_grant_exceeds_parent`, `child_depth_exceeded`, `child_result_too_large`, `invalid_skill_contract`, `unsupported_skill_condition`, `secret_material_rejected`, `invalid_approval_schema`, `workspace_not_root`, `pack_invalid`, `pack_not_found`, `pack_version_required`, `snapshot_invalid`, `invalid_context_schema`, `invalid_recall_request`; CP-ADR-0072: `invalid_artifact_content`, `content_ref_not_found`, `invalid_artifact_metadata`, `media_type_not_allowed`, `artifact_too_large`, `invalid_artifact_type`, `invalid_artifact_schema`, `unknown_artifact_type` |
 | 428 | `if_match_required` |
 | 500 | `internal_error` (без стектрейса) |
 | 502 | `memory_unavailable` (память не обработала проксируемый запрос, в т.ч. отвергла credential ядра — `403`; `details.memoryStatus`, `details.retryable`; текст ответа памяти клиенту не отдаётся) |
-| 503 | readiness: БД недоступна или миграции не применены; `decision_unavailable`; `memory_disabled`; `memory_timeout` (`/context/recall`, `:replay`) |
+| 503 | readiness: БД недоступна или миграции не применены; `decision_unavailable`; `memory_disabled`; `memory_timeout` (`/context/recall`, `:replay`); `content_store_unavailable` (хранилище содержимого выключено или недоступно, CP-ADR-0072) |
 
 ## События
 
@@ -1008,6 +1109,21 @@ M1.3 (ADR-0063): `rule.created|updated|enabled|disabled|archived` (entity
 или отменена) — по потоку **задачи**, с правилом, версией, оценкой, ключом и
 evidence. Всё, что пишет правило, несёт `correlationId = work-rule:<id>`;
 такие события правила не оценивают.
+
+CP-ADR-0072 (фича `artifact-handoff`):
+`artifact.created` v2 — плюс `sizeBytes`, `mediaType`, `sha256`,
+`contentState`, `typeVersion` (содержимое по-прежнему не пишется);
+`artifact.content_read` (entity `artifact`, actor — читающий; каждая выдача
+байтов): `artifactId`, `taskId`, `forTaskId` (задача-получатель при чтении
+как вход по `?forTask=`, иначе `null`), `runId` (running run читающего на
+задаче артефакта, при чтении как вход — на задаче-получателе), `sha256`, `sizeBytes` — в память
+не переносится; `artifact.content_purged` (entity `artifact`): `artifactId`,
+`taskId`, `sha256`, `sizeBytes`, `reason` (секреты вычищены, до 1000
+символов), `objectDeleted`; `artifact_type.created` (entity
+`artifact_type`): `key`, `version`, `mediaTypes`, `maxBytes`,
+`declaresMetadataSchema`; `task_type.created` v2 — плюс
+`declaresArtifactSchema` и числа `inputs`/`outputs`. Каталог `docs/events/`
+пополняется в шаге, который начинает писать событие.
 
 ADR-0064: `task.context_pack_recorded` (entity `task`) — пакет контекста claim
 записан: `publicId`, `contextPackId`, `claimId`, `asOf`, `asOfMode`, счётчики

@@ -1,5 +1,6 @@
 """FastAPI application factory and process entrypoint."""
 
+import logging
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from typing import Any
@@ -21,11 +22,30 @@ from control_plane.application.authorization import configure_authorizer
 from control_plane.config import Settings, get_settings
 from control_plane.infrastructure.auth.iam import build_iam_enforcement
 from control_plane.infrastructure.auth.policy import build_authorizer
+from control_plane.infrastructure.content_store import (
+    ContentStore,
+    ContentStoreUnavailable,
+    build_content_store,
+)
 from control_plane.infrastructure.context_provider import build_context_provider
 from control_plane.infrastructure.db.engine import build_engine, build_session_factory
 from control_plane.infrastructure.db.migrations import get_head_revision
 from control_plane.infrastructure.realtime.hub import RealtimeHub
 from control_plane.logging import configure_logging
+
+logger = logging.getLogger(__name__)
+
+
+async def _prepare_content_store(store: ContentStore | None) -> None:
+    """Create the bucket at start-up (CP-ADR-0072 §3). An unreachable store
+    does not stop the API: content routes answer 503 and the store tries
+    again on first use."""
+    if store is None:
+        return
+    try:
+        await store.ensure_bucket()
+    except ContentStoreUnavailable as exc:
+        logger.warning("content store unavailable at start-up", extra={"error": str(exc)})
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:
@@ -54,11 +74,17 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         authorizer, authz_closables = build_authorizer(settings)
         configure_authorizer(authorizer)
         app.state.authorizer = authorizer
+        # Artifact bytes (CP-ADR-0072): None without CP_S3_ENDPOINT_URL.
+        content_store = build_content_store(settings)
+        app.state.content_store = content_store
+        await _prepare_content_store(content_store)
         await hub.start()
         try:
             yield
         finally:
             await hub.stop()
+            if content_store is not None:
+                await content_store.aclose()
             if enforcement is not None:
                 await enforcement.aclose()
             for closable in authz_closables:
@@ -87,7 +113,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.add_middleware(
         BodySizeLimitMiddleware,
         max_body_bytes=settings.max_body_bytes,
-        path_limits={"/api/v1/knowledge/snapshots": settings.knowledge_snapshot_max_body_bytes},
+        path_limits={
+            "/api/v1/knowledge/snapshots": settings.knowledge_snapshot_max_body_bytes,
+            # Uploaded files stream to disk, never into memory (CP-ADR-0072 §2).
+            "/api/v1/artifact-contents": settings.artifact_max_bytes,
+        },
     )
     app.add_middleware(RequestIdMiddleware)
     if settings.cors_origins:  # CORS stays off unless explicitly configured

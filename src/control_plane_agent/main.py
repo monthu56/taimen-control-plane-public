@@ -17,6 +17,12 @@ reference (``git:<sha>``). Without a pool the adapter gets ``workspace=None``
 and the agent behaves exactly as before — the reference harness stays usable
 for protocol tests that touch no files.
 
+Inputs (CP-ADR-0072 §8): with a runtime directory configured, the inputs of
+a task — artifacts of other tasks its type declares — are downloaded into
+``<runtime>/inputs/<key>/<name>`` before the adapter starts, outside the
+working copy, and handed to an adapter whose ``execute`` takes ``inputs``
+(``inputs.py``). An adapter written before that keeps its four arguments.
+
 Restart recovery: on startup the agent consults /harness/context; a still-
 live claim+run is finished honestly (fail with reason=restart_recovery) so
 the task frees up deterministically — a reference policy, not the only one.
@@ -32,12 +38,21 @@ type to tell — leaves it for one that can.
 
 import asyncio
 import contextlib
+import inspect
 import logging
 import os
 import signal
+from collections.abc import Coroutine
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Protocol
 
+from control_plane_agent.inputs import (
+    LocalInput,
+    discard_inputs,
+    fetch_inputs,
+    task_runtime_dir,
+)
 from control_plane_agent.review import (
     ReviewPolicy,
     build_review_task,
@@ -103,6 +118,9 @@ class Adapter(Protocol):
     agent runs without a pool. An adapter that touches files MUST work inside
     ``workspace.path`` and nowhere else: that is what keeps two concurrent
     tasks from writing into one copy.
+
+    An adapter may also take a keyword ``inputs`` — the task's inputs as local
+    files (``inputs.py``); the daemon passes it only to an adapter that does.
     """
 
     async def execute(
@@ -177,9 +195,14 @@ class Agent:
         review_type: str = "code-review",
         skills: SkillExecutor | None = None,
         supervision: SupervisionSettings | None = None,
+        runtime_dir: Path | None = None,
     ) -> None:
         self.client = client
         self.adapter = adapter
+        # Where the inputs of a task are downloaded, one directory per task
+        # (CP-ADR-0072 §8). None: nothing is downloaded, and the prompt lists
+        # the inputs of the working context without files.
+        self.runtime_dir = runtime_dir
         # While the adapter works the daemon watches the run: a cancel request
         # or a run without progress stops the adapter (supervision.py).
         self.supervision = supervision or SupervisionSettings()
@@ -464,10 +487,9 @@ class Agent:
                     with contextlib.suppress(ControlPlaneError):
                         await self.client.fail_run(str(run["id"]), failure_reason="workspace_busy")
                     return False
+                inputs = await self._fetch_inputs(task, run)
                 supervisor = RunSupervisor(self.client, str(run["id"]), self.supervision)
-                artifacts = await supervisor.run(
-                    self.adapter.execute(task, run, self.client, workspace)
-                )
+                artifacts = await supervisor.run(self._execute(task, run, workspace, inputs))
                 if heartbeats.error is not None:
                     # The lease died while the adapter worked: the server would
                     # fence us anyway, so stop before writing results.
@@ -506,6 +528,8 @@ class Agent:
                 await self._record_verdict(task, artifacts, claim)
                 await self.client.succeed_run(str(run["id"]))
                 outcome = "succeeded"
+                if self.runtime_dir is not None:
+                    await discard_inputs(task_runtime_dir(self.runtime_dir, task))
                 logger.info("completed %s", task["publicId"])
                 await self._request_review(task, artifacts)
                 return True
@@ -770,6 +794,28 @@ class Agent:
         except ControlPlaneError as exc:
             logger.warning("could not record verdict for %s: %s", task["publicId"], exc.code)
 
+    async def _fetch_inputs(
+        self, task: dict[str, Any], run: dict[str, Any]
+    ) -> list[LocalInput] | None:
+        """The task's inputs on disk, or None without a runtime directory."""
+        if self.runtime_dir is None:
+            return None
+        runtime = task_runtime_dir(self.runtime_dir, task)
+        return await fetch_inputs(self.client, task, str(run["id"]), runtime)
+
+    def _execute(
+        self,
+        task: dict[str, Any],
+        run: dict[str, Any],
+        workspace: Workspace | None,
+        inputs: list[LocalInput] | None,
+    ) -> Coroutine[Any, Any, list[ArtifactSpec]]:
+        if inputs is not None and _takes_inputs(self.adapter):
+            return self.adapter.execute(  # type: ignore[call-arg]
+                task, run, self.client, workspace, inputs=inputs
+            )
+        return self.adapter.execute(task, run, self.client, workspace)
+
     async def _open_workspace(self, task: dict[str, Any], run: dict[str, Any]) -> Workspace | None:
         """Take this task's working copy and record it durably.
 
@@ -852,6 +898,29 @@ class Agent:
         ]
 
 
+def _takes_inputs(adapter: Adapter) -> bool:
+    try:
+        parameters = inspect.signature(adapter.execute).parameters
+    except (TypeError, ValueError):  # pragma: no cover - a builtin callable
+        return False
+    return "inputs" in parameters
+
+
+def _runtime_dir_from_env(pool: ExecutionWorkspacePool | None) -> Path:  # pragma: no cover
+    """Where inputs go: ``CONTROL_PLANE_AGENT_RUNTIME_DIR``, else beside the copies.
+
+    ``.runtime`` under the pool root cannot be a task's container — a task key
+    never starts with a dot — and the pool prunes only directories holding a
+    working copy.
+    """
+    configured = os.environ.get("CONTROL_PLANE_AGENT_RUNTIME_DIR")
+    if configured:
+        return Path(configured).expanduser()
+    if pool is not None:
+        return pool.root / ".runtime"
+    return Path.home() / ".control-plane-agent" / "runtime"
+
+
 def _workspace_pool_from_env() -> ExecutionWorkspacePool | None:  # pragma: no cover - wiring
     """Build the workspace pool if the runner was given a repository to work in.
 
@@ -923,12 +992,14 @@ def main() -> int:  # pragma: no cover - process entrypoint
             except ValueError as exc:
                 logger.error("skill executor misconfigured: %s", exc)
                 raise SystemExit(2) from exc
+            pool = _workspace_pool_from_env()
             agent = Agent(
                 client,
                 adapter,
                 skills=skills,
                 supervision=SupervisionSettings.from_environment(),
-                workspaces=_workspace_pool_from_env(),
+                workspaces=pool,
+                runtime_dir=_runtime_dir_from_env(pool),
                 workspace_id=os.environ.get("CONTROL_PLANE_AGENT_WORKSPACE") or None,
                 project_id=os.environ.get("CONTROL_PLANE_AGENT_PROJECT") or None,
                 include_subprojects=os.environ.get("CONTROL_PLANE_AGENT_SUBPROJECTS") == "1",

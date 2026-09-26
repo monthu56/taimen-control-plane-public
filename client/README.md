@@ -25,6 +25,13 @@ that the consumer retries based on its own state (`create_task`,
 `succeed_run`, `fail_run`, `create_artifact`, `request_approval`) accept
 `idempotency_key=` — otherwise the key is generated per call.
 
+Artifact content (CP-ADR-0072): `upload_artifact_content(path_or_bytes,
+media_type=…)` streams the bytes up and returns a `contentRef` for
+`create_artifact(content_ref=…)`; `download_artifact_content(id, destination,
+for_task=…)` streams the content into a file, checks its sha256 against the
+`ETag` and puts the file in place only whole; `for_task` reads the artifact as
+an input of that task.
+
 `control_plane_client.events` is the event consumer SDK (CP-ADR-0069):
 `EventConsumer(client, types, workspace_id, cursor_store, handler, name=…)`
 reads the journal through a subscription filter (type prefixes, a workspace

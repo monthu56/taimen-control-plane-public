@@ -51,13 +51,16 @@ actions:
   approvals.decide:
     resource: approval
     derived: "approvals.decide@scope but not requested_by"
-  # --- артефакты: через задачу ---
+  # --- артефакты: через задачу; артефакт без задачи — на своём воркспейсе,
+  # без обоих — на tenant (CP-ADR-0072 §5) ---
   artifacts.read:
     resources:
+      workspace: null
       task: "tasks.read"
       artifact: "artifacts.read@task"
   artifacts.write:
     resources:
+      workspace: null
       task: "tasks.write"
       artifact: "artifacts.write@task"
   # --- цели (CP-ADR-0062): решаются на воркспейсе цели (цель уровня
@@ -93,6 +96,11 @@ actions:
   task_types.read:
     resource: tenant
   task_types.manage:
+    resource: tenant
+  # --- реестр типов артефактов (CP-ADR-0072 §6) ---
+  artifact_types.read:
+    resource: tenant
+  artifact_types.manage:
     resource: tenant
   project_templates.read:
     resource: tenant

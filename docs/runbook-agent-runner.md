@@ -37,6 +37,7 @@ Runner — единственная часть системы, где агент
 | `CONTROL_PLANE_AGENT_WORKTREE_ROOT` | где живут рабочие копии |
 | `CONTROL_PLANE_AGENT_BASE_REF` | от чего ветвиться при создании рабочей копии; по умолчанию `HEAD` |
 | `CONTROL_PLANE_AGENT_PUSH_REMOTE` | remote для публикации веток; пусто — работа остаётся локальной |
+| `CONTROL_PLANE_AGENT_RUNTIME_DIR` | куда скачиваются входы задач (`<dir>/<publicId>/inputs/<key>/<name>`, CP-ADR-0072 §8); по умолчанию `<WORKTREE_ROOT>/.runtime` |
 | `IAM_PRINCIPAL` | какой Principal этой машины обслуживает процесс; обязателен, когда исполнителей несколько |
 | `CONTROL_PLANE_AGENT_NEIGHBOURS` | соседние репозитории для сборки: `platform-auth-sdk=<runner-root>/platform-auth-sdk.git` |
 | `CONTROL_PLANE_AGENT_SUPERPROJECT` | зеркало суперпроекта, чьи сабмодули закрепляют ревизии соседей |

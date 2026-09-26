@@ -46,11 +46,12 @@ from __future__ import annotations
 
 import logging
 import os
-from collections.abc import Awaitable
+from collections.abc import Awaitable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from control_plane_agent.inputs import LocalInput
 from control_plane_agent.instructions import (
     build_prompt,
     prompt_file_from_environment,
@@ -120,6 +121,7 @@ class CodexAdapter:
         run: dict[str, Any],
         client: ControlPlaneClient,
         workspace: Workspace | None,
+        inputs: Sequence[LocalInput] | None = None,
     ) -> list[ArtifactSpec]:
         run_id = str(run["id"])
         public_id = str(task.get("publicId") or task["id"])
@@ -148,7 +150,7 @@ class CodexAdapter:
                 },
             )
 
-        prompt = self._build_prompt(task, await self._context(client, task, run_id))
+        prompt = self._build_prompt(task, await self._context(client, task, run_id), inputs)
         action = await client.record_action(
             run_id,
             action="codex.turn",
@@ -265,12 +267,18 @@ class CodexAdapter:
             return {}
         return context if isinstance(context, dict) else {}
 
-    def _build_prompt(self, task: dict[str, Any], context: dict[str, Any]) -> str:
+    def _build_prompt(
+        self,
+        task: dict[str, Any],
+        context: dict[str, Any],
+        inputs: Sequence[LocalInput] | None = None,
+    ) -> str:
         return build_prompt(
             task,
             context,
             harness_note=SYSTEM_NOTE,
             conventions=read_conventions(self.prompt_file),
+            inputs=inputs,
         )
 
     async def _checkpoint(

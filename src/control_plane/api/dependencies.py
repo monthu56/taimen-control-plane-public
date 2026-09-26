@@ -10,6 +10,7 @@ from control_plane.application.authorization import AuthContext
 from control_plane.config import Settings
 from control_plane.infrastructure.auth.iam import IamEnforcement
 from control_plane.infrastructure.auth.service import resolve_auth_context
+from control_plane.infrastructure.content_store import ContentStore
 from control_plane.infrastructure.db.engine import transaction
 
 
@@ -34,6 +35,14 @@ async def get_db(
 
 
 DbDep = Annotated[AsyncSession, Depends(get_db)]
+
+
+def get_content_store(request: Request) -> ContentStore | None:
+    """``None`` when no store is configured (CP-ADR-0072 §3)."""
+    return cast(ContentStore | None, getattr(request.app.state, "content_store", None))
+
+
+ContentStoreDep = Annotated[ContentStore | None, Depends(get_content_store)]
 
 
 def get_iam_enforcement(request: Request) -> IamEnforcement | None:

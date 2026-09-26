@@ -14,6 +14,10 @@ And it runs the verification stage (CP-ADR-0067): open attempts of tasks
 handed in with acceptance checks are executed check by check, each look in
 its own transaction, waiting between looks on ``next_check_at``.
 
+With a content store configured it also sweeps artifact uploads no artifact
+referenced before they expired, and the objects nothing needs any more
+(CP-ADR-0072 §10).
+
 The worker is an availability optimization, not a correctness requirement:
 claims and sessions are also reaped lazily by the commands themselves.
 
@@ -44,6 +48,7 @@ from control_plane.application.commands.approval_outcomes import (
     execute_outcome,
     record_attempt_failure,
 )
+from control_plane.application.commands.artifacts import sweep_expired_uploads
 from control_plane.application.commands.rule_evaluations import (
     due_evaluations,
     due_rule_tenants,
@@ -70,6 +75,7 @@ from control_plane.application.events import record_event
 from control_plane.config import Settings
 from control_plane.domain.enums import ClaimStatus, SessionStatus
 from control_plane.infrastructure.auth.policy import build_authorizer
+from control_plane.infrastructure.content_store import ContentStore, build_content_store
 from control_plane.infrastructure.db.engine import (
     build_engine,
     build_session_factory,
@@ -95,9 +101,13 @@ class Worker:
         *,
         engine: AsyncEngine | None = None,
         authorizer: Authorizer | None = None,
+        content_store: ContentStore | None = None,
     ) -> None:
         self.settings = settings
         self.engine = engine or build_engine(settings)
+        self.content_store = (
+            content_store if content_store is not None else build_content_store(settings)
+        )
         # Outcome actions pass through the ordinary commands, which ask the
         # process-wide authorizer: without this the worker would answer from
         # the flat permission snapshot while the API asks the PDP, and a
@@ -153,6 +163,8 @@ class Worker:
             aclose = getattr(closable, "aclose", None)
             if aclose is not None:
                 await aclose()
+        if self.content_store is not None:
+            await self.content_store.aclose()
         await self.engine.dispose()
 
     async def run_once(self) -> dict[str, int]:
@@ -168,6 +180,7 @@ class Worker:
             "claims_expired": await self.expire_claims(),
             "skill_leases_expired": await self.expire_skill_invocation_leases(),
             "idempotency_cleaned": await self.cleanup_idempotency(),
+            "artifact_uploads_swept": await self.sweep_artifact_uploads(),
         }
         if any(stats.values()):
             logger.info("worker cycle", extra={"worker": self.name, **stats})
@@ -561,3 +574,11 @@ class Worker:
                 .returning(IdempotencyKey.key)
             )
             return len(result.all())
+
+    async def sweep_artifact_uploads(self) -> int:
+        """Uploads without an artifact past their TTL, and orphaned objects."""
+        if self.content_store is None:
+            return 0
+        return await sweep_expired_uploads(
+            self.session_factory, self.content_store, batch=_SWEEP_BATCH
+        )

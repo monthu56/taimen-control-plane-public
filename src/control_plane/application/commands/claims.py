@@ -89,6 +89,7 @@ async def _claim_locked_task(
     from control_plane.application.commands.approvals import check_approval_gate
     from control_plane.application.commands.eligibility import check_claim_eligibility
     from control_plane.application.commands.relations import check_task_readiness
+    from control_plane.application.commands.task_inputs import check_required_inputs
     from control_plane.application.commands.verification import check_verification_gate
 
     now = utcnow()
@@ -108,11 +109,13 @@ async def _claim_locked_task(
             },
         )
 
-    # Organizational eligibility (requirements), dependency readiness and the
-    # v0.3 approval gate are checked inside the claiming transaction, under
+    # Organizational eligibility (requirements), dependency readiness, required
+    # inputs and the v0.3 approval gate are checked inside the claiming transaction, under
     # the task row lock.
     await check_claim_eligibility(session, ctx, task, work_session.principal_id)
     await check_task_readiness(session, ctx, task)
+    # Inputs the type declares required are there (CP-ADR-0072 §8).
+    await check_required_inputs(session, ctx, task)
     await check_approval_gate(session, ctx, task.id)
     # Handed in and under verification (CP-ADR-0067): not work to take.
     await check_verification_gate(session, task)

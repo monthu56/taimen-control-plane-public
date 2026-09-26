@@ -8,10 +8,13 @@ exception.
 """
 
 import asyncio
+import hashlib
 import json
+import os
 import uuid
-from collections.abc import AsyncIterator, Sequence
+from collections.abc import AsyncIterator, Callable, Sequence
 from importlib import metadata as importlib_metadata
+from pathlib import Path
 from types import TracebackType
 from typing import Any
 
@@ -23,6 +26,9 @@ from control_plane_client.errors import ControlPlaneError, TransportError, error
 PROTOCOL_VERSION = "2"
 _RETRIES = 3
 _RETRY_BACKOFF = 0.5
+# Artifact content travels in chunks of this size, both ways: neither an upload
+# nor a download is ever held in memory whole (CP-ADR-0072 §2, §5).
+_CONTENT_CHUNK = 1024 * 1024
 
 Json = dict[str, Any]
 _UNSET: Any = object()
@@ -153,6 +159,56 @@ class ControlPlaneClient:
             result: Json = response.json()
             return result
         raise TransportError(str(last_error))  # pragma: no cover - loop always returns
+
+    async def _send(
+        self,
+        method: str,
+        path: str,
+        *,
+        content: Callable[[], Any] | None = None,
+        params: Json | None = None,
+        headers: dict[str, str] | None = None,
+        stream: bool = False,
+    ) -> httpx.Response:
+        """One raw request whose body or answer is bytes, not JSON.
+
+        ``content`` is a factory: the body is produced anew for the single
+        re-send after a refreshed credential, since a streamed file cannot be
+        replayed. With ``stream=True`` the answer is returned unread and the
+        caller closes it. An error answer raises the typed error, as
+        :meth:`_request` does.
+        """
+        refreshed = False
+        while True:
+            request = self._http.build_request(
+                method,
+                path,
+                content=content() if content is not None else None,
+                params=params,
+                headers={
+                    **(headers or {}),
+                    "Authorization": f"Bearer {await self._credential.token()}",
+                },
+            )
+            try:
+                response = await self._http.send(request, stream=stream)
+            except httpx.HTTPError as exc:
+                raise TransportError(f"{type(exc).__name__}: {exc}") from exc
+            if response.status_code == 401 and self._credential.refreshable and not refreshed:
+                refreshed = True
+                await response.aclose()
+                await self._credential.refresh()
+                continue
+            if response.status_code >= 400:
+                try:
+                    await response.aread()
+                    body = response.json()
+                except (ValueError, httpx.HTTPError):
+                    body = {}
+                finally:
+                    await response.aclose()
+                raise error_from_response(response.status_code, body)
+            return response
 
     # -- identity / context ----------------------------------------------------
 
@@ -1125,13 +1181,17 @@ class ControlPlaneClient:
         run_id: str | None = None,
         uri: str | None = None,
         content: Json | None = None,
+        content_ref: str | None = None,
         metadata: Json | None = None,
         supersedes_artifact_id: str | None = None,
         workspace_id: str | None = None,
         idempotency_key: str | None = None,
     ) -> Json:
         """``workspace_id`` is needed only for an artifact bound to neither a
-        task nor a run — otherwise the server derives it."""
+        task nor a run — otherwise the server derives it.
+
+        ``content_ref`` is the answer of :meth:`upload_artifact_content`; it
+        excludes ``uri`` and ``content`` (CP-ADR-0072 §1)."""
         body: Json = {"type": type, "name": name}
         if task_ref is not None:
             body["task"] = task_ref
@@ -1143,6 +1203,8 @@ class ControlPlaneClient:
             body["uri"] = uri
         if content is not None:
             body["content"] = content
+        if content_ref is not None:
+            body["contentRef"] = content_ref
         if metadata:
             body["metadata"] = metadata
         if supersedes_artifact_id is not None:
@@ -1161,6 +1223,93 @@ class ControlPlaneClient:
 
     async def list_artifacts(self, **params: Any) -> Json:
         return await self._request("GET", "/artifacts", params=params or None)
+
+    async def upload_artifact_content(
+        self, source: bytes | str | os.PathLike[str], *, media_type: str
+    ) -> Json:
+        """Upload the bytes of a file: ``{contentRef, sizeBytes, mediaType,
+        sha256, expiresAt}`` (CP-ADR-0072 §2).
+
+        The ``contentRef`` is then named in :meth:`create_artifact`. A path is
+        streamed from disk, never read whole. There is no Idempotency-Key and
+        no retry on a transport failure: a repeated upload is a new
+        ``contentRef`` for the same object, and one nobody references expires
+        on its own, so the caller may simply upload again.
+        """
+        if isinstance(source, bytes):
+            data = source
+
+            def body() -> Any:
+                return data
+
+            size = len(data)
+        else:
+            path = Path(source)
+            size = (await asyncio.to_thread(path.stat)).st_size
+
+            def body() -> Any:
+                return _file_chunks(path)
+
+        response = await self._send(
+            "PUT",
+            "/artifact-contents",
+            content=body,
+            headers={"Content-Type": media_type, "Content-Length": str(size)},
+        )
+        result: Json = response.json()
+        return result
+
+    async def download_artifact_content(
+        self,
+        artifact_id: str,
+        destination: str | os.PathLike[str],
+        *,
+        for_task: str | None = None,
+    ) -> Json:
+        """Stream the stored content of an artifact into ``destination``.
+
+        ``for_task`` reads the artifact as an input of that task (CP-ADR-0072
+        §5): the executor of the next step may have no right on the task that
+        produced it. The file appears only complete — it is written beside the
+        destination and renamed into place — and only when its sha256 matches
+        the ``ETag`` the server sent. Returns ``{path, sizeBytes, mediaType,
+        sha256}``.
+        """
+        target = Path(destination)
+        params = {"forTask": for_task} if for_task else None
+        response = await self._send(
+            "GET", f"/artifacts/{artifact_id}/content", params=params, stream=True
+        )
+        partial = target.with_name(f".{target.name}.{uuid.uuid4().hex}.part")
+        digest = hashlib.sha256()
+        size = 0
+        try:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            with partial.open("wb") as sink:
+                async for chunk in response.aiter_bytes(_CONTENT_CHUNK):
+                    digest.update(chunk)
+                    size += len(chunk)
+                    await asyncio.to_thread(sink.write, chunk)
+        except httpx.HTTPError as exc:
+            partial.unlink(missing_ok=True)
+            raise TransportError(f"{type(exc).__name__}: {exc}") from exc
+        except BaseException:
+            partial.unlink(missing_ok=True)
+            raise
+        finally:
+            await response.aclose()
+        sha256 = digest.hexdigest()
+        etag = response.headers.get("etag", "").strip('"')
+        if etag.startswith("sha256:") and etag.removeprefix("sha256:") != sha256:
+            partial.unlink(missing_ok=True)
+            raise ControlPlaneError(
+                "content_integrity_failed",
+                "Downloaded content does not match its sha256",
+                details={"artifactId": artifact_id, "expected": etag, "actual": sha256},
+            )
+        os.replace(partial, target)
+        media_type = response.headers.get("content-type", "application/octet-stream")
+        return {"path": str(target), "sizeBytes": size, "mediaType": media_type, "sha256": sha256}
 
     # -- approvals -------------------------------------------------------------
 
@@ -2034,6 +2183,13 @@ class ControlPlaneClient:
             json_body=body,
             idempotent=True,
         )
+
+
+async def _file_chunks(path: Path) -> AsyncIterator[bytes]:
+    """A file as chunks read off the event loop."""
+    with path.open("rb") as source:
+        while chunk := await asyncio.to_thread(source.read, _CONTENT_CHUNK):
+            yield chunk
 
 
 class HeartbeatRunner:

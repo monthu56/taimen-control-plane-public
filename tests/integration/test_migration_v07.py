@@ -19,7 +19,7 @@ from sqlalchemy.engine import Engine
 from tests.helpers import auth, create_agent_with_key, create_task, do_bootstrap, open_session
 
 V06_HEAD = "72ef8bc31a06"
-CURRENT_HEAD = "e8a4c2f6b1d9"
+CURRENT_HEAD = "c3f8a2d6e1b7"
 MANIFEST_TABLES = {"run_harness_manifests", "run_manifest_ephemerals"}
 CHILD_TABLES = {"run_child_handles", "run_child_results"}
 

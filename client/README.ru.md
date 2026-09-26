@@ -25,6 +25,13 @@ IAM Platform Access Token из `~/.config/iam/credentials.json`, Keychain или
 `succeed_run`, `fail_run`, `create_artifact`, `request_approval`), принимают
 `idempotency_key=` — иначе ключ генерируется на вызов.
 
+Содержимое артефактов (CP-ADR-0072): `upload_artifact_content(path_or_bytes,
+media_type=…)` загружает байты потоком и возвращает `contentRef`, который
+передаётся в `create_artifact(content_ref=…)`; `download_artifact_content(id,
+destination, for_task=…)` пишет содержимое в файл потоком, сверяет sha256 с
+`ETag` и кладёт файл на место только целиком; `for_task` читает артефакт как
+вход этой задачи.
+
 `control_plane_client.events` — SDK потребителя событий (CP-ADR-0069):
 `EventConsumer(client, types, workspace_id, cursor_store, handler, name=…)`
 читает журнал через фильтр подписки (префиксы типа, поддерево workspace),

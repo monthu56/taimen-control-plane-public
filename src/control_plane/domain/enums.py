@@ -110,6 +110,11 @@ class Permission(StrEnum):
     # the right to automate that is not implied by the right to file work.
     RULES_READ = "rules.read"
     RULES_WRITE = "rules.write"
+    # artifact-handoff (CP-ADR-0072 §6). Separate from artifacts.*: the right to
+    # hand in an artifact does not include the right to reshape what a type
+    # of artifact must look like.
+    ARTIFACT_TYPES_READ = "artifact_types.read"
+    ARTIFACT_TYPES_MANAGE = "artifact_types.manage"
     ADMIN = "admin"
 
 
@@ -134,6 +139,11 @@ class ProjectTemplateStatus(StrEnum):
 
 
 class TaskTypeStatus(StrEnum):
+    ACTIVE = "active"
+    DEPRECATED = "deprecated"
+
+
+class ArtifactTypeStatus(StrEnum):
     ACTIVE = "active"
     DEPRECATED = "deprecated"
 

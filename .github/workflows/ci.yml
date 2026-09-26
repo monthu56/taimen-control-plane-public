@@ -84,9 +84,25 @@ jobs:
           uv run ruff format --check .
       - name: Type check
         run: uv run mypy src
+      # S3-compatible store for the ContentStore contract test (CP-ADR-0072).
+      # A step, not a service: the MinIO image needs a command line.
+      - name: Start MinIO
+        run: |
+          docker run -d --name minio -p 9000:9000 \
+            -e MINIO_ROOT_USER=minioadmin -e MINIO_ROOT_PASSWORD=minioadmin \
+            minio/minio:RELEASE.2025-04-22T22-12-26Z server /data
+          for i in $(seq 1 30); do
+            curl -sf http://localhost:9000/minio/health/live && exit 0
+            sleep 1
+          done
+          docker logs minio
+          exit 1
       - name: Tests
         env:
           CP_TEST_DATABASE_URL: postgresql+psycopg://control_plane:control_plane@localhost:5434/control_plane_test
+          CP_TEST_S3_ENDPOINT_URL: http://localhost:9000
+          CP_TEST_S3_ACCESS_KEY_ID: minioadmin
+          CP_TEST_S3_SECRET_ACCESS_KEY: minioadmin
         run: uv run pytest -q
 
   docker:

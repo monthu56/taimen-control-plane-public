@@ -47,7 +47,7 @@ _TRUNCATE_SQL = text(
     "skill_invocations, "
     "approval_outcome_actions, attention_feedback, "
     "run_control_messages, run_child_results, run_child_handles, approvals, "
-    "task_context_packs, task_comment_revisions, task_comments, artifacts, "
+    "task_context_packs, task_comment_revisions, task_comments, artifacts, artifact_contents, "
     "run_manifest_ephemerals, run_harness_manifests, "
     "runs, task_relations, task_requirements, "
     "principal_roles, principal_capabilities, principal_skills, workspace_members, "

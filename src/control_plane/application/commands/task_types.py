@@ -23,6 +23,11 @@ from control_plane.domain.approval_outcomes import (
     parse_approval_schema,
     skill_calls,
 )
+from control_plane.domain.artifact_schema import (
+    ArtifactSchema,
+    check_against_artifact_types,
+    parse_artifact_schema,
+)
 from control_plane.domain.completion_work import parse_completion_schema
 from control_plane.domain.context_schema import parse_context_schema
 from control_plane.domain.enums import (
@@ -42,7 +47,7 @@ from control_plane.domain.work_item import (
     WorkItemLifecycle,
     parse_work_item_lifecycle,
 )
-from control_plane.infrastructure.db.models import Skill, Task, TaskType
+from control_plane.infrastructure.db.models import ArtifactType, Skill, Task, TaskType
 
 
 async def _lock_type_key(session: AsyncSession, tenant_id: uuid.UUID, key: str) -> None:
@@ -211,6 +216,24 @@ async def _check_outcome_skills(
             )
 
 
+async def _check_artifact_types(
+    session: AsyncSession, ctx: AuthContext, schema: ArtifactSchema
+) -> None:
+    """The artifact types ``schema`` names exist in the tenant (latest versions)."""
+    keys = schema.artifact_types()
+    if not keys:
+        return
+    rows = (
+        await session.execute(
+            select(ArtifactType.key, ArtifactType.media_types)
+            .where(ArtifactType.tenant_id == ctx.tenant_id, ArtifactType.key.in_(keys))
+            .order_by(ArtifactType.key, ArtifactType.version.desc())
+            .distinct(ArtifactType.key)
+        )
+    ).all()
+    check_against_artifact_types(schema, {key: list(media) for key, media in rows})
+
+
 async def create_task_type_version(
     session: AsyncSession,
     ctx: AuthContext,
@@ -225,6 +248,7 @@ async def create_task_type_version(
     context_schema: dict[str, Any] | None = None,
     instructions: str | None = None,
     completion_schema: dict[str, Any] | None = None,
+    artifact_schema: dict[str, Any] | None = None,
 ) -> TaskType:
     """Create the next version of ``key`` — never an in-place edit."""
     await authorize(ctx, Permission.TASK_TYPES_MANAGE)
@@ -262,6 +286,12 @@ async def create_task_type_version(
     # closed vocabulary, checked now for the same reason as the outcomes.
     after_completion = completion_schema or {}
     parse_completion_schema(after_completion)
+    # Inputs and outputs (CP-ADR-0072 §7): the artifact types they name must
+    # be registered now; their version is not pinned — an artifact is checked
+    # against the latest one.
+    handoff = artifact_schema or {}
+    io = parse_artifact_schema(handoff)
+    await _check_artifact_types(session, ctx, io)
 
     current_max = await session.scalar(
         select(func.max(TaskType.version)).where(
@@ -285,6 +315,7 @@ async def create_task_type_version(
         context_schema=profile,
         instructions=text,
         completion_schema=after_completion,
+        artifact_schema=handoff,
         status=TaskTypeStatus.ACTIVE,
         created_by=ctx.principal_id,
         created_at=now,
@@ -314,6 +345,9 @@ async def create_task_type_version(
             "declaresContextProfile": bool(profile),
             "declaresInstructions": bool(text),
             "declaresCompletionWork": bool(after_completion),
+            "declaresArtifactSchema": not io.empty,
+            "inputs": len(io.inputs),
+            "outputs": len(io.outputs),
         },
     )
     return task_type

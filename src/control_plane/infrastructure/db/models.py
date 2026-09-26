@@ -251,6 +251,10 @@ class TaskType(Base):
     # amendment 2026-09-25): {"onComplete": {"when": [...], "actions": [...]}}.
     # Part of the immutable version; empty means "nothing after completion".
     completion_schema: Mapped[dict[str, Any]] = mapped_column(default=dict)
+    # What artifacts a task of this version takes in and hands on
+    # (CP-ADR-0072 §7): {"inputs": [...], "outputs": [...]}. Part of the
+    # immutable version; empty means "no inputs, no outputs".
+    artifact_schema: Mapped[dict[str, Any]] = mapped_column(default=dict)
     status: Mapped[str] = mapped_column(Text, default="active")
     created_by: Mapped[uuid.UUID] = mapped_column(ForeignKey("principals.id"))
     created_at: Mapped[datetime]
@@ -1198,13 +1202,31 @@ class Run(Base):
 
 
 class Artifact(Base):
-    """Append-oriented work product; large payloads live behind `uri`."""
+    """Append-oriented work product: a reference (`uri`), small JSON (`content`)
+    or bytes in the content store (`content_state`, CP-ADR-0072)."""
 
     __tablename__ = "artifacts"
     __table_args__ = (
         Index("ix_artifacts_tenant_created", "tenant_id", "created_at", "id"),
         Index("ix_artifacts_task", "task_id"),
         Index("ix_artifacts_run", "run_id"),
+        CheckConstraint(
+            "content_state IN ('none', 'stored', 'purged')", name="content_state_valid"
+        ),
+        # Stored (or once stored) content always knows what it was.
+        CheckConstraint(
+            "(content_state = 'none') = (sha256 IS NULL)"
+            " AND (sha256 IS NULL) = (size_bytes IS NULL)"
+            " AND (sha256 IS NULL) = (media_type IS NULL)",
+            name="content_fields_consistent",
+        ),
+        # Is an object still referenced? — asked per (tenant, sha256).
+        Index(
+            "ix_artifacts_tenant_sha256",
+            "tenant_id",
+            "sha256",
+            postgresql_where=text("sha256 IS NOT NULL"),
+        ),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(primary_key=True)
@@ -1221,7 +1243,79 @@ class Artifact(Base):
     # Rows stay append-only; the chain is the revision history (ADR-0020).
     supersedes_artifact_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("artifacts.id"))
     metadata_json: Mapped[dict[str, Any]] = mapped_column("metadata", default=dict)
+    # Content in the store (CP-ADR-0072 §1): none | stored | purged. A purge
+    # keeps size, media type and checksum as the trace of what was there.
+    content_state: Mapped[str] = mapped_column(Text, default="none", server_default=text("'none'"))
+    size_bytes: Mapped[int | None] = mapped_column(BigInteger)
+    media_type: Mapped[str | None] = mapped_column(Text)
+    sha256: Mapped[str | None] = mapped_column(Text)
+    # Version of the registered artifact type checked at creation (§6).
+    type_version: Mapped[int | None] = mapped_column(Integer)
     created_at: Mapped[datetime]
+
+
+class ArtifactContent(Base):
+    """One upload of artifact bytes (CP-ADR-0072 §2, §4).
+
+    The id is the ``contentRef`` handed to the uploader. A row per upload,
+    not per object: the reference is bound to the principal who uploaded it
+    and to the media type they declared. The object itself is shared by
+    content inside the tenant (``storage_key``).
+    """
+
+    __tablename__ = "artifact_contents"
+    __table_args__ = (
+        CheckConstraint("size_bytes >= 0", name="size_non_negative"),
+        Index("ix_artifact_contents_tenant_sha256", "tenant_id", "sha256"),
+        Index("ix_artifact_contents_expires", "expires_at"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True)
+    tenant_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("tenants.id"))
+    uploaded_by_principal_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("principals.id"))
+    sha256: Mapped[str] = mapped_column(Text)
+    size_bytes: Mapped[int] = mapped_column(BigInteger)
+    media_type: Mapped[str] = mapped_column(Text)
+    storage_key: Mapped[str] = mapped_column(Text)
+    created_at: Mapped[datetime]
+    expires_at: Mapped[datetime]
+    # First artifact that referenced this upload; NULL = still unclaimed.
+    referenced_at: Mapped[datetime | None]
+
+
+class ArtifactType(Base):
+    """One immutable version of an artifact type (CP-ADR-0072 §6).
+
+    Versioned like ``task_types`` (ADR-0048): ``(tenant_id, key, version)`` is
+    unique and a database trigger rejects every UPDATE except ``status:
+    active -> deprecated``. An artifact of a registered type is checked
+    against the latest version of its key and records that version.
+    """
+
+    __tablename__ = "artifact_types"
+    __table_args__ = (
+        CheckConstraint("status IN ('active', 'deprecated')", name="status"),
+        CheckConstraint("version >= 1", name="version_positive"),
+        CheckConstraint("max_bytes >= 1", name="max_bytes_positive"),
+        UniqueConstraint("tenant_id", "key", "version", name="uq_artifact_types_key_version"),
+        Index("ix_artifact_types_tenant_created", "tenant_id", "created_at", "id"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True)
+    tenant_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("tenants.id"))
+    key: Mapped[str] = mapped_column(Text)
+    version: Mapped[int] = mapped_column(Integer)
+    display_name: Mapped[str] = mapped_column(Text)
+    description: Mapped[str] = mapped_column(Text, default="")
+    # JSON Schema for the artifact's metadata; empty means "any object".
+    metadata_schema: Mapped[dict[str, Any]] = mapped_column(default=dict)
+    # ["type/subtype" | "type/*" | "*/*"], lower case.
+    media_types: Mapped[list[str]] = mapped_column(JSONB)
+    max_bytes: Mapped[int] = mapped_column(BigInteger)
+    status: Mapped[str] = mapped_column(Text, default="active")
+    created_by: Mapped[uuid.UUID] = mapped_column(ForeignKey("principals.id"))
+    created_at: Mapped[datetime]
+    updated_at: Mapped[datetime]
 
 
 class TaskComment(Base):

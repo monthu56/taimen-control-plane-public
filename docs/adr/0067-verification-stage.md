@@ -10,7 +10,9 @@ T002 (TASK-000393) — попытки, критерий `deterministic`, про�
 (TASK-000395) — правила ([ADR-0063](0063-work-derivation-rules.md), амендмент
 2026-09-25, и «Реализация T004» ниже);
 T005 (TASK-000396) — пакет-фикстура второго домена (см. «Реализация
-T005»).
+T005»). Амендмент 2026-09-26 ([ADR-0072](0072-artifact-content-types-task-io.md),
+фича `artifact-handoff`): критерий `artifact` и выходы типа задачи как
+неявные критерии — реализует A006 (TASK-000522).
 
 Контекст: ADR-0062 (acceptance и evidence задачи — п.4 оставлял `spec` без
 интерпретации до M1.6); ADR-0063 (правила вывода работы); ADR-0061 (исходы
@@ -350,6 +352,102 @@ evidence и approvals. В них нет понятий конкретного д
   `deterministic`), теперь — `422 invalid_acceptance_spec`.
 - Worker получает четвёртый вид работы — проход проверок.
 
+## Амендмент 2026-09-26 (CP-ADR-0072): критерий `artifact`, выходы типа — неявные критерии
+
+Фича `artifact-handoff` (TASK-000518, реализация — A006 TASK-000522). Тип
+задачи объявляет выходы (`artifactSchema.outputs`,
+[ADR-0072](0072-artifact-content-types-task-io.md) п.7); задача не должна
+становиться выполненной, пока обязательный выход не сдан (FR-006, SC-003).
+
+### В1. Грамматика: `deterministic` с ключом `artifact`
+
+У `deterministic` вторая форма `spec` — **`{artifact: {type, mediaTypes?,
+content?}}`**; `skill` и `artifact` взаимоисключают друг друга (ни того, ни
+другого — прежний `deterministic` без скилла, п.4).
+
+- `type` — ключ типа артефакта; тип должен быть зарегистрирован в tenant
+  (ADR-0072 п.6). Существование проверяет прикладной слой при записи, как
+  реестр скиллов, — иначе `422 invalid_acceptance_spec`,
+  `details.field = acceptance[i].spec.artifact.type`.
+- `mediaTypes` — непустой список media type или шаблонов `type/*`.
+- `content` — `required | optional`, по умолчанию `required`.
+- Прочие ключи внутри `artifact` и `inputs`/`expect` рядом с ним — `422
+  invalid_acceptance_spec`.
+
+| kind | `spec` | когда пройден |
+|---|---|---|
+| `deterministic` | `{artifact: {type, mediaTypes?, content?}}` | у задачи есть head-ревизия (ADR-0020) артефакта этого `type`, её `mediaType` подходит под `mediaTypes` (если заданы), при `content: required` — `contentState = stored` |
+
+### В2. Исполнение — синхронно, по записям
+
+`_artifact_check` в `commands/verification.py` исполняется в проходе
+попытки без ожидания и без вызова скилла: смотрит только записи артефактов
+**самой задачи** (не входы, не связанные задачи). Хранилище содержимого не
+читается — его недоступность проверку не проваливает; сдать файл, пока
+хранилище недоступно, всё равно нельзя. Подходит хотя бы одна head-ревизия —
+`passed`, evidence `{kind: artifact, ref: <artifactId>}`. Иначе провал с
+причиной по первой неудаче: `artifact_missing` (нет head-ревизии типа),
+`artifact_media_type` (есть, но media type не подходит; у артефакта-ссылки
+`mediaType` нет, и при заданных `mediaTypes` он не подходит),
+`artifact_content_missing` (нет содержимого, в том числе удалённого
+`:purge-content`). Дальше — обычный провал п.5: задача возвращается
+исполнителю, третий подряд — `blocked`.
+
+### В3. Обязательные выходы типа — неявные критерии
+
+Меняется п.1 и «Реализация T004»: критерии попытки при **каждом** завершении
+(`finish_locked_task`, все пути, включая `complete_work` правила) — это
+неявные критерии обязательных выходов типа задачи, **затем** acceptance
+задачи (или, если он пуст и задачу закрывает правило, неявный
+`rule-evidence`). Задача с обязательным выходом проходит стадию проверки,
+даже когда её acceptance пуст: мимо стадии к «выполнено» без выхода пути
+нет. Задача без acceptance, у типа которой нет обязательных выходов, по-прежнему
+выполняется сразу.
+
+- Неявный критерий выхода: `{key: "output.<key>", kind: deterministic,
+  description: "Required output <key> (<type>)", spec: {artifact: {type,
+  mediaTypes?, content}}}` из объявления выхода версии типа задачи; выходы с
+  `required: false` критериями не становятся.
+- Выходы идут **первыми**: это дешёвая детерминированная проверка, и без
+  результата решение человека по критерию `human` бессмысленно — это и есть
+  советуемый порядок п.3. Порядок самого acceptance не меняется.
+- Префикс ключа `output.` зарезервирован: acceptance с таким ключом при
+  записи — `422 invalid_acceptance` (`details.field`). Сохранённый раньше
+  критерий с тем же ключом заменяется неявным.
+- Неявные критерии входят в `checks` попытки (снимок на момент открытия) и
+  видны в `GET /tasks/{ref}/verifications` и в `task.verification_*`
+  (`checks` — число всех критериев попытки).
+- Граница «критериев по умолчанию у типа задачи нет» уточняется: у типа
+  есть ровно такие — обязательные выходы; иных критериев тип не объявляет.
+
+### Реализация A006 (TASK-000522)
+
+- Грамматика — `check_spec` в `domain/work_graph.py`: `artifact` рядом со
+  `skill`, `inputs` или `expect` — `details.field = acceptance[i].spec`;
+  ключ `type` — по грамматике ключа типа артефакта (`TYPE_KEY_RE` из
+  `domain/artifact_schema.py`); `mediaTypes` — от 1 до 50 шаблонов, при
+  сравнении приводятся к нижнему регистру. Незарегистрированный тип
+  отвергает `check_acceptance_skills` (он же проверяет скиллы) по
+  **последней** версии типа артефакта.
+- Резерв префикса `output.` проверяет `normalize_checks` только для
+  acceptance задачи (`typed_spec`); критерии цели не проверяются.
+- Неявные критерии строит `output_checks` (`domain/work_graph.py`) из
+  `artifactSchema` версии типа, которую несёт задача; `mediaTypes` —
+  из объявления выхода, если он их объявляет, иначе ключа нет (media type
+  артефакта уже проверен его типом при записи, п.6 ADR-0072).
+  `finish_locked_task` склеивает их с acceptance (или неявным
+  `rule-evidence`) до открытия попытки.
+- `_artifact_check`: head-ревизии типа на задаче, от новой к старой; при
+  нескольких подходящих evidence цитирует самую новую. Артефакт-ссылка
+  (`contentState = none`) при `content: required` не проходит, JSON-артефакт
+  тоже: содержимое — только загруженные байты.
+
+### В4. Нейтральность
+
+`_artifact_check` знает только тип артефакта, media type и состояние
+содержимого; ветвлений по типу задачи или пакету нет. Пробы `absent` ниже
+по `commands/verification.py` и `domain/work_graph.py` остаются в силе.
+
 ## Conformance
 
 Пробы для `adr.conformance_check` (пилот «саморазработка»):
@@ -396,5 +494,11 @@ evidence и approvals. В них нет понятий конкретного д
 - grep: {path: tests/integration/test_invoice_payment_package.py, pattern: 'test_a_paid_invoice_is_done_only_after_the_bank_and_the_director'}
   repo: control-plane
 - grep: {path: tests/integration/test_invoice_payment_package.py, pattern: 'test_two_packages_in_one_tenant_do_not_touch_each_others_work'}
+  repo: control-plane
+- grep: {path: src/control_plane/domain/work_graph.py, pattern: 'CheckKind\.DETERMINISTIC: frozenset\(\{[^}]*"artifact"'}
+  repo: control-plane
+- grep: {path: src/control_plane/application/commands/verification.py, pattern: 'async def _artifact_check\('}
+  repo: control-plane
+- grep: {path: src/control_plane/application/commands/verification.py, pattern: '"artifact_missing"'}
   repo: control-plane
 ```

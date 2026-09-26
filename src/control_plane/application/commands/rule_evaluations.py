@@ -51,6 +51,7 @@ from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from control_plane.application.authorization import AuthContext, ResourceRef, authorize
+from control_plane.application.commands._artifact_content import artifact_event_fields
 from control_plane.application.commands.approval_outcomes import require_active_credential
 from control_plane.application.commands.approvals import request_approval
 from control_plane.application.commands.goals import get_readable_goal
@@ -1253,6 +1254,7 @@ async def _record_skill_artifact(
             "supersedesArtifactId": None,
             "skillInvocationId": str(invocation.id),
             "ruleEvaluationId": str(row.id),
+            **artifact_event_fields(artifact),
         },
     )
     return artifact

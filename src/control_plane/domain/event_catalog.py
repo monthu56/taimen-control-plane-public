@@ -831,23 +831,33 @@ _register(
         }
     ),
 )
+_TASK_TYPE_CREATED_V1: dict[str, JsonSchema] = {
+    "key": STR,
+    "version": INT,
+    "displayName": STR,
+    "initialStatus": ANY,
+    "completionStatus": ANY,
+    "execution": ANY,
+    "declaresApprovalOutcomes": BOOL,
+    "declaresContextProfile": BOOL,
+    "declaresInstructions": BOOL,
+    "declaresCompletionWork": BOOL,
+}
 _register(
     "task_type.created",
     "task_type",
     "A task type version was created (ADR-0048).",
-    data(
-        {
-            "key": STR,
-            "version": INT,
-            "displayName": STR,
-            "initialStatus": ANY,
-            "completionStatus": ANY,
-            "execution": ANY,
-            "declaresApprovalOutcomes": BOOL,
-            "declaresContextProfile": BOOL,
-            "declaresInstructions": BOOL,
-            "declaresCompletionWork": BOOL,
-        }
+    data(_TASK_TYPE_CREATED_V1),
+    (
+        data(
+            {
+                **_TASK_TYPE_CREATED_V1,
+                "declaresArtifactSchema": BOOL,
+                "inputs": described(INT, "Number of declared artifact inputs"),
+                "outputs": described(INT, "Number of declared artifact outputs"),
+            }
+        ),
+        "declaresArtifactSchema, inputs, outputs (CP-ADR-0072)",
     ),
 )
 _register(
@@ -1048,20 +1058,90 @@ _register(
 
 # --- artifacts, observations, goals -----------------------------------------
 
+_ARTIFACT_CREATED_V1 = {
+    "type": STR,
+    "name": STR,
+    "taskId": UUID_N,
+    "runId": UUID_N,
+    "uri": ANY,
+    "supersedesArtifactId": UUID_N,
+}
+_ARTIFACT_CREATED_OPTIONAL = {
+    "skillInvocationId": UUID,
+    "ruleEvaluationId": UUID,
+    "verificationId": UUID,
+}
+_CONTENT_STATE: JsonSchema = {"type": "string", "enum": ["none", "stored", "purged"]}
+_SHA256: JsonSchema = {"type": "string", "pattern": "^[0-9a-f]{64}$"}
 _register(
     "artifact.created",
     "artifact",
     "An artifact was recorded.",
+    data(_ARTIFACT_CREATED_V1, _ARTIFACT_CREATED_OPTIONAL),
+    (
+        data(
+            {
+                **_ARTIFACT_CREATED_V1,
+                "sizeBytes": described(INT_N, "Size of the stored content; null without one"),
+                "mediaType": STR_N,
+                "sha256": nullable(_SHA256),
+                "contentState": _CONTENT_STATE,
+                "typeVersion": described(
+                    INT_N, "Version of the registered artifact type it was checked against"
+                ),
+            },
+            _ARTIFACT_CREATED_OPTIONAL,
+        ),
+        "sizeBytes, mediaType, sha256, contentState, typeVersion (CP-ADR-0072)",
+    ),
+)
+_register(
+    "artifact.content_read",
+    "artifact",
+    "The bytes of an artifact were handed out (CP-ADR-0072 §5).",
     data(
         {
-            "type": STR,
-            "name": STR,
+            "artifactId": UUID,
             "taskId": UUID_N,
-            "runId": UUID_N,
-            "uri": ANY,
-            "supersedesArtifactId": UUID_N,
-        },
-        {"skillInvocationId": UUID, "ruleEvaluationId": UUID, "verificationId": UUID},
+            "forTaskId": described(UUID_N, "Receiving task when read as its input"),
+            "runId": described(UUID_N, "The reader's running run on that task, if any"),
+            "sha256": _SHA256,
+            "sizeBytes": INT,
+        }
+    ),
+)
+_register(
+    "artifact.content_purged",
+    "artifact",
+    "The bytes of an artifact were removed by an administrator; the record stays.",
+    data(
+        {
+            "artifactId": UUID,
+            "taskId": UUID_N,
+            "sha256": _SHA256,
+            "sizeBytes": INT,
+            "reason": described(
+                {"type": "string", "maxLength": PAYLOAD_TEXT_LIMIT},
+                "Reason given; credential-shaped material redacted, cut to the limit",
+            ),
+            "objectDeleted": described(
+                BOOL, "False when other artifacts or uploads still need the object"
+            ),
+        }
+    ),
+)
+_register(
+    "artifact_type.created",
+    "artifact_type",
+    "An artifact type version was created (CP-ADR-0072).",
+    data(
+        {
+            "key": STR,
+            "version": INT,
+            "mediaTypes": ARR,
+            "maxBytes": INT,
+            "declaresMetadataSchema": BOOL,
+        }
     ),
 )
 _register(

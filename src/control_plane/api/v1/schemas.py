@@ -139,7 +139,8 @@ class AcceptanceCheckSpec(ApiModel):
     """One declared check, executed by the verification stage (CP-ADR-0067).
 
     On a task, ``spec`` follows the grammar of ``kind``: ``deterministic`` —
-    ``{skill: name@version, inputs?, expect?}``; ``external_state`` —
+    ``{skill: name@version, inputs?, expect?}`` or ``{artifact: {type,
+    mediaTypes?, content?}}``; ``external_state`` —
     ``{event?}``; ``human`` — ``{approver? | approverRole?}``; ``llm_judge`` —
     as ``human`` plus ``rubric?``. A spec outside it is
     ``422 invalid_acceptance_spec``. On a goal it is not interpreted.
@@ -963,8 +964,14 @@ class ArtifactCreateRequest(ApiModel):
     workspace_id: uuid.UUID | None = None
     uri: str | None = Field(default=None, max_length=2000)
     content: dict[str, Any] | None = None
+    # An upload of PUT /artifact-contents (CP-ADR-0072 §2); excludes uri and content.
+    content_ref: str | None = Field(default=None, min_length=1, max_length=100)
     metadata: dict[str, Any] = Field(default_factory=dict)
     supersedes_artifact_id: uuid.UUID | None = None
+
+
+class ArtifactPurgeContentRequest(ApiModel):
+    reason: str = Field(min_length=1, max_length=2000)
 
 
 class TaskCommentCreateRequest(ApiModel):
@@ -1216,7 +1223,26 @@ class ArtifactOut(ApiModel):
     content: dict[str, Any] | None
     supersedes_artifact_id: uuid.UUID | None
     metadata_json: dict[str, Any] = Field(serialization_alias="metadata")
+    # Content in the store (CP-ADR-0072 §1): none | stored | purged; the other
+    # fields are null without stored (or once stored) content.
+    content_state: str
+    size_bytes: int | None
+    media_type: str | None
+    sha256: str | None
+    # Version of the registered artifact type it was checked against
+    # (CP-ADR-0072 §6); null for an unregistered type.
+    type_version: int | None
     created_at: datetime
+
+
+class ArtifactContentOut(ApiModel):
+    """An upload waiting for an artifact to reference it (CP-ADR-0072 §2)."""
+
+    content_ref: str
+    size_bytes: int
+    media_type: str
+    sha256: str
+    expires_at: datetime
 
 
 class TaskCommentOut(ApiModel):
@@ -1388,6 +1414,9 @@ class TaskTypeCreateRequest(ApiModel):
     # CP-ADR-0061 amendment 2026-09-25: work core files once a task of this
     # version is completed ({"onComplete": {"when", "actions"}}).
     completion_schema: dict[str, Any] = Field(default_factory=dict)
+    # CP-ADR-0072 §7: artifacts a task of this version takes in and hands on
+    # ({"inputs": [...], "outputs": [...]}); checked against the registry.
+    artifact_schema: dict[str, Any] = Field(default_factory=dict)
 
 
 class TaskTypeOut(ApiModel):
@@ -1404,6 +1433,40 @@ class TaskTypeOut(ApiModel):
     context_schema: dict[str, Any]
     instructions: str = ""
     completion_schema: dict[str, Any] = Field(default_factory=dict)
+    artifact_schema: dict[str, Any] = Field(default_factory=dict)
+    status: str
+    created_by: uuid.UUID
+    created_at: datetime
+    updated_at: datetime
+
+
+class ArtifactTypeCreateRequest(ApiModel):
+    """Creating a version, never editing one: the server allocates `version`.
+
+    ``mediaTypes`` and ``maxBytes`` are checked by the command, so an empty
+    list or a ceiling above ``CP_ARTIFACT_MAX_BYTES`` is ``invalid_artifact_type``
+    like every other defect of the definition (CP-ADR-0072 §6).
+    """
+
+    key: str = _TYPE_KEY_FIELD
+    display_name: str = Field(min_length=1, max_length=200)
+    description: str = Field(default="", max_length=2000)
+    metadata_schema: dict[str, Any] = Field(default_factory=dict)
+    media_types: list[Any]
+    # Omitted: the global ceiling at the time of creation.
+    max_bytes: int | None = None
+
+
+class ArtifactTypeOut(ApiModel):
+    id: uuid.UUID
+    tenant_id: uuid.UUID
+    key: str
+    version: int
+    display_name: str
+    description: str
+    metadata_schema: dict[str, Any]
+    media_types: list[str]
+    max_bytes: int
     status: str
     created_by: uuid.UUID
     created_at: datetime

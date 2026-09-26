@@ -44,7 +44,10 @@ N+1 без изменений и игнорирует незнакомые по�
 | [`approval.outcome_failed`](#approvaloutcome_failed) | `approval` | 1 | An outcome action failed; the remaining actions stay for replay. |
 | [`approval.rejected`](#approvalrejected) | `approval` | 2 | The approval was rejected by an eligible principal. |
 | [`approval.requested`](#approvalrequested) | `approval` | 2 | A decision was requested from a principal or from the holders of a role. |
-| [`artifact.created`](#artifactcreated) | `artifact` | 1 | An artifact was recorded. |
+| [`artifact.content_purged`](#artifactcontent_purged) | `artifact` | 1 | The bytes of an artifact were removed by an administrator; the record stays. |
+| [`artifact.content_read`](#artifactcontent_read) | `artifact` | 1 | The bytes of an artifact were handed out (CP-ADR-0072 §5). |
+| [`artifact.created`](#artifactcreated) | `artifact` | 2 | An artifact was recorded. |
+| [`artifact_type.created`](#artifact_typecreated) | `artifact_type` | 1 | An artifact type version was created (CP-ADR-0072). |
 | [`attention.feedback_recorded`](#attentionfeedback_recorded) | `attention_feedback` | 1 | A principal judged an item of its attention list (CP-ADR-0071). |
 | [`capability.assigned`](#capabilityassigned) | `principal` | 1 | A capability was assigned to the principal. |
 | [`capability.created`](#capabilitycreated) | `capability` | 1 | A capability was created. |
@@ -135,7 +138,7 @@ N+1 без изменений и игнорирует незнакомые по�
 | [`task.verification_failed`](#taskverification_failed) | `task` | 1 | An acceptance check failed; the task went back to its executor or got blocked. |
 | [`task.verification_started`](#taskverification_started) | `task` | 1 | A verification attempt of the task's acceptance checks opened (CP-ADR-0067). |
 | [`task.verified`](#taskverified) | `task` | 1 | Every acceptance check passed; the task is complete. |
-| [`task_type.created`](#task_typecreated) | `task_type` | 1 | A task type version was created (ADR-0048). |
+| [`task_type.created`](#task_typecreated) | `task_type` | 2 | A task type version was created (ADR-0048). |
 | [`task_type.deprecated`](#task_typedeprecated) | `task_type` | 1 | A task type version was deprecated. |
 | [`tenant.bootstrapped`](#tenantbootstrapped) | `tenant` | 1 | The tenant was created with its first administrator. |
 | [`work.derived`](#workderived) | `task` | 1 | A rule derived new work. |
@@ -342,11 +345,64 @@ A decision was requested from a principal or from the holders of a role.
 | `assignedPrincipalId` | string \| null (uuid) | да | Set when one principal decides |
 | `gate` | boolean | да | A gate holds the task's claim and completion until decided |
 
+### artifact.content_purged
+
+The bytes of an artifact were removed by an administrator; the record stays.
+
+Сущность: `artifact`.
+
+Версия 1:
+
+| Поле | Тип | Всегда | Описание |
+|---|---|---|---|
+| `artifactId` | string (uuid) | да |  |
+| `taskId` | string \| null (uuid) | да |  |
+| `sha256` | string | да |  |
+| `sizeBytes` | integer | да |  |
+| `reason` | string | да | Reason given; credential-shaped material redacted, cut to the limit |
+| `objectDeleted` | boolean | да | False when other artifacts or uploads still need the object |
+
+### artifact.content_read
+
+The bytes of an artifact were handed out (CP-ADR-0072 §5).
+
+Сущность: `artifact`.
+
+Версия 1:
+
+| Поле | Тип | Всегда | Описание |
+|---|---|---|---|
+| `artifactId` | string (uuid) | да |  |
+| `taskId` | string \| null (uuid) | да |  |
+| `forTaskId` | string \| null (uuid) | да | Receiving task when read as its input |
+| `runId` | string \| null (uuid) | да | The reader's running run on that task, if any |
+| `sha256` | string | да |  |
+| `sizeBytes` | integer | да |  |
+
 ### artifact.created
 
 An artifact was recorded.
 
 Сущность: `artifact`.
+
+Версия 2 (добавлено: sizeBytes, mediaType, sha256, contentState, typeVersion (CP-ADR-0072)):
+
+| Поле | Тип | Всегда | Описание |
+|---|---|---|---|
+| `type` | string | да |  |
+| `name` | string | да |  |
+| `taskId` | string \| null (uuid) | да |  |
+| `runId` | string \| null (uuid) | да |  |
+| `uri` | any | да |  |
+| `supersedesArtifactId` | string \| null (uuid) | да |  |
+| `sizeBytes` | integer \| null | да | Size of the stored content; null without one |
+| `mediaType` | string \| null | да |  |
+| `sha256` | string \| null | да |  |
+| `contentState` | string | да |  |
+| `typeVersion` | integer \| null | да | Version of the registered artifact type it was checked against |
+| `skillInvocationId` | string (uuid) | нет |  |
+| `ruleEvaluationId` | string (uuid) | нет |  |
+| `verificationId` | string (uuid) | нет |  |
 
 Версия 1:
 
@@ -361,6 +417,22 @@ An artifact was recorded.
 | `skillInvocationId` | string (uuid) | нет |  |
 | `ruleEvaluationId` | string (uuid) | нет |  |
 | `verificationId` | string (uuid) | нет |  |
+
+### artifact_type.created
+
+An artifact type version was created (CP-ADR-0072).
+
+Сущность: `artifact_type`.
+
+Версия 1:
+
+| Поле | Тип | Всегда | Описание |
+|---|---|---|---|
+| `key` | string | да |  |
+| `version` | integer | да |  |
+| `mediaTypes` | array | да |  |
+| `maxBytes` | integer | да |  |
+| `declaresMetadataSchema` | boolean | да |  |
 
 ### attention.feedback_recorded
 
@@ -1830,6 +1902,24 @@ Every acceptance check passed; the task is complete.
 A task type version was created (ADR-0048).
 
 Сущность: `task_type`.
+
+Версия 2 (добавлено: declaresArtifactSchema, inputs, outputs (CP-ADR-0072)):
+
+| Поле | Тип | Всегда | Описание |
+|---|---|---|---|
+| `key` | string | да |  |
+| `version` | integer | да |  |
+| `displayName` | string | да |  |
+| `initialStatus` | any | да |  |
+| `completionStatus` | any | да |  |
+| `execution` | any | да |  |
+| `declaresApprovalOutcomes` | boolean | да |  |
+| `declaresContextProfile` | boolean | да |  |
+| `declaresInstructions` | boolean | да |  |
+| `declaresCompletionWork` | boolean | да |  |
+| `declaresArtifactSchema` | boolean | да |  |
+| `inputs` | integer | да | Number of declared artifact inputs |
+| `outputs` | integer | да | Number of declared artifact outputs |
 
 Версия 1:
 

@@ -20,6 +20,7 @@ dependencies = [
     "control-plane-client",
     "regex>=2024.11.6",
     "anyio>=4.4",
+    "boto3>=1.35",
 ]
 
 # Enforcement SDK — отдельный product-neutral репозиторий, общий для всех
@@ -43,6 +44,7 @@ dev = [
     "types-regex>=2026.9.10.20260911",
     "pytest-timeout>=2.3",
     "pyyaml>=6.0",
+    "boto3-stubs[s3]>=1.43.103",
 ]
 
 [project.scripts]

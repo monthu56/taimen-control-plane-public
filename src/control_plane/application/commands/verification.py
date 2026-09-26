@@ -17,6 +17,13 @@ the checks in the order they are declared:
   (``requestedBy.kind = verification``) and bound to the task; it passes when
   the call succeeds and its output equals ``expect``. A call without a result
   after ``skill_timeout`` is cancelled and the check fails ``no_result``;
+* **artifact** — a ``deterministic`` check with an ``artifact`` passes at
+  once, without waiting, when a head revision (ADR-0020) of an artifact of
+  that type on the task itself fits its media types and, if content is
+  required, has it stored (CP-ADR-0072 §9); otherwise it fails
+  ``artifact_missing``, ``artifact_media_type`` or
+  ``artifact_content_missing``. The required outputs of the task's type are
+  such checks, run before its acceptance on every completion;
 * **evidence** — an ``external_state`` check, and a ``deterministic`` one
   without a skill, passes by evidence of the task tied to it (with ``event``,
   an observation of that kind); none after ``external_timeout`` is
@@ -46,10 +53,15 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Any
 
-from sqlalchemy import func, select, update
+from sqlalchemy import exists, func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import aliased
 
 from control_plane.application.authorization import AuthContext
+from control_plane.application.commands._artifact_content import (
+    CONTENT_STORED,
+    artifact_event_fields,
+)
 from control_plane.application.commands.approval_outcomes import (
     DecisionContext,
     authority_snapshot,
@@ -58,6 +70,7 @@ from control_plane.application.commands.approval_outcomes import (
     require_active_credential,
     task_view,
 )
+from control_plane.application.commands.artifact_types import latest_artifact_type
 from control_plane.application.commands.principals import ensure_core_principal
 from control_plane.application.commands.skill_invocations import (
     CANCELLED_BY_SYSTEM,
@@ -72,6 +85,8 @@ from control_plane.application.commands.tasks import mark_task_completed
 from control_plane.application.common import new_uuid, utcnow
 from control_plane.application.events import record_event
 from control_plane.domain.approval_outcomes import Path, expressions_in, render
+from control_plane.domain.artifact_schema import CONTENT_REQUIRED
+from control_plane.domain.artifact_type import media_type_allowed
 from control_plane.domain.enums import (
     ApprovalStatus,
     Permission,
@@ -124,6 +139,9 @@ SKILL_CANCELLED = "skill_cancelled"
 APPROVAL_REJECTED = "approval_rejected"
 APPROVAL_CANCELLED = "approval_cancelled"
 NO_APPROVER = "no_approver"
+ARTIFACT_MISSING = "artifact_missing"
+ARTIFACT_MEDIA_TYPE = "artifact_media_type"
+ARTIFACT_CONTENT_MISSING = "artifact_content_missing"
 # Why an attempt was cancelled.
 TASK_CANCELLED = "task_cancelled"
 # The reason given to a skill call the stage stops waiting for.
@@ -200,16 +218,30 @@ async def check_acceptance_skills(
     *,
     field: str = "acceptance",
 ) -> None:
-    """The skills ``deterministic`` checks name exist and write nothing outside.
+    """What ``deterministic`` checks name is registered; their skills write nothing outside.
 
-    The grammar (``check_spec``) knows the form only; the registry is asked
-    here, when the acceptance is written. A check whose skill is
+    The grammar (``check_spec``) knows the form only; the registries are
+    asked here, when the acceptance is written. A check whose skill is
     ``external_write`` is refused: a verification has no approval that could
-    be the basis of an external write (ADR-0056 §4).
+    be the basis of an external write (ADR-0056 §4). A check on an artifact
+    names an artifact type registered in the tenant (CP-ADR-0072 §9).
     """
     for index, check in enumerate(checks):
-        ref = (check.get("spec") or {}).get("skill")
-        if check["kind"] != CheckKind.DETERMINISTIC or not ref:
+        if check["kind"] != CheckKind.DETERMINISTIC:
+            continue
+        spec = check.get("spec") or {}
+        artifact = spec.get("artifact")
+        if artifact is not None:
+            path = f"{field}[{index}].spec.artifact.type"
+            if await latest_artifact_type(session, ctx.tenant_id, artifact["type"]) is None:
+                raise ValidationError(
+                    INVALID_ACCEPTANCE_SPEC,
+                    f"{path}: artifact type {artifact['type']!r} is not registered",
+                    details={"field": path, "kind": check["kind"]},
+                )
+            continue
+        ref = spec.get("skill")
+        if not ref:
             continue
         path = f"{field}[{index}].spec.skill"
         try:
@@ -453,6 +485,8 @@ async def _look(
     spec = check.get("spec") or {}
     if kind == CheckKind.DETERMINISTIC and spec.get("skill"):
         return await _skill_check(session, ctx, task, row, spec, timing)
+    if kind == CheckKind.DETERMINISTIC and spec.get("artifact"):
+        return await _artifact_check(session, task, spec["artifact"])
     if kind in (CheckKind.DETERMINISTIC, CheckKind.EXTERNAL_STATE):
         return await _evidence_check(session, task, row, check, spec, timing)
     return await _decision_check(session, ctx, task, row, check)
@@ -606,6 +640,60 @@ async def _stop_call(
         # The completer's authority can no longer cancel it (its lease bounds
         # it anyway); the attempt does not wait for its result either way.
         return
+
+
+# --- deterministic: an artifact of the task -------------------------------------
+
+
+async def _artifact_check(session: AsyncSession, task: Task, spec: dict[str, Any]) -> _Outcome:
+    """A head revision of the artifact type on the task itself, looked at now.
+
+    Records only: the content store is not read, so its outage fails nothing
+    here. The reason is that of the first step no head revision gets past:
+    none of the type, none of the media types, none with stored content.
+    """
+    newer = aliased(Artifact)
+    heads = (
+        await session.scalars(
+            select(Artifact)
+            .where(
+                Artifact.tenant_id == task.tenant_id,
+                Artifact.task_id == task.id,
+                Artifact.type == spec["type"],
+                ~exists().where(
+                    newer.tenant_id == task.tenant_id, newer.supersedes_artifact_id == Artifact.id
+                ),
+            )
+            .order_by(Artifact.created_at.desc(), Artifact.id.desc())
+            .execution_options(populate_existing=True)
+        )
+    ).all()
+    if not heads:
+        return _Outcome(
+            FAILED,
+            reason=ARTIFACT_MISSING,
+            message=f"the task has no artifact of type {spec['type']!r}",
+        )
+    patterns = [p.strip().lower() for p in spec.get("mediaTypes") or ()]
+    if patterns:
+        # A reference has no media type: it fits no declared one.
+        heads = [a for a in heads if a.media_type and media_type_allowed(patterns, a.media_type)]
+        if not heads:
+            return _Outcome(
+                FAILED,
+                reason=ARTIFACT_MEDIA_TYPE,
+                message=f"no artifact of type {spec['type']!r} has a media type in {patterns}",
+            )
+    if spec.get("content", CONTENT_REQUIRED) == CONTENT_REQUIRED:
+        heads = [a for a in heads if a.content_state == CONTENT_STORED]
+        if not heads:
+            return _Outcome(
+                FAILED,
+                reason=ARTIFACT_CONTENT_MISSING,
+                message=f"no artifact of type {spec['type']!r} has its content stored",
+            )
+    evidence = [{"kind": EvidenceKind.ARTIFACT.value, "ref": str(heads[0].id)}]
+    return _Outcome(PASSED, evidence=evidence)
 
 
 # --- deterministic without a skill, external_state: evidence ---------------------
@@ -1090,6 +1178,7 @@ async def _record_artifact(
             "uri": None,
             "supersedesArtifactId": None,
             "verificationId": str(row.id),
+            **artifact_event_fields(artifact),
         },
     )
     return artifact

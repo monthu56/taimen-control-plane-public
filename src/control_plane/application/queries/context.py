@@ -36,6 +36,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from control_plane import observability
 from control_plane.application.authorization import AuthContext, authorize, visible_objects
 from control_plane.application.commands.relations import resolve_task
+from control_plane.application.commands.task_inputs import resolve_task_inputs
 from control_plane.application.commands.workspaces import workspace_ancestor_ids
 from control_plane.application.context.assertions import validate_anchors
 from control_plane.application.context.graph import graph_scope_of, workspace_read
@@ -135,6 +136,8 @@ async def _task_focus(session: AsyncSession, ctx: AuthContext, task_ref: str) ->
             }
             for a in artifacts
         ],
+        # CP-ADR-0072 §8: the same inputs as in GET /runs/{id}/context.
+        "inputs": await resolve_task_inputs(session, ctx.tenant_id, task),
     }
 
 
