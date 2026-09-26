@@ -1,0 +1,7 @@
+# Кто принимает изменение: gate-approval ревью адресуется держателю этой роли.
+apiVersion: taimen.ai/v1
+kind: Role
+key: code-reviewer
+spec:
+  name: Ревьюер кода
+  description: Принимает или возвращает изменение кода

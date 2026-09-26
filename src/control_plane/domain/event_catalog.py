@@ -1175,6 +1175,31 @@ _register(
     data({**_WORK, "changes": ARR}, {"verificationId": UUID, "check": ANY}),
 )
 
+# --- attention ---------------------------------------------------------------
+
+_register(
+    "attention.feedback_recorded",
+    "attention_feedback",
+    "A principal judged an item of its attention list (CP-ADR-0071).",
+    data(
+        {
+            "principalId": described(UUID, "Whose attention list the item was on"),
+            "itemKey": described(STR, "Stable key of the item: <ruleKey>:<entityId>"),
+            "rule": described(STR, "The rule that raised the item, as ruleKey@version"),
+            "ruleKey": STR,
+            "ruleVersion": INT,
+            "kind": STR,
+            "reasonCode": STR,
+            "entityType": described(STR, "approval or task"),
+            "entityId": UUID,
+            "score": INT,
+            "verdict": described(STR, "useful or not_needed"),
+            "created": described(BOOL, "false when the verdict replaced an earlier one"),
+            "hasComment": described(BOOL, "The comment itself stays with the feedback row"),
+        }
+    ),
+)
+
 # --- operations --------------------------------------------------------------
 
 _register(

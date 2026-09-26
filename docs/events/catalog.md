@@ -45,6 +45,7 @@ N+1 без изменений и игнорирует незнакомые по�
 | [`approval.rejected`](#approvalrejected) | `approval` | 2 | The approval was rejected by an eligible principal. |
 | [`approval.requested`](#approvalrequested) | `approval` | 2 | A decision was requested from a principal or from the holders of a role. |
 | [`artifact.created`](#artifactcreated) | `artifact` | 1 | An artifact was recorded. |
+| [`attention.feedback_recorded`](#attentionfeedback_recorded) | `attention_feedback` | 1 | A principal judged an item of its attention list (CP-ADR-0071). |
 | [`capability.assigned`](#capabilityassigned) | `principal` | 1 | A capability was assigned to the principal. |
 | [`capability.created`](#capabilitycreated) | `capability` | 1 | A capability was created. |
 | [`capability.revoked`](#capabilityrevoked) | `principal` | 1 | A capability was revoked from the principal. |
@@ -360,6 +361,30 @@ An artifact was recorded.
 | `skillInvocationId` | string (uuid) | нет |  |
 | `ruleEvaluationId` | string (uuid) | нет |  |
 | `verificationId` | string (uuid) | нет |  |
+
+### attention.feedback_recorded
+
+A principal judged an item of its attention list (CP-ADR-0071).
+
+Сущность: `attention_feedback`.
+
+Версия 1:
+
+| Поле | Тип | Всегда | Описание |
+|---|---|---|---|
+| `principalId` | string (uuid) | да | Whose attention list the item was on |
+| `itemKey` | string | да | Stable key of the item: <ruleKey>:<entityId> |
+| `rule` | string | да | The rule that raised the item, as ruleKey@version |
+| `ruleKey` | string | да |  |
+| `ruleVersion` | integer | да |  |
+| `kind` | string | да |  |
+| `reasonCode` | string | да |  |
+| `entityType` | string | да | approval or task |
+| `entityId` | string (uuid) | да |  |
+| `score` | integer | да |  |
+| `verdict` | string | да | useful or not_needed |
+| `created` | boolean | да | false when the verdict replaced an earlier one |
+| `hasComment` | boolean | да | The comment itself stays with the feedback row |
 
 ### capability.assigned
 

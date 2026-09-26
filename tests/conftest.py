@@ -45,7 +45,7 @@ _TRUNCATE_SQL = text(
     "TRUNCATE outbox, events, event_archive, event_consumer_cursors, event_journal_floor, "
     "idempotency_keys, observation_dedup_keys, "
     "skill_invocations, "
-    "approval_outcome_actions, "
+    "approval_outcome_actions, attention_feedback, "
     "run_control_messages, run_child_results, run_child_handles, approvals, "
     "task_context_packs, task_comment_revisions, task_comments, artifacts, "
     "run_manifest_ephemerals, run_harness_manifests, "

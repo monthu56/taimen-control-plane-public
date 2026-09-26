@@ -105,6 +105,7 @@ def test_catalog_is_neutral() -> None:
         "api_key",
         "approval",
         "artifact",
+        "attention_feedback",
         "capability",
         "claim",
         "delegation",

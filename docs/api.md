@@ -491,6 +491,28 @@ POST /api/v1/approvals/{id}:replay-outcome approvals.decide; решивший (�
 отказ действия не отменяет завершения — он записан событием
 `task.completion_work_failed` и комментарием ядра на задаче.
 
+GET  /api/v1/me/attention                 tasks.read ИЛИ approvals.read (CP-ADR-0071: «Важное»
+                                          вызывающего — элементы правил ruleKey@version:
+                                          approval.review, approval.decide,
+                                          task.due_not_started, task.blocked,
+                                          task.delegated_failing; ?workspaceId=
+                                          &includeDescendants=, нет workspace -> 404; ответ
+                                          {items[{itemKey, kind, reasonCode, rule, score,
+                                          entity, title, workspaceId, taskId, taskPublicId,
+                                          dueDate, since, details, actions[{action, method,
+                                          href}], feedback}], degraded[{rule, reasonCode,
+                                          message}], generatedAt}; score убывает; правило
+                                          без права чтения — degraded permission_missing,
+                                          упавшее — rule_failed, > 100 элементов — truncated)
+POST /api/v1/me/attention/{itemKey}:feedback  право чтения правила элемента ({verdict:
+                                          useful|not_needed, comment? ≤ 1000}; элемент
+                                          пересчитывается его правилом: нет в списке
+                                          вызывающего, чужой или неизвестный ключ -> 404,
+                                          правило не вычислилось -> 503
+                                          attention_rule_unavailable; 201 — первый вердикт,
+                                          200 — замена; список не меняет; событие
+                                          attention.feedback_recorded)
+
 GET  /api/v1/events                       events.read  (?cursor=<opaque>|after=<seq legacy>
                                           &tail=N&entityType=&entityId=; ответ: items[]
                                           c cursor у каждого события, nextCursor, hasMore;

@@ -698,6 +698,85 @@
         }
       }
     },
+    "attention.feedback_recorded": {
+      "entityType": "attention_feedback",
+      "description": "A principal judged an item of its attention list (CP-ADR-0071).",
+      "currentVersion": 1,
+      "versions": {
+        "1": {
+          "schema": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+            "properties": {
+              "principalId": {
+                "type": "string",
+                "format": "uuid",
+                "description": "Whose attention list the item was on"
+              },
+              "itemKey": {
+                "type": "string",
+                "description": "Stable key of the item: <ruleKey>:<entityId>"
+              },
+              "rule": {
+                "type": "string",
+                "description": "The rule that raised the item, as ruleKey@version"
+              },
+              "ruleKey": {
+                "type": "string"
+              },
+              "ruleVersion": {
+                "type": "integer"
+              },
+              "kind": {
+                "type": "string"
+              },
+              "reasonCode": {
+                "type": "string"
+              },
+              "entityType": {
+                "type": "string",
+                "description": "approval or task"
+              },
+              "entityId": {
+                "type": "string",
+                "format": "uuid"
+              },
+              "score": {
+                "type": "integer"
+              },
+              "verdict": {
+                "type": "string",
+                "description": "useful or not_needed"
+              },
+              "created": {
+                "type": "boolean",
+                "description": "false when the verdict replaced an earlier one"
+              },
+              "hasComment": {
+                "type": "boolean",
+                "description": "The comment itself stays with the feedback row"
+              }
+            },
+            "additionalProperties": true,
+            "required": [
+              "created",
+              "entityId",
+              "entityType",
+              "hasComment",
+              "itemKey",
+              "kind",
+              "principalId",
+              "reasonCode",
+              "rule",
+              "ruleKey",
+              "ruleVersion",
+              "score",
+              "verdict"
+            ]
+          }
+        }
+      }
+    },
     "capability.assigned": {
       "entityType": "principal",
       "description": "A capability was assigned to the principal.",

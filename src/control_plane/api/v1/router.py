@@ -6,6 +6,7 @@ from control_plane.api.strict_query import reject_unknown_query_params
 from control_plane.api.v1 import (
     approvals,
     artifacts,
+    attention,
     bootstrap,
     child_handles,
     claims,
@@ -60,6 +61,7 @@ api_v1_router.include_router(runs.router)
 api_v1_router.include_router(child_handles.router)
 api_v1_router.include_router(artifacts.router)
 api_v1_router.include_router(approvals.router)
+api_v1_router.include_router(attention.router)
 api_v1_router.include_router(events.router)
 api_v1_router.include_router(observations.router)
 api_v1_router.include_router(context.router)

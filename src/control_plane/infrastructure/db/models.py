@@ -2169,3 +2169,40 @@ class ExternalReference(Base):
     created_by: Mapped[uuid.UUID] = mapped_column(ForeignKey("principals.id"))
     created_at: Mapped[datetime]
     updated_at: Mapped[datetime]
+
+
+class AttentionFeedback(Base):
+    """A principal's verdict on one item of its attention list (CP-ADR-0071).
+
+    One row per ``(principal, item_key)``: a repeated verdict replaces the
+    previous one. The item itself is computed, never stored; the row keeps the
+    rule, its version, the reason and the score the item had when it was
+    judged, so the precision of a rule version can be measured afterwards.
+    """
+
+    __tablename__ = "attention_feedback"
+    __table_args__ = (
+        CheckConstraint("verdict IN ('useful', 'not_needed')", name="verdict"),
+        CheckConstraint("rule_version >= 1", name="rule_version_positive"),
+        CheckConstraint("score BETWEEN 0 AND 100", name="score_range"),
+        UniqueConstraint(
+            "tenant_id", "principal_id", "item_key", name="uq_attention_feedback_item"
+        ),
+        Index("ix_attention_feedback_rule", "tenant_id", "rule_key", "rule_version"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True)
+    tenant_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("tenants.id"))
+    principal_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("principals.id"))
+    item_key: Mapped[str] = mapped_column(Text)
+    rule_key: Mapped[str] = mapped_column(Text)
+    rule_version: Mapped[int] = mapped_column(Integer)
+    kind: Mapped[str] = mapped_column(Text)
+    reason_code: Mapped[str] = mapped_column(Text)
+    entity_type: Mapped[str] = mapped_column(Text)
+    entity_id: Mapped[uuid.UUID]
+    score: Mapped[int] = mapped_column(Integer)
+    verdict: Mapped[str] = mapped_column(Text)
+    comment: Mapped[str] = mapped_column(Text, default="")
+    created_at: Mapped[datetime]
+    updated_at: Mapped[datetime]

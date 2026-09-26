@@ -1,0 +1,16 @@
+# Пакет-фикстура домена разработки для «Важного» (CP-ADR-0071): тип задачи
+# «изменение кода» и роль ревьюера. Только данные в формате пакетов
+# суперпроекта (TAI-ADR-0044); ядро этих понятий не знает. Вместе с
+# invoice-payment на нём проходит tests/integration/test_attention_h003.py.
+# Не поставляется: живёт в тестах.
+apiVersion: taimen.ai/v1
+kind: Package
+key: software-change
+spec:
+  version: 0.1.0
+  displayName: Software change (test fixture)
+  description: >-
+    Работа «изменить код»: реализация на ветке, ревью держателем роли
+    code-reviewer, слияние. Ожидание внешней зависимости — статус
+    категории blocked.
+  requires: []

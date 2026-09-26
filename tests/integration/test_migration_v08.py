@@ -30,8 +30,10 @@ V08_TYPES = "c8a51d70b394"
 # Second revision of the v0.8 line: custom fields and planned dates (ADR-0049).
 V08_FIELDS = "a1c7e94b2f60"
 # The current head of the chain the v0.8 tests upgrade back to (the last
-# revision gives pending task approvals the task's workspace, CP-ADR-0068).
-V08_HEAD = "d2f8b4a6e1c3"
+# revision adds attention feedback, CP-ADR-0071).
+V08_HEAD = "e8a4c2f6b1d9"
+# The revision right before attention feedback (CP-ADR-0068 approval workspaces).
+BEFORE_ATTENTION_FEEDBACK = "d2f8b4a6e1c3"
 # Observation dedup keys (CP-ADR-0057) and the revision right before them.
 OBSERVATION_DEDUP = "b3e7d1f9c2a4"
 BEFORE_OBSERVATION_DEDUP = "a9c4e2d7f1b3"
@@ -260,6 +262,27 @@ async def test_observation_dedup_revision_is_additive_and_reversible(
     repeat = await client.post("/api/v1/observations", json=body, headers=auth(admin_key))
     assert repeat.status_code == 200
     assert repeat.json()["id"] == again.json()["id"]
+
+
+async def test_attention_feedback_revision_is_additive_and_reversible(
+    client: httpx.AsyncClient, sync_engine: Engine, v08_alembic_config: Config
+) -> None:
+    """The revision only ADDS the feedback table; downgrade drops the verdicts."""
+    admin_key = (await do_bootstrap(client))["apiKey"]["key"]
+    task = await create_task(client, admin_key, title="Kept")
+
+    alembic_command.downgrade(v08_alembic_config, BEFORE_ATTENTION_FEEDBACK)
+    assert "attention_feedback" not in inspect(sync_engine).get_table_names()
+    alembic_command.upgrade(v08_alembic_config, V08_HEAD)
+
+    inspector = inspect(sync_engine)
+    assert "attention_feedback" in inspector.get_table_names()
+    assert {c["name"] for c in inspector.get_unique_constraints("attention_feedback")} == {
+        "uq_attention_feedback_item"
+    }
+    response = await client.get(f"/api/v1/tasks/{task['id']}", headers=auth(admin_key))
+    assert response.status_code == 200
+    assert (await client.get("/api/v1/me/attention", headers=auth(admin_key))).status_code == 200
 
 
 async def test_head_matches_code(sync_engine: Engine) -> None:

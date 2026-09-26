@@ -1,0 +1,32 @@
+# «Изменить код». Статусы — словарь домена; ядро видит только их категории.
+apiVersion: taimen.ai/v1
+kind: TaskType
+key: code-change
+spec:
+  displayName: Изменение кода
+  description: Изменение в репозитории через ветку и ревью
+  fieldSchema:
+    type: object
+    properties:
+      repository:
+        type: string
+        description: Репозиторий изменения
+      branch:
+        type: string
+        description: Ветка изменения
+  lifecycleSchema:
+    statuses:
+      - {key: open, category: active, displayName: Открыто}
+      - {key: coding, category: active, displayName: В работе}
+      - {key: waiting_upstream, category: blocked, displayName: Ждёт внешнего изменения}
+      - {key: merged, category: terminal_success, displayName: Влито}
+      - {key: dropped, category: terminal_cancelled, displayName: Отменено}
+    transitions:
+      - {from: open, to: [coding, waiting_upstream, merged, dropped]}
+      - {from: coding, to: [open, waiting_upstream, merged, dropped]}
+      - {from: waiting_upstream, to: [open, coding, merged, dropped]}
+    initialStatus: open
+    claimStatus: coding
+    releaseStatus: open
+    completionStatus: merged
+  approvalSchema: {}

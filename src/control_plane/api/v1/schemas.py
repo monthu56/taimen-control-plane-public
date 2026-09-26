@@ -979,6 +979,13 @@ class TaskCommentUpdateRequest(ApiModel):
     body: str = Field(min_length=1, max_length=MAX_COMMENT_BODY_LENGTH)
 
 
+class AttentionFeedbackRequest(ApiModel):
+    """A verdict on an item of the caller's attention list (CP-ADR-0071)."""
+
+    verdict: Literal["useful", "not_needed"]
+    comment: str | None = Field(default=None, max_length=1000)
+
+
 class ApprovalRequestRequest(ApiModel):
     task: str | None = Field(default=None, max_length=100)
     artifact_id: uuid.UUID | None = None
