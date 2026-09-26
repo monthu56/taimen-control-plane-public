@@ -103,7 +103,9 @@ async def _world(client: httpx.AsyncClient, domain: str) -> dict[str, Any]:
     ws = await create_workspace(client, admin, "main")
     other = await create_workspace(client, admin, "other")
     other_child = await create_workspace(client, admin, "other-child", parent_id=other["id"])
-    installed = await install_package(client, admin, domain, kinds={"Role", "TaskType"})
+    installed = await install_package(
+        client, admin, domain, kinds={"ArtifactType", "Role", "TaskType"}
+    )
     role = installed[f"Role/{spec['role']}"]["id"]
     foreign_role = (await create_role(client, admin, "someone-elses"))["id"]
 

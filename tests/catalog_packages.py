@@ -23,6 +23,7 @@ PACKAGES = Path(__file__).parent / "fixtures" / "packages"
 # kind -> (create endpoint, the request field that carries the file's key);
 # the order is the order of installation: what is referred to comes first.
 ENDPOINTS: dict[str, tuple[str, str]] = {
+    "ArtifactType": ("/api/v1/artifact-types", "key"),
     "Role": ("/api/v1/roles", "slug"),
     "Skill": ("/api/v1/skills", "name"),
     "TaskType": ("/api/v1/task-types", "key"),

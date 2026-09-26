@@ -1,0 +1,14 @@
+# «Проверить счёт»: исполнитель сверяет счёт с договором и сдаёт заключение PDF.
+# Обязательный выход — критерий стадии проверки (CP-ADR-0072 §9): без заключения
+# задача не закрывается.
+apiVersion: taimen.ai/v1
+kind: TaskType
+key: invoice-review
+spec:
+  displayName: Проверить счёт
+  description: Проверка счёта поставщика перед оплатой; результат — заключение PDF
+  artifactSchema:
+    outputs:
+      - key: review
+        type: invoice-review
+        required: true

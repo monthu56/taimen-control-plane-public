@@ -71,7 +71,7 @@ async def _setup(client: httpx.AsyncClient) -> dict[str, Any]:
         key,
         PACKAGE,
         variables={"INVOICE_WORKSPACE_ID": finance["id"], "FINANCE_DIRECTOR_ROLE_ID": role_id},
-        kinds={"Skill", "TaskType", "WorkRule"},
+        kinds={"ArtifactType", "Skill", "TaskType", "WorkRule"},
     )
     director, director_key = await create_agent_with_key(
         client,

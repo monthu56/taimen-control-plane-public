@@ -3,6 +3,8 @@
 # критерий amount-matches. Критериев по умолчанию у типа нет (CP-ADR-0067,
 # «Границы»): их задаёт правило invoice-received. Реквизиты счёта (invoice, supplier,
 # invoiceAmount) правило пишет в customFields при заведении работы (CP-ADR-0063, B1).
+# Заключение проверки счёта — вход от задачи, от которой оплата зависит (CP-ADR-0072):
+# необязательный, потому что правило заводит оплату и без отдельной проверки.
 apiVersion: taimen.ai/v1
 kind: TaskType
 key: invoice-payment
@@ -42,3 +44,9 @@ spec:
     releaseStatus: to_pay
     completionStatus: paid
   approvalSchema: {}
+  artifactSchema:
+    inputs:
+      - key: review
+        type: invoice-review
+        from: depends_on
+        required: false

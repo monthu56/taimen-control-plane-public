@@ -1,0 +1,14 @@
+# Заключение проверки счёта (CP-ADR-0072): PDF, который сдаёт задача «проверить
+# счёт» и получает входом задача «оплатить счёт». Ядро знает только тип, media type
+# и размер — что внутри заключения, оно не знает.
+apiVersion: taimen.ai/v1
+kind: ArtifactType
+key: invoice-review
+spec:
+  displayName: Заключение по счёту
+  description: Заключение проверки счёта поставщика перед оплатой
+  mediaTypes: [application/pdf]
+  metadataSchema:
+    type: object
+    properties:
+      invoice: {type: string, description: Номер счёта}
