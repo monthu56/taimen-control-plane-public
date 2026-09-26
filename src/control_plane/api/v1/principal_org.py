@@ -1,0 +1,270 @@
+"""Principal organization assignments: roles, capabilities, skills."""
+
+import uuid
+
+from fastapi import APIRouter, Request
+from fastapi.responses import JSONResponse, Response
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from control_plane.api.dependencies import AuthDep, DbDep, SessionFactoryDep, SettingsDep
+from control_plane.api.v1.schemas import (
+    ERROR_RESPONSES,
+    CapabilityAssignRequest,
+    CapabilityOut,
+    RoleAssignRequest,
+    RoleOut,
+    ScopeRevokeRequest,
+    SkillAssignRequest,
+    SkillOut,
+    dump,
+)
+from control_plane.api.write_flow import as_no_content, execute_write
+from control_plane.application.commands import org as commands
+from control_plane.application.queries import org as queries
+from control_plane.infrastructure.db.models import (
+    PrincipalCapability,
+    PrincipalRole,
+    PrincipalSkill,
+)
+
+router = APIRouter(tags=["principal-organization"])
+
+
+def _assignment_body(
+    assignment: PrincipalRole | PrincipalCapability | PrincipalSkill,
+    embedded_key: str,
+    embedded: dict[str, object],
+) -> dict[str, object]:
+    body: dict[str, object] = {
+        "id": str(assignment.id),
+        "principalId": str(assignment.principal_id),
+        "createdAt": assignment.created_at.isoformat(),
+        embedded_key: embedded,
+    }
+    if isinstance(assignment, PrincipalRole):
+        body["workspaceId"] = str(assignment.workspace_id) if assignment.workspace_id else None
+    else:
+        body["metadata"] = assignment.metadata_json
+    return body
+
+
+# --- roles --------------------------------------------------------------------
+
+
+@router.post("/principals/{principal_id}/roles", status_code=201, responses=ERROR_RESPONSES)
+async def assign_role(
+    principal_id: uuid.UUID,
+    payload: RoleAssignRequest,
+    request: Request,
+    ctx: AuthDep,
+    settings: SettingsDep,
+    session_factory: SessionFactoryDep,
+) -> JSONResponse:
+    async def executor(db: AsyncSession) -> tuple[int, dict[str, object]]:
+        assignment = await commands.assign_role(
+            db,
+            ctx,
+            principal_id=principal_id,
+            role_id=payload.role_id,
+            workspace_id=payload.workspace_id,
+        )
+        role = await commands.get_tenant_role(db, ctx, payload.role_id)
+        return 201, _assignment_body(assignment, "role", dump(RoleOut, role))
+
+    return await execute_write(
+        request,
+        ctx,
+        settings,
+        session_factory,
+        canonical_body=payload.model_dump_json(exclude_unset=True),
+        executor=executor,
+    )
+
+
+@router.get("/principals/{principal_id}/roles", responses=ERROR_RESPONSES)
+async def list_roles(principal_id: uuid.UUID, ctx: AuthDep, db: DbDep) -> JSONResponse:
+    rows = await queries.list_principal_roles(db, ctx, principal_id)
+    return JSONResponse(
+        {
+            "items": [
+                _assignment_body(assignment, "role", dump(RoleOut, role))
+                for assignment, role in rows
+            ]
+        }
+    )
+
+
+@router.post(
+    "/principals/{principal_id}/roles/{role_id}:revoke",
+    status_code=204,
+    responses=ERROR_RESPONSES,
+)
+async def revoke_role(
+    principal_id: uuid.UUID,
+    role_id: uuid.UUID,
+    request: Request,
+    ctx: AuthDep,
+    settings: SettingsDep,
+    session_factory: SessionFactoryDep,
+    payload: ScopeRevokeRequest | None = None,
+) -> Response:
+    workspace_id = payload.workspace_id if payload else None
+
+    async def executor(db: AsyncSession) -> tuple[int, dict[str, object]]:
+        await commands.revoke_role(
+            db, ctx, principal_id=principal_id, role_id=role_id, workspace_id=workspace_id
+        )
+        return 204, {}
+
+    return as_no_content(
+        await execute_write(
+            request,
+            ctx,
+            settings,
+            session_factory,
+            canonical_body=payload.model_dump_json(exclude_unset=True) if payload else "",
+            executor=executor,
+        )
+    )
+
+
+# --- capabilities -------------------------------------------------------------
+
+
+@router.post("/principals/{principal_id}/capabilities", status_code=201, responses=ERROR_RESPONSES)
+async def assign_capability(
+    principal_id: uuid.UUID,
+    payload: CapabilityAssignRequest,
+    request: Request,
+    ctx: AuthDep,
+    settings: SettingsDep,
+    session_factory: SessionFactoryDep,
+) -> JSONResponse:
+    async def executor(db: AsyncSession) -> tuple[int, dict[str, object]]:
+        assignment = await commands.assign_capability(
+            db,
+            ctx,
+            principal_id=principal_id,
+            capability_id=payload.capability_id,
+            metadata=payload.metadata,
+        )
+        capability = await commands.get_tenant_capability(db, ctx, payload.capability_id)
+        return 201, _assignment_body(assignment, "capability", dump(CapabilityOut, capability))
+
+    return await execute_write(
+        request,
+        ctx,
+        settings,
+        session_factory,
+        canonical_body=payload.model_dump_json(exclude_unset=True),
+        executor=executor,
+    )
+
+
+@router.get("/principals/{principal_id}/capabilities", responses=ERROR_RESPONSES)
+async def list_capabilities(principal_id: uuid.UUID, ctx: AuthDep, db: DbDep) -> JSONResponse:
+    rows = await queries.list_principal_capabilities(db, ctx, principal_id)
+    return JSONResponse(
+        {
+            "items": [
+                _assignment_body(assignment, "capability", dump(CapabilityOut, capability))
+                for assignment, capability in rows
+            ]
+        }
+    )
+
+
+@router.post(
+    "/principals/{principal_id}/capabilities/{capability_id}:revoke",
+    status_code=204,
+    responses=ERROR_RESPONSES,
+)
+async def revoke_capability(
+    principal_id: uuid.UUID,
+    capability_id: uuid.UUID,
+    request: Request,
+    ctx: AuthDep,
+    settings: SettingsDep,
+    session_factory: SessionFactoryDep,
+) -> Response:
+    async def executor(db: AsyncSession) -> tuple[int, dict[str, object]]:
+        await commands.revoke_capability(
+            db, ctx, principal_id=principal_id, capability_id=capability_id
+        )
+        return 204, {}
+
+    return as_no_content(
+        await execute_write(
+            request, ctx, settings, session_factory, canonical_body="", executor=executor
+        )
+    )
+
+
+# --- skills -------------------------------------------------------------------
+
+
+@router.post("/principals/{principal_id}/skills", status_code=201, responses=ERROR_RESPONSES)
+async def assign_skill(
+    principal_id: uuid.UUID,
+    payload: SkillAssignRequest,
+    request: Request,
+    ctx: AuthDep,
+    settings: SettingsDep,
+    session_factory: SessionFactoryDep,
+) -> JSONResponse:
+    async def executor(db: AsyncSession) -> tuple[int, dict[str, object]]:
+        assignment = await commands.assign_skill(
+            db,
+            ctx,
+            principal_id=principal_id,
+            skill_id=payload.skill_id,
+            metadata=payload.metadata,
+        )
+        skill = await commands.get_tenant_skill(db, ctx, payload.skill_id)
+        return 201, _assignment_body(assignment, "skill", dump(SkillOut, skill))
+
+    return await execute_write(
+        request,
+        ctx,
+        settings,
+        session_factory,
+        canonical_body=payload.model_dump_json(exclude_unset=True),
+        executor=executor,
+    )
+
+
+@router.get("/principals/{principal_id}/skills", responses=ERROR_RESPONSES)
+async def list_skills(principal_id: uuid.UUID, ctx: AuthDep, db: DbDep) -> JSONResponse:
+    rows = await queries.list_principal_skills(db, ctx, principal_id)
+    return JSONResponse(
+        {
+            "items": [
+                _assignment_body(assignment, "skill", dump(SkillOut, skill))
+                for assignment, skill in rows
+            ]
+        }
+    )
+
+
+@router.post(
+    "/principals/{principal_id}/skills/{skill_id}:revoke",
+    status_code=204,
+    responses=ERROR_RESPONSES,
+)
+async def revoke_skill(
+    principal_id: uuid.UUID,
+    skill_id: uuid.UUID,
+    request: Request,
+    ctx: AuthDep,
+    settings: SettingsDep,
+    session_factory: SessionFactoryDep,
+) -> Response:
+    async def executor(db: AsyncSession) -> tuple[int, dict[str, object]]:
+        await commands.revoke_skill(db, ctx, principal_id=principal_id, skill_id=skill_id)
+        return 204, {}
+
+    return as_no_content(
+        await execute_write(
+            request, ctx, settings, session_factory, canonical_body="", executor=executor
+        )
+    )

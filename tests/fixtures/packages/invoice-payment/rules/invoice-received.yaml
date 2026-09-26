@@ -1,0 +1,42 @@
+# Счёт получен → работа «оплатить счёт» с тремя критериями приёмки в рекомендованном
+# порядке (CP-ADR-0067 п.3): сверка суммы скиллом, факт банка, решение директора.
+# Дедуп по номеру счёта: одна открытая работа на счёт. Реквизиты счёта — в customFields
+# работы; сумма, которую fieldSchema типа не принимает, не заводит работу.
+apiVersion: taimen.ai/v1
+kind: WorkRule
+key: invoice-received
+spec:
+  description: Получен счёт поставщика — работа на оплату
+  workspaceId: ${INVOICE_WORKSPACE_ID}
+  trigger: {kind: observation, type: invoice.received}
+  action:
+    kind: ensure_work
+    taskType: invoice-payment
+    dedupKeyTemplate: "invoice:{{payload.data.invoice}}"
+    fields:
+      title: "Оплатить счёт {{payload.data.invoice}} поставщика {{payload.data.supplier}}"
+      description: |
+        Счёт {{payload.data.invoice}} от {{payload.data.supplier}} на сумму {{payload.data.amount}}.
+        Оплатите его и запишите сумму платёжного поручения в поле paymentAmount.
+      customFields:
+        invoice: "{{payload.data.invoice}}"
+        supplier: "{{payload.data.supplier}}"
+        invoiceAmount: "{{payload.data.amount}}"
+    acceptance:
+      - key: amount-matches
+        kind: deterministic
+        description: "Сумма платёжного поручения равна сумме счёта {{payload.data.amount}}"
+        spec:
+          skill: invoice.amount_match@1
+          inputs:
+            invoiceAmount: "{{payload.data.amount}}"
+            paymentAmount: $.task.customFields.paymentAmount
+          expect: {matches: true}
+      - key: payment-settled
+        kind: external_state
+        description: Банк провёл платёж
+        spec: {event: invoice.payment_settled}
+      - key: director-approved
+        kind: human
+        description: Финансовый директор подтвердил оплату
+        spec: {approverRole: "${FINANCE_DIRECTOR_ROLE_ID}"}

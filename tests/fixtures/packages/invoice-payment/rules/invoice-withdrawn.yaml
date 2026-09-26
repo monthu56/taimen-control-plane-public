@@ -1,0 +1,12 @@
+# Поставщик отозвал счёт → работа по нему отменяется (с evidence наблюдения; под
+# живым исполнителем — после его остановки, CP-ADR-0063 А1).
+apiVersion: taimen.ai/v1
+kind: WorkRule
+key: invoice-withdrawn
+spec:
+  description: Счёт отозван поставщиком — работа на оплату отменяется
+  workspaceId: ${INVOICE_WORKSPACE_ID}
+  trigger: {kind: observation, type: invoice.withdrawn}
+  action:
+    kind: cancel_work
+    dedupKeyTemplate: "invoice:{{payload.data.invoice}}"

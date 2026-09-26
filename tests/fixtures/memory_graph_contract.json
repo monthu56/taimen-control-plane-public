@@ -1,0 +1,328 @@
+{
+  "$comment": "Pinned contract of the Memory Service graph reads the core makes (CP-ADR-0064). paths/schemas are copied from memory-service app.openapi(); typedRequest is hand-extracted from context/typed.py; packages/namespaceKinds are answers produced by memory-service code (parse_pack(...).to_payload(), KindCatalog.build(...).to_payload()) for the superproject's integrations/selfdev software-delivery pack. Regenerate when memory-service changes these endpoints or the pack changes.",
+  "memoryService": {
+    "repository": "monthu56/taimen-memory-service",
+    "branch": "master",
+    "commit": "7f43a8c"
+  },
+  "paths": {
+    "/api/memory/context/typed": {
+      "post": {
+        "requestBody": "ContextIn",
+        "responses": [
+          "200",
+          "422"
+        ]
+      }
+    },
+    "/api/memory/namespaces/{namespace}/kinds": {
+      "get": {
+        "parameters": [
+          "namespace"
+        ]
+      }
+    },
+    "/api/memory/packages/{name}": {
+      "get": {
+        "parameters": [
+          "name",
+          "version"
+        ]
+      }
+    }
+  },
+  "schemas": {
+    "ContextIn": {
+      "properties": {
+        "scope": {
+          "anyOf": [
+            {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Scope"
+        }
+      },
+      "additionalProperties": true,
+      "type": "object",
+      "title": "ContextIn",
+      "description": "ContextRequest + scope чтения (namespace(s) — как у /api/brain)."
+    }
+  },
+  "typedRequest": {
+    "$comment": "Hand-extracted from platform_memory.context.typed.TypedContextRequest.from_payload (the rules the typed route applies to the body); the route also reads scope (ContextIn), allowedNamespaces/allowedScopes (server/app.visibility).",
+    "type": "object",
+    "required": [
+      "anchors",
+      "scope"
+    ],
+    "properties": {
+      "anchors": {
+        "type": "array",
+        "minItems": 1,
+        "maxItems": 20,
+        "items": {
+          "anyOf": [
+            {
+              "type": "string",
+              "pattern": "\\S"
+            },
+            {
+              "type": "object",
+              "required": [
+                "value"
+              ],
+              "properties": {
+                "value": {
+                  "type": "string",
+                  "pattern": "\\S"
+                },
+                "kind": {
+                  "type": "string"
+                }
+              }
+            }
+          ]
+        }
+      },
+      "traverse": {
+        "type": "array",
+        "maxItems": 10,
+        "items": {
+          "type": "object",
+          "required": [
+            "relation"
+          ],
+          "properties": {
+            "relation": {
+              "type": "string",
+              "pattern": "\\S"
+            },
+            "direction": {
+              "enum": [
+                "in",
+                "out",
+                "both"
+              ]
+            },
+            "depth": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 5
+            },
+            "limit": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 200
+            },
+            "from": {
+              "enum": [
+                "anchors",
+                "previous"
+              ]
+            }
+          }
+        }
+      },
+      "as_of": {
+        "type": "string"
+      },
+      "allow_semantic": {
+        "type": "boolean"
+      },
+      "scope": {
+        "type": "object",
+        "required": [
+          "namespace"
+        ],
+        "properties": {
+          "namespace": {
+            "type": "string"
+          },
+          "namespaces": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        }
+      },
+      "allowedNamespaces": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        }
+      },
+      "allowedScopes": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        }
+      }
+    }
+  },
+  "packages": {
+    "software-delivery@1": {
+      "name": "software-delivery",
+      "version": "1",
+      "kinds": [
+        {
+          "kind": "component",
+          "naturalKey": "<repo>"
+        },
+        {
+          "kind": "source_file",
+          "naturalKey": "<repo>:<path>",
+          "idPatterns": [
+            "(?:src|tests|client)/[\\w./-]+\\.(?:py|ts|tsx)"
+          ]
+        },
+        {
+          "kind": "endpoint",
+          "naturalKey": "<METHOD> <path с параметрами как {}>",
+          "aliases": [
+            "<path с исходными именами параметров>"
+          ],
+          "idPatterns": [
+            "\\b(?:GET|POST|PUT|PATCH|DELETE)\\s+/[\\w{}./:-]+",
+            "(?<![\\w.])/(?:api|iam|platform|scim)/[\\w{}./:-]+",
+            "(?<![\\w.])/(?:tasks|runs|approvals|artifacts|claims|sessions|events|skills|principals|workspaces|projects|work|harness|observations|context|task-types)(?:/[\\w{}.:-]+)*"
+          ]
+        },
+        {
+          "kind": "client_method",
+          "naturalKey": "<repo>:<module>.<Class>.<method>"
+        },
+        {
+          "kind": "ui_call",
+          "naturalKey": "<repo>:<path>:<line>"
+        },
+        {
+          "kind": "event",
+          "naturalKey": "<event_type>",
+          "idPatterns": [
+            "\\b[a-z_]+\\.(?:[a-z_]+)(?:\\.[a-z_]+)?\\b"
+          ]
+        },
+        {
+          "kind": "table",
+          "naturalKey": "<repo>:<table>"
+        },
+        {
+          "kind": "adr",
+          "naturalKey": "<SERIES>-<number>",
+          "aliases": [
+            "ADR-<number>",
+            "<SERIES>-ADR-<number>"
+          ],
+          "idPatterns": [
+            "\\b(?:TAI|CP|PC|MEM)-(?:ADR-)?\\d{3,4}\\b",
+            "\\bADR-\\d{3,4}\\b"
+          ]
+        }
+      ],
+      "relations": [
+        {
+          "relation": "defined_in",
+          "fromKinds": [
+            "endpoint",
+            "client_method",
+            "ui_call",
+            "event",
+            "table"
+          ],
+          "toKinds": [
+            "source_file"
+          ],
+          "temporal": true
+        },
+        {
+          "relation": "part_of",
+          "fromKinds": [
+            "source_file"
+          ],
+          "toKinds": [
+            "component"
+          ],
+          "temporal": true
+        },
+        {
+          "relation": "calls",
+          "fromKinds": [
+            "client_method",
+            "ui_call"
+          ],
+          "toKinds": [
+            "endpoint"
+          ],
+          "temporal": true
+        },
+        {
+          "relation": "emits",
+          "fromKinds": [
+            "source_file"
+          ],
+          "toKinds": [
+            "event"
+          ],
+          "temporal": true
+        },
+        {
+          "relation": "governs",
+          "fromKinds": [
+            "adr"
+          ],
+          "toKinds": [
+            "source_file"
+          ],
+          "temporal": true
+        }
+      ]
+    }
+  },
+  "namespaceKinds": {
+    "settings": {
+      "namespace": "tenant:<tenant>:ws:<root>",
+      "strict": false,
+      "packages": [
+        "software-delivery"
+      ],
+      "updated_at": "",
+      "updated_by": ""
+    },
+    "catalog": {
+      "strict": false,
+      "packages": [
+        "software-delivery@1"
+      ],
+      "base_kinds": [
+        "document",
+        "entity",
+        "fact"
+      ],
+      "kinds": [
+        "adr",
+        "client_method",
+        "component",
+        "endpoint",
+        "event",
+        "source_file",
+        "table",
+        "ui_call"
+      ],
+      "kindAliases": {},
+      "relations": [
+        "calls",
+        "defined_in",
+        "emits",
+        "governs",
+        "part_of"
+      ],
+      "conflicts": []
+    }
+  }
+}

@@ -1,0 +1,25 @@
+[project]
+name = "control-plane-client"
+version = "0.9.0"
+description = "SDK Control Plane: HTTP-клиент, разрешение credential (API key / IAM PAT) и обмен на access token"
+readme = "README.md"
+requires-python = ">=3.12"
+license = { text = "Apache-2.0" }
+license-files = ["LICENSE", "NOTICE"]
+dependencies = [
+    "httpx>=0.28.1",
+]
+
+[project.optional-dependencies]
+# EventConsumer: the WebSocket wake-up (without it the consumer polls) and the
+# SQL cursor store. The core client stays httpx-only.
+ws = ["websockets>=13.0"]
+sqlalchemy = ["sqlalchemy[asyncio]>=2.0.35"]
+events = ["websockets>=13.0", "sqlalchemy[asyncio]>=2.0.35"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/control_plane_client"]

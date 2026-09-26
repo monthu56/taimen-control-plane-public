@@ -1,0 +1,13 @@
+# Банк провёл платёж → работа закрывается как выполненная: факт становится evidence
+# критерия payment-settled, остальные критерии стадия проверки исполняет как обычно.
+apiVersion: taimen.ai/v1
+kind: WorkRule
+key: payment-settled
+spec:
+  description: Платёж по счёту проведён банком — работа на оплату выполнена
+  workspaceId: ${INVOICE_WORKSPACE_ID}
+  trigger: {kind: observation, type: invoice.payment_settled}
+  action:
+    kind: complete_work
+    dedupKeyTemplate: "invoice:{{payload.data.invoice}}"
+    check: payment-settled

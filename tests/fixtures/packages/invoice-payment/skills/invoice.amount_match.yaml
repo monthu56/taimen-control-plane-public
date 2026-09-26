@@ -1,0 +1,27 @@
+# Сверка суммы платёжного поручения со счётом. Детерминированный тестовый скилл:
+# реализация — tests/skill_stubs/amount_match.py (контракт там же, CONTRACT).
+apiVersion: taimen.ai/v1
+kind: Skill
+key: invoice.amount_match
+spec:
+  version: "1"
+  description: Сумма платёжного поручения равна сумме счёта
+  sideEffects: none
+  riskLevel: low
+  contract:
+    inputs:
+      type: object
+      properties:
+        invoiceAmount: {type: string, pattern: '^\d+(\.\d{1,2})?$'}
+        paymentAmount: {type: string, pattern: '^\d+(\.\d{1,2})?$'}
+      required: [invoiceAmount, paymentAmount]
+      additionalProperties: false
+    outputs:
+      type: object
+      properties:
+        matches: {type: boolean}
+        difference: {type: string}
+      required: [matches, difference]
+    implementation:
+      protocol: local
+      entrypoint: tests.skill_stubs.amount_match:run

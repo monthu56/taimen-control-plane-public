@@ -1,0 +1,44 @@
+# «Оплатить счёт поставщика». Исполнитель — человек-казначей или агент — оплачивает
+# счёт и пишет сумму платёжного поручения в customFields.paymentAmount; её сверяет
+# критерий amount-matches. Критериев по умолчанию у типа нет (CP-ADR-0067,
+# «Границы»): их задаёт правило invoice-received. Реквизиты счёта (invoice, supplier,
+# invoiceAmount) правило пишет в customFields при заведении работы (CP-ADR-0063, B1).
+apiVersion: taimen.ai/v1
+kind: TaskType
+key: invoice-payment
+spec:
+  displayName: Оплатить счёт
+  description: Оплата счёта поставщика платёжным поручением
+  fieldSchema:
+    type: object
+    properties:
+      invoice:
+        type: string
+        description: Номер счёта поставщика
+      supplier:
+        type: string
+        description: Поставщик
+      invoiceAmount:
+        type: string
+        pattern: '^\d+(\.\d{1,2})?$'
+        description: Сумма счёта
+      paymentAmount:
+        type: string
+        pattern: '^\d+(\.\d{1,2})?$'
+        description: Сумма отправленного платёжного поручения
+  lifecycleSchema:
+    statuses:
+      - {key: to_pay, category: active, displayName: К оплате}
+      - {key: paying, category: active, displayName: Оплачивается}
+      - {key: on_hold, category: blocked, displayName: Приостановлено}
+      - {key: paid, category: terminal_success, displayName: Оплачено}
+      - {key: withdrawn, category: terminal_cancelled, displayName: Отозвано}
+    transitions:
+      - {from: to_pay, to: [paying, on_hold, paid, withdrawn]}
+      - {from: paying, to: [to_pay, on_hold, paid, withdrawn]}
+      - {from: on_hold, to: [to_pay, paying, paid, withdrawn]}
+    initialStatus: to_pay
+    claimStatus: paying
+    releaseStatus: to_pay
+    completionStatus: paid
+  approvalSchema: {}

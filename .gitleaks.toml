@@ -1,0 +1,21 @@
+# gitleaks: allowlist только для тестовых фикстур и локальных E2E-скриптов (подготовка
+# открытого релиза 0.1). Каждая запись — конкретный файл, проверенный вручную: значения
+# в нём тестовые константы, dev-дефолты вида change-me или подписанные тестовым ключом
+# JWT; ни одно не даёт доступа к реальной системе.
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "Test fixtures and loopback-only E2E harness constants"
+paths = [
+  '''^scripts/e2e_v04\.py$''',                          # локальный E2E: тестовый ключ памяти cp-memtest, dev-дефолт bootstrap-токена
+  '''^scripts/e2e_v05\.py$''',                          # то же для v0.5
+  '''^tests/contract/conftest\.py$''',                  # пример CP_TEST_MEMORY_API_KEY в докстринге контрактных тестов
+  '''^tests/integration/test_active_turn_control\.py$''',   # фикстуры integration-тестов
+  '''^tests/integration/test_external_references_v08\.py$''',
+  '''^tests/integration/test_task_type_instructions\.py$''',  # AKIA-образец как вход проверки secret_material_rejected (инструкции типа задачи)
+  '''^tests/unit/test_agent_instructions\.py$''',       # AKIA-образец как вход проверки secret_material_rejected (validate_instructions)
+  '''^tests/unit/test_trace\.py$''',                    # RSA-ключ и заголовки Authorization как вход теста редактирования транскрипта
+  '''^tests/unit/test_work_item_domain\.py$''',         # JWT, подписанный тестовым ключом внутри теста
+  '''^tests/unit/test_work_graph_domain\.py$''',        # AKIA-образец как вход проверки reject_secret_material (evidence)
+]

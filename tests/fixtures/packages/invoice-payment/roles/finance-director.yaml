@@ -1,0 +1,9 @@
+# Кто подтверждает оплату: критерий director-approved правила invoice-received
+# спрашивает держателя этой роли (approverRole). Id роли попадает в правило
+# переменной установки ${FINANCE_DIRECTOR_ROLE_ID}.
+apiVersion: taimen.ai/v1
+kind: Role
+key: finance-director
+spec:
+  name: Финансовый директор
+  description: Подтверждает оплату счетов поставщиков

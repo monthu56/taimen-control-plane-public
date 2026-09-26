@@ -1,0 +1,173 @@
+{
+  "$comment": "Pinned request contract of the Memory Service knowledge endpoints (CP-ADR-0060). paths/schemas are copied from memory-service app.openapi(); snapshotDocument is hand-extracted from domain/reconcile.py. Regenerate when memory-service changes these endpoints.",
+  "memoryService": {
+    "repository": "monthu56/taimen-memory-service",
+    "branch": "master",
+    "commit": "a00c872"
+  },
+  "paths": {
+    "/api/memory/reconcile": {
+      "post": {
+        "requestBody": "ReconcileIn",
+        "responses": [
+          "200",
+          "422"
+        ]
+      }
+    },
+    "/api/memory/packages": {
+      "post": {
+        "requestBody": "PackIn",
+        "responses": [
+          "201",
+          "422"
+        ]
+      }
+    },
+    "/api/memory/namespaces/{namespace}/kinds": {
+      "put": {
+        "requestBody": "NamespaceKindsIn",
+        "responses": [
+          "200",
+          "422"
+        ]
+      }
+    }
+  },
+  "schemas": {
+    "ReconcileIn": {
+      "properties": {
+        "namespace": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Namespace"
+        },
+        "scopes": {
+          "anyOf": [
+            {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Scopes"
+        }
+      },
+      "additionalProperties": true,
+      "type": "object",
+      "title": "ReconcileIn",
+      "description": "Документ снимка как есть (формат SNAPSHOT.md пакета) + namespace и scopes записи.\n\nПоля снимка (``pack, source, scope, snapshotId, observedAt, entities, relations``)\nвалидирует ``domain.reconcile.parse_snapshot``. ``scope`` здесь — строка снимка\n(часть источника), а не scope namespace: namespace передаётся полем ``namespace``\nили query-параметром ``?namespace=``. ``scopes`` — scopes видимости (MEM-ADR-019),\nкоторые ядро выводит из задачи."
+    },
+    "PackIn": {
+      "properties": {
+        "name": {
+          "type": "string",
+          "title": "Name"
+        },
+        "version": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "integer"
+            },
+            {
+              "type": "number"
+            }
+          ],
+          "title": "Version"
+        }
+      },
+      "additionalProperties": true,
+      "type": "object",
+      "required": [
+        "name",
+        "version"
+      ],
+      "title": "PackIn",
+      "description": "Доменный пакет: {name, version, kinds[], relations[]} (валидирует core.kinds).\n\n``version`` — строка или число (``version: 1`` из YAML пакета приводится к ``\"1\"``)."
+    },
+    "NamespaceKindsIn": {
+      "properties": {
+        "strict": {
+          "type": "boolean",
+          "title": "Strict",
+          "default": false
+        },
+        "packages": {
+          "anyOf": [
+            {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Packages"
+        }
+      },
+      "type": "object",
+      "title": "NamespaceKindsIn",
+      "description": "Настройка видов namespace: строгий режим и набор пакетов (None — все)."
+    }
+  },
+  "snapshotDocument": {
+    "description": "Snapshot fields checked by domain.reconcile.parse_snapshot (hand-extracted: MAX_SOURCE_LEN, MAX_SCOPE_LEN, MAX_SNAPSHOT_ID_LEN, reconcile_max_items); the server reads them at the TOP level of ReconcileIn after excluding namespace and scopes.",
+    "type": "object",
+    "required": [
+      "source",
+      "snapshotId",
+      "observedAt"
+    ],
+    "properties": {
+      "pack": {
+        "type": "string"
+      },
+      "source": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 200
+      },
+      "scope": {
+        "type": "string",
+        "maxLength": 200
+      },
+      "snapshotId": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 200
+      },
+      "observedAt": {
+        "type": "string",
+        "minLength": 1
+      },
+      "entities": {
+        "type": "array",
+        "items": {
+          "type": "object"
+        }
+      },
+      "relations": {
+        "type": "array",
+        "items": {
+          "type": "object"
+        }
+      }
+    },
+    "maxItemsTotal": 20000
+  }
+}

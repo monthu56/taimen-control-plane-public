@@ -1,0 +1,91 @@
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: control_plane
+      POSTGRES_PASSWORD: control_plane
+      POSTGRES_DB: control_plane
+    ports:
+      - "5433:5432"
+    volumes:
+      - db_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U control_plane -d control_plane"]
+      interval: 2s
+      timeout: 3s
+      retries: 15
+
+  # Ephemeral database for integration/concurrency tests:
+  #   docker compose --profile test up -d db-test
+  db-test:
+    image: postgres:16-alpine
+    profiles: ["test"]
+    environment:
+      POSTGRES_USER: control_plane
+      POSTGRES_PASSWORD: control_plane
+      POSTGRES_DB: control_plane_test
+    ports:
+      - "5434:5432"
+    tmpfs:
+      - /var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U control_plane -d control_plane_test"]
+      interval: 2s
+      timeout: 3s
+      retries: 15
+
+  api:
+    build:
+      context: ..
+      dockerfile: control-plane/Dockerfile
+    command: >
+      sh -c "alembic upgrade head &&
+             uvicorn control_plane.main:app --host 0.0.0.0 --port 8000"
+    environment:
+      CP_DATABASE_URL: postgresql+psycopg://control_plane:control_plane@db:5432/control_plane
+      CP_BOOTSTRAP_TOKEN: ${CP_BOOTSTRAP_TOKEN:-dev-bootstrap-token-change-me}
+      CP_LOG_LEVEL: ${CP_LOG_LEVEL:-INFO}
+      CP_CONTEXT_PROVIDER: ${CP_CONTEXT_PROVIDER:-none}
+      CP_CONTEXT_BASE_URL: ${CP_CONTEXT_BASE_URL:-}
+      CP_CONTEXT_API_KEY: ${CP_CONTEXT_API_KEY:-}
+    ports:
+      - "8000:8000"
+    depends_on:
+      db:
+        condition: service_healthy
+
+  worker:
+    build:
+      context: ..
+      dockerfile: control-plane/Dockerfile
+    command: python -m control_plane.worker
+    environment:
+      CP_DATABASE_URL: postgresql+psycopg://control_plane:control_plane@db:5432/control_plane
+      CP_LOG_LEVEL: ${CP_LOG_LEVEL:-INFO}
+    depends_on:
+      db:
+        condition: service_healthy
+      api:
+        condition: service_started
+
+  # Optional: replays the event journal into an external Context Memory
+  # Engine. Idles harmlessly when CP_CONTEXT_PROVIDER=none (the default).
+  context-adapter:
+    build:
+      context: ..
+      dockerfile: control-plane/Dockerfile
+    command: python -m control_plane.worker.context_adapter
+    environment:
+      CP_DATABASE_URL: postgresql+psycopg://control_plane:control_plane@db:5432/control_plane
+      CP_LOG_LEVEL: ${CP_LOG_LEVEL:-INFO}
+      CP_CONTEXT_PROVIDER: ${CP_CONTEXT_PROVIDER:-none}
+      CP_CONTEXT_BASE_URL: ${CP_CONTEXT_BASE_URL:-}
+      CP_CONTEXT_API_KEY: ${CP_CONTEXT_API_KEY:-}
+    depends_on:
+      db:
+        condition: service_healthy
+      api:
+        condition: service_started
+
+volumes:
+  db_data:

@@ -1,0 +1,335 @@
+"""v0.7 -> v0.8 -> v0.7 work item type migration matrix (ADR-0048).
+
+The claim the migration makes is narrow and testable: existing tasks keep
+their statuses, keep being claimable, and gain a type and a category that mean
+the same thing the old six-value enumeration meant. Downgrade is lossy, and
+the test pins exactly HOW it is lossy rather than pretending it is not.
+"""
+
+from collections.abc import Iterator
+
+import httpx
+import pytest
+from alembic import command as alembic_command
+from alembic.config import Config
+from sqlalchemy import inspect, text
+from sqlalchemy.engine import Engine
+
+from tests.helpers import (
+    auth,
+    claim_task,
+    create_agent_with_key,
+    create_task,
+    do_bootstrap,
+    open_session,
+)
+from tests.integration.test_skill_invocations_m21 import claim, invoke, published
+
+V07_HEAD = "f5b91c3e7a24"
+V08_TYPES = "c8a51d70b394"
+# Second revision of the v0.8 line: custom fields and planned dates (ADR-0049).
+V08_FIELDS = "a1c7e94b2f60"
+# The current head of the chain the v0.8 tests upgrade back to (the last
+# revision gives pending task approvals the task's workspace, CP-ADR-0068).
+V08_HEAD = "d2f8b4a6e1c3"
+# Observation dedup keys (CP-ADR-0057) and the revision right before them.
+OBSERVATION_DEDUP = "b3e7d1f9c2a4"
+BEFORE_OBSERVATION_DEDUP = "a9c4e2d7f1b3"
+
+pytestmark = pytest.mark.usefixtures("clean_database")
+
+
+@pytest.fixture
+def v08_alembic_config(migrated_database: str) -> Iterator[Config]:
+    config = Config("alembic.ini")
+    config.set_main_option("sqlalchemy.url", migrated_database.replace("+psycopg", ""))
+    yield config
+    alembic_command.upgrade(config, "head")
+
+
+async def test_existing_tasks_keep_their_status_and_gain_a_category(
+    client: httpx.AsyncClient, sync_engine: Engine, v08_alembic_config: Config
+) -> None:
+    boot = await do_bootstrap(client)
+    admin_key = boot["apiKey"]["key"]
+    backlog = await create_task(client, admin_key, title="Backlog", status="backlog")
+    todo = await create_task(client, admin_key, title="Todo")
+    blocked_task = await create_task(client, admin_key, title="Blocked")
+    await client.patch(
+        f"/api/v1/tasks/{blocked_task['id']}",
+        json={"status": "blocked"},
+        headers={**auth(admin_key), "If-Match": f'"task-{blocked_task["version"]}"'},
+    )
+
+    alembic_command.downgrade(v08_alembic_config, V07_HEAD)
+    alembic_command.upgrade(v08_alembic_config, V08_HEAD)
+
+    with sync_engine.connect() as connection:
+        rows = dict(
+            connection.execute(
+                text("SELECT public_id, status || '/' || system_status_category FROM tasks")
+            ).all()
+        )
+        typed = connection.execute(
+            text(
+                "SELECT count(*) FROM tasks t JOIN task_types tt ON tt.id = t.type_id"
+                " WHERE tt.key = 'task' AND tt.version = 1 AND tt.tenant_id = t.tenant_id"
+            )
+        ).scalar_one()
+    assert rows[backlog["publicId"]] == "backlog/backlog"
+    assert rows[todo["publicId"]] == "todo/active"
+    assert rows[blocked_task["publicId"]] == "blocked/blocked"
+    assert typed == 3
+
+
+async def test_a_blocked_task_survives_the_roundtrip_claimable(
+    client: httpx.AsyncClient, v08_alembic_config: Config
+) -> None:
+    """Pre-v0.8 claimability was "not done, not cancelled" — including blocked."""
+    boot = await do_bootstrap(client)
+    admin_key = boot["apiKey"]["key"]
+    _, agent_key = await create_agent_with_key(client, admin_key)
+    task = await create_task(client, admin_key, title="Blocked")
+    await client.patch(
+        f"/api/v1/tasks/{task['id']}",
+        json={"status": "blocked"},
+        headers={**auth(admin_key), "If-Match": f'"task-{task["version"]}"'},
+    )
+
+    alembic_command.downgrade(v08_alembic_config, V07_HEAD)
+    alembic_command.upgrade(v08_alembic_config, V08_HEAD)
+
+    session = await open_session(client, agent_key)
+    claimed = await claim_task(client, agent_key, task["id"], session["id"])
+    assert claimed.status_code == 200, claimed.text
+
+
+async def test_downgrade_removes_the_registry_and_collapses_custom_keys(
+    client: httpx.AsyncClient, sync_engine: Engine, v08_alembic_config: Config
+) -> None:
+    boot = await do_bootstrap(client)
+    admin_key = boot["apiKey"]["key"]
+    created = await client.post(
+        "/api/v1/task-types",
+        json={
+            "key": "question",
+            "displayName": "Question",
+            "lifecycleSchema": {
+                "initialStatus": "review",
+                "statuses": [
+                    {"key": "review", "category": "active"},
+                    {"key": "answered", "category": "terminal_success"},
+                ],
+                "transitions": [{"from": "review", "to": ["answered"]}],
+            },
+        },
+        headers=auth(admin_key),
+    )
+    assert created.status_code == 201, created.text
+    task = await create_task(client, admin_key, title="Why?", typeKey="question")
+    assert task["status"] == "review"
+
+    alembic_command.downgrade(v08_alembic_config, V07_HEAD)
+
+    inspector = inspect(sync_engine)
+    assert "task_types" not in inspector.get_table_names()
+    task_columns = {column["name"] for column in inspector.get_columns("tasks")}
+    assert "type_id" not in task_columns and "system_status_category" not in task_columns
+    with sync_engine.connect() as connection:
+        status = connection.execute(
+            text("SELECT status FROM tasks WHERE public_id = :pid"), {"pid": task["publicId"]}
+        ).scalar_one()
+        # `review` has no representation in the six-value CHECK: it collapses
+        # onto the legacy key of its category. Documented, irreversible.
+        assert status == "todo"
+        # And the old constraint is back in force.
+        with pytest.raises(Exception, match="ck_tasks_status"):
+            connection.execute(
+                text("UPDATE tasks SET status = 'review' WHERE public_id = :pid"),
+                {"pid": task["publicId"]},
+            )
+
+
+async def test_fields_revision_is_additive_and_reversible(
+    client: httpx.AsyncClient, sync_engine: Engine, v08_alembic_config: Config
+) -> None:
+    """The second v0.8 revision adds three columns and takes nothing away."""
+    admin_key = (await do_bootstrap(client))["apiKey"]["key"]
+    dated = await create_task(
+        client,
+        admin_key,
+        title="Dated",
+        dueDate="2026-09-01T12:00:00Z",
+        customFields={"component": "iam"},
+    )
+
+    alembic_command.downgrade(v08_alembic_config, V08_TYPES)
+
+    inspector = inspect(sync_engine)
+    columns = {column["name"] for column in inspector.get_columns("tasks")}
+    assert not ({"custom_fields", "start_date", "due_date"} & columns)
+    # The task itself survives: the type registry is untouched by this revision.
+    with sync_engine.connect() as connection:
+        assert (
+            connection.execute(
+                text("SELECT status FROM tasks WHERE public_id = :pid"), {"pid": dated["publicId"]}
+            ).scalar_one()
+            == dated["status"]
+        )
+
+    alembic_command.upgrade(v08_alembic_config, V08_HEAD)
+
+    with sync_engine.connect() as connection:
+        row = connection.execute(
+            text("SELECT custom_fields, due_date FROM tasks WHERE public_id = :pid"),
+            {"pid": dated["publicId"]},
+        ).one()
+    # Re-created empty, per the documented (lossy) downgrade.
+    assert row[0] == {}
+    assert row[1] is None
+
+
+async def test_comments_revision_is_additive_and_reversible(
+    client: httpx.AsyncClient, sync_engine: Engine, v08_alembic_config: Config
+) -> None:
+    """The third v0.8 revision only ADDS two tables — no task is touched.
+
+    Downgrade drops the thread and its audit with it, which is the documented
+    (lossy) rollback; what must survive is everything that existed before.
+    """
+    admin_key = (await do_bootstrap(client))["apiKey"]["key"]
+    task = await create_task(client, admin_key, title="Discussed")
+    created = await client.post(
+        f"/api/v1/tasks/{task['publicId']}/comments",
+        json={"body": "First reply"},
+        headers=auth(admin_key),
+    )
+    assert created.status_code == 201, created.text
+
+    alembic_command.downgrade(v08_alembic_config, V08_FIELDS)
+
+    inspector = inspect(sync_engine)
+    tables = set(inspector.get_table_names())
+    assert not ({"task_comments", "task_comment_revisions"} & tables)
+    with sync_engine.connect() as connection:
+        assert (
+            connection.execute(
+                text("SELECT status FROM tasks WHERE public_id = :pid"), {"pid": task["publicId"]}
+            ).scalar_one()
+            == task["status"]
+        )
+
+    alembic_command.upgrade(v08_alembic_config, V08_HEAD)
+
+    with sync_engine.connect() as connection:
+        assert connection.execute(text("SELECT count(*) FROM task_comments")).scalar_one() == 0
+    # The task is still commentable after the round trip.
+    again = await client.post(
+        f"/api/v1/tasks/{task['publicId']}/comments",
+        json={"body": "Reply after the roundtrip"},
+        headers=auth(admin_key),
+    )
+    assert again.status_code == 201, again.text
+
+
+async def test_observation_dedup_revision_is_additive_and_reversible(
+    client: httpx.AsyncClient, sync_engine: Engine, v08_alembic_config: Config
+) -> None:
+    boot = await do_bootstrap(client)
+    admin_key = boot["apiKey"]["key"]
+    body = {"kind": "external_fact", "content": "x", "source": "ci", "dedupKey": "k"}
+    first = await client.post("/api/v1/observations", json=body, headers=auth(admin_key))
+    assert first.status_code == 201, first.text
+
+    alembic_command.downgrade(v08_alembic_config, BEFORE_OBSERVATION_DEDUP)
+    assert "observation_dedup_keys" not in inspect(sync_engine).get_table_names()
+    alembic_command.upgrade(v08_alembic_config, OBSERVATION_DEDUP)
+    inspector = inspect(sync_engine)
+    assert inspector.get_pk_constraint("observation_dedup_keys")["constrained_columns"] == [
+        "tenant_id",
+        "source",
+        "dedup_key",
+    ]
+    # The running code needs the rest of the chain (later revisions add
+    # journal columns); the keys table stays as the roundtrip left it.
+    alembic_command.upgrade(v08_alembic_config, "head")
+    # Keys are not rebuilt from the journal: a repeat after the lossy
+    # roundtrip records a new observation, then dedups again.
+    again = await client.post("/api/v1/observations", json=body, headers=auth(admin_key))
+    assert again.status_code == 201
+    repeat = await client.post("/api/v1/observations", json=body, headers=auth(admin_key))
+    assert repeat.status_code == 200
+    assert repeat.json()["id"] == again.json()["id"]
+
+
+async def test_head_matches_code(sync_engine: Engine) -> None:
+    with sync_engine.connect() as connection:
+        version = connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one()
+    assert version == V08_HEAD
+
+
+# The attempt start of a skill invocation (ADR-0056 amendment) and the revision
+# right before it.
+ATTEMPT_STARTED = "c7d3a1f9e2b6"
+BEFORE_ATTEMPT_STARTED = "b5e1d9c3a7f2"
+
+
+async def test_running_invocations_gain_an_attempt_start_on_upgrade(
+    client: httpx.AsyncClient, sync_engine: Engine, v08_alembic_config: Config
+) -> None:
+    boot = await do_bootstrap(client)
+    admin_key = boot["apiKey"]["key"]
+    await published(client, admin_key)
+    created = (await invoke(client, admin_key, "repo.search", {"query": "x"})).json()
+    lease = (await claim(client, admin_key)).json()["invocation"]
+
+    alembic_command.downgrade(v08_alembic_config, BEFORE_ATTEMPT_STARTED)
+    alembic_command.upgrade(v08_alembic_config, ATTEMPT_STARTED)
+    with sync_engine.connect() as connection:
+        started, attempt_started = connection.execute(
+            text("SELECT started_at, attempt_started_at FROM skill_invocations")
+        ).one()
+    assert started is not None
+    assert attempt_started == started
+
+    # A row the backfill missed still gets a bounded lease instead of a 500.
+    with sync_engine.begin() as connection:
+        connection.execute(text("UPDATE skill_invocations SET attempt_started_at = NULL"))
+    beat = await client.post(
+        f"/api/v1/skill-invocations/{created['id']}:heartbeat",
+        json={"fencingToken": lease["fencingToken"], "leaseSeconds": 3600},
+        headers=auth(admin_key),
+    )
+    assert beat.status_code == 200, beat.text
+
+
+# task_types.execution (ADR-0056 §3) and the revision right before it.
+TASK_TYPE_EXECUTION = "e3a9c5d7f1b4"
+
+
+async def test_task_type_execution_roundtrip(
+    client: httpx.AsyncClient, sync_engine: Engine, v08_alembic_config: Config
+) -> None:
+    boot = await do_bootstrap(client)
+    admin_key = boot["apiKey"]["key"]
+    await create_task(client, admin_key, title="Before")
+
+    alembic_command.downgrade(v08_alembic_config, ATTEMPT_STARTED)
+    with sync_engine.connect() as connection:
+        columns = connection.execute(
+            text(
+                "SELECT column_name FROM information_schema.columns "
+                "WHERE table_name = 'task_types' AND column_name = 'execution'"
+            )
+        ).all()
+    assert columns == []
+    alembic_command.upgrade(v08_alembic_config, TASK_TYPE_EXECUTION)
+
+    with sync_engine.connect() as connection:
+        executions = connection.execute(text("SELECT execution FROM task_types")).scalars().all()
+    assert executions and all(value is None for value in executions)
+    # The replaced trigger function still freezes the version — execution included.
+    with pytest.raises(Exception, match="immutable"), sync_engine.begin() as connection:
+        connection.execute(text("""UPDATE task_types SET execution = '{"skill": "x"}'"""))
+    with pytest.raises(Exception, match="immutable"), sync_engine.begin() as connection:
+        connection.execute(text("UPDATE task_types SET display_name = 'changed'"))

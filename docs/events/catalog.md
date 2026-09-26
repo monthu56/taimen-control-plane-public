@@ -1,0 +1,2013 @@
+# Каталог событий ядра
+
+<!-- Сгенерировано из src/control_plane/domain/event_catalog.py: make event-catalog. Не править руками. -->
+
+Контракт событий — [CP-ADR-0068](../adr/0068-event-filters-catalog-versions.md).
+Версия схемы данных только добавляет поля: потребитель версии N читает
+N+1 без изменений и игнорирует незнакомые поля. Машиночитаемый каталог
+с JSON Schema — [catalog.json](catalog.json).
+
+## Конверт
+
+| Поле | Смысл |
+|---|---|
+| `id` | Event identifier (uuid); the key for deduplication |
+| `type` | Event type, see below |
+| `schemaVersion` | Version of the payload schema of this type |
+| `sequence` | Journal sequence number; an identifier, not the replay order |
+| `cursor` | Opaque replay cursor of the event |
+| `tenantId` | Tenant |
+| `entityType` | Entity the event is about |
+| `entityId` | Its identifier |
+| `workspaceId` | Workspace of the entity; null for tenant-level events |
+| `actorId` | Principal who acted; null for the core itself |
+| `iamActorId` | IAM identity of the actor, when there is one |
+| `occurredAt` | When it happened |
+| `correlationId` | Correlation of the request chain |
+| `causationId` | What caused it, when known |
+| `requestId` | Request that wrote it |
+| `sessionId` | Work session, when there is one |
+| `traceRunId` | Distributed trace id (X-Run-Id) |
+| `payload` | Data of the event, by the schema of (type, schemaVersion) |
+
+## Типы
+
+| Тип | Сущность | Версия | Описание |
+|---|---|---|---|
+| [`api_key.break_glass_issued`](#api_keybreak_glass_issued) | `api_key` | 1 | A short-lived break-glass key was issued from the host shell (CP-ADR-0065). |
+| [`api_key.created`](#api_keycreated) | `api_key` | 1 | An API key was issued to a principal. |
+| [`api_key.revoked`](#api_keyrevoked) | `api_key` | 1 | An API key was revoked. |
+| [`approval.approved`](#approvalapproved) | `approval` | 2 | The approval was approved by an eligible principal. |
+| [`approval.cancelled`](#approvalcancelled) | `approval` | 2 | The pending approval was cancelled; nobody decides it any more. |
+| [`approval.outcome_deferred`](#approvaloutcome_deferred) | `approval` | 1 | An outcome action waits for something (e.g. a skill invocation) before continuing. |
+| [`approval.outcome_executed`](#approvaloutcome_executed) | `approval` | 1 | The outcome actions the task type declares for the decision were executed. |
+| [`approval.outcome_failed`](#approvaloutcome_failed) | `approval` | 1 | An outcome action failed; the remaining actions stay for replay. |
+| [`approval.rejected`](#approvalrejected) | `approval` | 2 | The approval was rejected by an eligible principal. |
+| [`approval.requested`](#approvalrequested) | `approval` | 2 | A decision was requested from a principal or from the holders of a role. |
+| [`artifact.created`](#artifactcreated) | `artifact` | 1 | An artifact was recorded. |
+| [`capability.assigned`](#capabilityassigned) | `principal` | 1 | A capability was assigned to the principal. |
+| [`capability.created`](#capabilitycreated) | `capability` | 1 | A capability was created. |
+| [`capability.revoked`](#capabilityrevoked) | `principal` | 1 | A capability was revoked from the principal. |
+| [`claim.expired`](#claimexpired) | `claim` | 1 | The lease of a claim ran out. |
+| [`claim.released`](#claimreleased) | `claim` | 1 | The claim on a task ended: completed, released, cancelled or superseded. |
+| [`context_adapter.rebuilt`](#context_adapterrebuilt) | `event_consumer` | 1 | The memory context adapter was rewound to rebuild its projection. |
+| [`context_adapter.redriven`](#context_adapterredriven) | `event_consumer` | 1 | The memory context adapter was redriven past a parked event. |
+| [`delegation.created`](#delegationcreated) | `delegation` | 1 | A human delegated permissions to an agent. |
+| [`delegation.revoked`](#delegationrevoked) | `delegation` | 1 | A delegation was revoked. |
+| [`event_journal.archived`](#event_journalarchived) | `event_journal` | 1 | Journal events were moved to the archive (ADR-0038). |
+| [`event_journal.pruned`](#event_journalpruned) | `event_journal` | 1 | Archived journal events were deleted. |
+| [`goal.created`](#goalcreated) | `goal` | 1 | A goal was created (CP-ADR-0062). |
+| [`goal.updated`](#goalupdated) | `goal` | 1 | Goal attributes or its status changed. |
+| [`iam_binding.created`](#iam_bindingcreated) | `iam_binding` | 1 | An IAM identity was bound to a local principal (CP-ADR-0053). |
+| [`iam_binding.revoked`](#iam_bindingrevoked) | `iam_binding` | 1 | An IAM binding was revoked; the identity no longer enters. |
+| [`iam_binding.updated`](#iam_bindingupdated) | `iam_binding` | 1 | The permissions of an IAM binding changed. |
+| [`knowledge.pack_registered`](#knowledgepack_registered) | `knowledge_pack` | 1 | A domain knowledge pack version was registered. |
+| [`knowledge.packs_configured`](#knowledgepacks_configured) | `workspace` | 1 | The knowledge packs of a workspace tree were configured. |
+| [`knowledge.snapshot_reconciled`](#knowledgesnapshot_reconciled) | `workspace` | 1 | A knowledge snapshot was reconciled into the memory service (CP-ADR-0060). |
+| [`observation.recorded`](#observationrecorded) | `observation` | 1 | An observation was recorded (ADR-0057). |
+| [`principal.created`](#principalcreated) | `principal` | 1 | A principal (human, agent or service) was created. |
+| [`project.archived`](#projectarchived) | `project` | 1 | The project was archived. |
+| [`project.config_revision_activated`](#projectconfig_revision_activated) | `project` | 1 | A configuration revision became the active one. |
+| [`project.config_revision_created`](#projectconfig_revision_created) | `project` | 1 | A new configuration revision of the project was drafted. |
+| [`project.created`](#projectcreated) | `project` | 1 | A project was created on a workspace (ADR-0031). |
+| [`project.external_reference_added`](#projectexternal_reference_added) | `project` | 1 | A reference to an external system was attached to the project (ADR-0047). |
+| [`project.external_reference_updated`](#projectexternal_reference_updated) | `project` | 1 | An external reference of the project changed. |
+| [`project.status_changed`](#projectstatus_changed) | `project` | 1 | The project moved to another status. |
+| [`project.updated`](#projectupdated) | `project` | 1 | Project attributes changed. |
+| [`project_template.created`](#project_templatecreated) | `project_template` | 1 | A project template version was created. |
+| [`project_template.deprecated`](#project_templatedeprecated) | `project_template` | 1 | A project template version was deprecated. |
+| [`role.assigned`](#roleassigned) | `principal` | 1 | A role was assigned to the principal, tenant-wide or in a workspace subtree. |
+| [`role.created`](#rolecreated) | `role` | 1 | A role was created, tenant-wide or in a workspace. |
+| [`role.revoked`](#rolerevoked) | `principal` | 1 | A role assignment was revoked. |
+| [`role.updated`](#roleupdated) | `role` | 1 | A role was renamed or redescribed. |
+| [`rule.archived`](#rulearchived) | `rule` | 1 | A work rule was archived. |
+| [`rule.created`](#rulecreated) | `rule` | 1 | A work rule was created (CP-ADR-0063). |
+| [`rule.disabled`](#ruledisabled) | `rule` | 1 | A work rule was disabled. |
+| [`rule.enabled`](#ruleenabled) | `rule` | 1 | A work rule was enabled. |
+| [`rule.evaluated`](#ruleevaluated) | `rule` | 1 | A work rule was evaluated against a trigger. |
+| [`rule.updated`](#ruleupdated) | `rule` | 1 | A work rule changed. |
+| [`run.cancel_requested`](#runcancel_requested) | `run` | 1 | Cancellation of the run was requested. |
+| [`run.cancelled`](#runcancelled) | `run` | 1 | The run was cancelled. |
+| [`run.checkpointed`](#runcheckpointed) | `run` | 1 | The run left a checkpoint. |
+| [`run.child.cancel_requested`](#runchildcancel_requested) | `run` | 1 | Cancellation of the child run was requested. |
+| [`run.child.launched`](#runchildlaunched) | `run` | 1 | The run launched a child task under a handle (ADR-0046). |
+| [`run.child.resolved`](#runchildresolved) | `run` | 1 | The child handle was resolved with the child's outcome. |
+| [`run.child.revoked`](#runchildrevoked) | `run` | 1 | The child handle was revoked. |
+| [`run.child.started`](#runchildstarted) | `run` | 1 | A run of the child task started. |
+| [`run.control_message.accepted`](#runcontrol_messageaccepted) | `run` | 1 | A control message for the active turn was accepted (ADR-0044). |
+| [`run.control_message.applied`](#runcontrol_messageapplied) | `run` | 1 | A control message was applied. |
+| [`run.control_message.rejected`](#runcontrol_messagerejected) | `run` | 1 | A control message was rejected. |
+| [`run.control_message.superseded`](#runcontrol_messagesuperseded) | `run` | 1 | A control message was superseded. |
+| [`run.failed`](#runfailed) | `run` | 1 | The run failed. |
+| [`run.handoff_prepared`](#runhandoff_prepared) | `run` | 1 | The run prepared a handoff to another executor. |
+| [`run.manifest_compiled`](#runmanifest_compiled) | `run` | 1 | The effective harness manifest of the run was compiled (ADR-0043). |
+| [`run.manifest_ephemeral_recorded`](#runmanifest_ephemeral_recorded) | `run` | 1 | An ephemeral manifest change was recorded. |
+| [`run.started`](#runstarted) | `run` | 1 | An execution attempt started under a claim. |
+| [`run.succeeded`](#runsucceeded) | `run` | 1 | The run finished successfully. |
+| [`run.suspended`](#runsuspended) | `run` | 1 | The run was suspended, e.g. to wait for a decision. |
+| [`session.closed`](#sessionclosed) | `session` | 1 | A work session was closed. |
+| [`session.expired`](#sessionexpired) | `session` | 1 | A work session expired; its claims were released. |
+| [`session.opened`](#sessionopened) | `session` | 1 | A harness opened a work session. |
+| [`skill.assigned`](#skillassigned) | `principal` | 1 | A skill was assigned. |
+| [`skill.invocation_cancelled`](#skillinvocation_cancelled) | `skill_invocation` | 1 | The invocation was cancelled. |
+| [`skill.invocation_claimed`](#skillinvocation_claimed) | `skill_invocation` | 1 | An executor took the invocation under a lease. |
+| [`skill.invocation_failed`](#skillinvocation_failed) | `skill_invocation` | 1 | The invocation failed for good. |
+| [`skill.invocation_requested`](#skillinvocation_requested) | `skill_invocation` | 1 | The core was asked to invoke a skill (CP-ADR-0056). |
+| [`skill.invocation_retry_scheduled`](#skillinvocation_retry_scheduled) | `skill_invocation` | 1 | The attempt failed with a retryable error; another one is scheduled. |
+| [`skill.invocation_succeeded`](#skillinvocation_succeeded) | `skill_invocation` | 1 | The invocation finished; its result is an artifact. |
+| [`skill.registered`](#skillregistered) | `skill` | 1 | A skill version was registered. |
+| [`skill.revoked`](#skillrevoked) | `principal` | 1 | A skill was revoked. |
+| [`skill.updated`](#skillupdated) | `skill` | 1 | The description or status of a skill version changed. |
+| [`task.claimed`](#taskclaimed) | `task` | 1 | An executor claimed the task under a lease. |
+| [`task.comment_added`](#taskcomment_added) | `task` | 1 | A comment was added to the task. |
+| [`task.comment_edited`](#taskcomment_edited) | `task` | 1 | A task comment was edited. |
+| [`task.completed`](#taskcompleted) | `task` | 1 | The task reached its completion status. |
+| [`task.completion_work_executed`](#taskcompletion_work_executed) | `task` | 1 | The completion work the task type declares was executed (ADR-0061). |
+| [`task.completion_work_failed`](#taskcompletion_work_failed) | `task` | 1 | An action of the completion work failed; the completion stands. |
+| [`task.context_pack_recorded`](#taskcontext_pack_recorded) | `task` | 1 | The context pack assembled for the task on claim was recorded (CP-ADR-0064). |
+| [`task.created`](#taskcreated) | `task` | 1 | A task was created. |
+| [`task.external_reference_added`](#taskexternal_reference_added) | `task` | 1 | A reference to an external system was attached to the task (ADR-0047). |
+| [`task.external_reference_updated`](#taskexternal_reference_updated) | `task` | 1 | An external reference of the task changed. |
+| [`task.relation_added`](#taskrelation_added) | `task` | 1 | A relation to another task was added. |
+| [`task.relation_removed`](#taskrelation_removed) | `task` | 1 | A relation between tasks was removed. |
+| [`task.updated`](#taskupdated) | `task` | 1 | Task attributes or its status changed. |
+| [`task.verification_failed`](#taskverification_failed) | `task` | 1 | An acceptance check failed; the task went back to its executor or got blocked. |
+| [`task.verification_started`](#taskverification_started) | `task` | 1 | A verification attempt of the task's acceptance checks opened (CP-ADR-0067). |
+| [`task.verified`](#taskverified) | `task` | 1 | Every acceptance check passed; the task is complete. |
+| [`task_type.created`](#task_typecreated) | `task_type` | 1 | A task type version was created (ADR-0048). |
+| [`task_type.deprecated`](#task_typedeprecated) | `task_type` | 1 | A task type version was deprecated. |
+| [`tenant.bootstrapped`](#tenantbootstrapped) | `tenant` | 1 | The tenant was created with its first administrator. |
+| [`work.derived`](#workderived) | `task` | 1 | A rule derived new work. |
+| [`work.reconciled`](#workreconciled) | `task` | 1 | A rule updated, cancelled or completed the work it derived earlier. |
+| [`workspace.archived`](#workspacearchived) | `workspace` | 1 | A workspace was archived. |
+| [`workspace.created`](#workspacecreated) | `workspace` | 1 | A workspace was created. |
+| [`workspace.member_added`](#workspacemember_added) | `workspace` | 1 | A principal became a member of the workspace. |
+| [`workspace.member_removed`](#workspacemember_removed) | `workspace` | 1 | A principal stopped being a member of the workspace. |
+| [`workspace.moved`](#workspacemoved) | `workspace` | 1 | A workspace moved under another parent. |
+| [`workspace.updated`](#workspaceupdated) | `workspace` | 1 | Workspace attributes changed. |
+| [`workspace_type.archived`](#workspace_typearchived) | `workspace_type` | 1 | A workspace type was archived. |
+| [`workspace_type.created`](#workspace_typecreated) | `workspace_type` | 1 | A workspace type was created. |
+| [`workspace_type.updated`](#workspace_typeupdated) | `workspace_type` | 1 | A workspace type changed. |
+
+### api_key.break_glass_issued
+
+A short-lived break-glass key was issued from the host shell (CP-ADR-0065).
+
+Сущность: `api_key`.
+
+Версия 1:
+
+| Поле | Тип | Всегда | Описание |
+|---|---|---|---|
+| `principalId` | string (uuid) | да |  |
+| `keyPrefix` | string | да |  |
+| `permissions` | array | да |  |
+| `expiresAt` | string (date-time) | да |  |
+| `ttlSeconds` | integer | да |  |
+| `reason` | string | да |  |
+| `issuedBy` | any | да |  |
+
+### api_key.created
+
+An API key was issued to a principal.
+
+Сущность: `api_key`.
+
+Версия 1:
+
+| Поле | Тип | Всегда | Описание |
+|---|---|---|---|
+| `principalId` | string (uuid) | да |  |
+| `keyPrefix` | string | да |  |
+| `permissions` | array | да |  |
+
+### api_key.revoked
+
+An API key was revoked.
+
+Сущность: `api_key`.
+
+Версия 1:
+
+| Поле | Тип | Всегда | Описание |
+|---|---|---|---|
+| `keyPrefix` | string | да |  |
+| `breakGlass` | boolean | нет |  |
+| `issuedBy` | any | нет |  |
+
+### approval.approved
+
+The approval was approved by an eligible principal.
+
+Сущность: `approval`.
+
+Версия 2 (добавлено: decisionBy, comment, channel):
+
+| Поле | Тип | Всегда | Описание |
+|---|---|---|---|
+| `taskId` | string \| null (uuid) | да |  |
+| `artifactId` | string \| null (uuid) | да |  |
+| `outcomeStatus` | string \| null | да | pending when the task type declares outcomes for this decision (CP-ADR-0061) |
+| `decisionBy` | string (uuid) | да | Principal who decided |
+| `comment` | string \| null | да | Decision comment; credential-shaped material redacted, cut to the limit |
+| `channel` | string \| null | да | Channel the decision came through when it was not a direct API call (e.g. telegram); null for a direct call |
+
+Версия 1:
+
+| Поле | Тип | Всегда | Описание |
+|---|---|---|---|
+| `taskId` | string \| null (uuid) | да |  |
+| `artifactId` | string \| null (uuid) | да |  |
+| `outcomeStatus` | string \| null | да | pending when the task type declares outcomes for this decision (CP-ADR-0061) |
+
+### approval.cancelled
+
+The pending approval was cancelled; nobody decides it any more.
+
+Сущность: `approval`.
+
+Версия 2 (добавлено: cancelledBy):
+
+| Поле | Тип | Всегда | Описание |
+|---|---|---|---|
+| `taskId` | string \| null (uuid) | да |  |
+| `cancelledBy` | string (uuid) | да | Principal who cancelled |
+
+Версия 1:
+
+| Поле | Тип | Всегда | Описание |
+|---|---|---|---|
+| `taskId` | string \| null (uuid) | да |  |
+
+### approval.outcome_deferred
+
+An outcome action waits for something (e.g. a skill invocation) before continuing.
+
+Сущность: `approval`.
+
+Версия 1:
+
+| Поле | Тип | Всегда | Описание |
+|---|---|---|---|
+| `taskId` | string (uuid) | да |  |
+| `outcome` | string | да |  |
+| `waitingAction` | object | да |  |
+| `reason` | string | да |  |
+| `details` | object | да |  |
+
+### approval.outcome_executed
+
+The outcome actions the task type declares for the decision were executed.
+
+Сущность: `approval`.
+
+Версия 1:
+
+| Поле | Тип | Всегда | Описание |
+|---|---|---|---|
+| `taskId` | string (uuid) | да |  |
+| `outcome` | string | да |  |
+| `actions` | array | да |  |
+
+### approval.outcome_failed
+
+An outcome action failed; the remaining actions stay for replay.
+
+Сущность: `approval`.
+
+Версия 1:
+
+| Поле | Тип | Всегда | Описание |
+|---|---|---|---|
+| `taskId` | string (uuid) | да |  |
+| `outcome` | string | да |  |
+| `failedAction` | object | да |  |
+| `actions` | array | да |  |
+| `failureWorkTaskId` | string \| null (uuid) | да |  |
+
+### approval.rejected
+
+The approval was rejected by an eligible principal.
+
+Сущность: `approval`.
+
+Версия 2 (добавлено: decisionBy, comment, channel):
+
+| Поле | Тип | Всегда | Описание |
+|---|---|---|---|
+| `taskId` | string \| null (uuid) | да |  |
+| `artifactId` | string \| null (uuid) | да |  |
+| `outcomeStatus` | string \| null | да | pending when the task type declares outcomes for this decision (CP-ADR-0061) |
+| `decisionBy` | string (uuid) | да | Principal who decided |
+| `comment` | string \| null | да | Decision comment; credential-shaped material redacted, cut to the limit |
+| `channel` | string \| null | да | Channel the decision came through when it was not a direct API call (e.g. telegram); null for a direct call |
+
+Версия 1:
+
+| Поле | Тип | Всегда | Описание |
+|---|---|---|---|
+| `taskId` | string \| null (uuid) | да |  |
+| `artifactId` | string \| null (uuid) | да |  |
+| `outcomeStatus` | string \| null | да | pending when the task type declares outcomes for this decision (CP-ADR-0061) |
+
+### approval.requested
+
+A decision was requested from a principal or from the holders of a role.
+
+Сущность: `approval`.
+
+Версия 2 (добавлено: workspaceId, taskPublicId, taskTitle, requestedBy, comment):
+
+| Поле | Тип | Всегда | Описание |
+|---|---|---|---|
+| `taskId` | string \| null (uuid) | да |  |
+| `artifactId` | string \| null (uuid) | да |  |
+| `requiredRoleId` | string \| null (uuid) | да | Set when any holder of the role may decide |
+| `assignedPrincipalId` | string \| null (uuid) | да | Set when one principal decides |
+| `gate` | boolean | да | A gate holds the task's claim and completion until decided |
+| `workspaceId` | string \| null (uuid) | да | The approval's workspace, else its task's workspace |
+| `taskPublicId` | string \| null | да | Public id of the task, e.g. TASK-000123 |
+| `taskTitle` | string \| null | да |  |
+| `requestedBy` | string (uuid) | да | Principal who requested the decision |
+| `comment` | string | да | Request comment; credential-shaped material redacted, cut to the limit |
+
+Версия 1:
+
+| Поле | Тип | Всегда | Описание |
+|---|---|---|---|
+| `taskId` | string \| null (uuid) | да |  |
+| `artifactId` | string \| null (uuid) | да |  |
+| `requiredRoleId` | string \| null (uuid) | да | Set when any holder of the role may decide |
+| `assignedPrincipalId` | string \| null (uuid) | да | Set when one principal decides |
+| `gate` | boolean | да | A gate holds the task's claim and completion until decided |
+
+### artifact.created
+
+An artifact was recorded.
+
+Сущность: `artifact`.
+
+Версия 1:
+
+| Поле | Тип | Всегда | Описание |
+|---|---|---|---|
+| `type` | string | да |  |
+| `name` | string | да |  |
+| `taskId` | string \| null (uuid) | да |  |
+| `runId` | string \| null (uuid) | да |  |
+| `uri` | any | да |  |
+| `supersedesArtifactId` | string \| null (uuid) | да |  |
+| `skillInvocationId` | string (uuid) | нет |  |
+| `ruleEvaluationId` | string (uuid) | нет |  |
+| `verificationId` | string (uuid) | нет |  |
+
+### capability.assigned
+
+A capability was assigned to the principal.
+
+Сущность: `principal`.
+
+Версия 1:
+
+| Поле | Тип | Всегда | Описание |
+|---|---|---|---|
+| `capabilityId` | string (uuid) | да |  |
+
+### capability.created
+
+A capability was created.
+
+Сущность: `capability`.
+
+Версия 1:
+
+| Поле | Тип | Всегда | Описание |
+|---|---|---|---|
+| `name` | string | да |  |
+
+### capability.revoked
+
+A capability was revoked from the principal.
+
+Сущность: `principal`.
+
+Версия 1:
+
+| Поле | Тип | Всегда | Описание |
+|---|---|---|---|
+| `capabilityId` | string (uuid) | да |  |
+
+### claim.expired
+
+The lease of a claim ran out.
+
+Сущность: `claim`.
+
+Версия 1:
+
+| Поле | Тип | Всегда | Описание |
+|---|---|---|---|
+| `taskId` | string (uuid) | да |  |
+| `reason` | any | нет |  |
+| `taskStatus` | string | нет |  |
+| `taskSystemStatusCategory` | string | нет |  |
+
+### claim.released
+
+The claim on a task ended: completed, released, cancelled or superseded.
+
+Сущность: `claim`.
+
+Версия 1:
+
+| Поле | Тип | Всегда | Описание |
+|---|---|---|---|
+| `taskId` | string (uuid) | да |  |
+| `reason` | any | да |  |
+| `taskStatus` | string | нет |  |
+| `taskSystemStatusCategory` | string | нет |  |
+
+### context_adapter.rebuilt
+
+The memory context adapter was rewound to rebuild its projection.
+
+Сущность: `event_consumer`.
+
+Версия 1:
+
+| Поле | Тип | Всегда | Описание |
+|---|---|---|---|
+| `consumer` | string | да |  |
+| `fromCursor` | any | да |  |
+| `toCursor` | string | да |  |
+| `reason` | string | да |  |
+
+### context_adapter.redriven
+
+The memory context adapter was redriven past a parked event.
+
+Сущность: `event_consumer`.
+
+Версия 1:
+
+| Поле | Тип | Всегда | Описание |
+|---|---|---|---|
+| `consumer` | string | да |  |
+| `wasParked` | boolean | да |  |
+| `parkedReason` | any | да |  |
+| `parkedEventId` | string \| null (uuid) | да |  |
+| `cursor` | string | да |  |
+| `reason` | string | да |  |
+
+### delegation.created
+
+A human delegated permissions to an agent.
+
+Сущность: `delegation`.
+
+Версия 1:
+
+| Поле | Тип | Всегда | Описание |
+|---|---|---|---|
+| `humanPrincipalId` | string (uuid) | да |  |
+| `agentPrincipalId` | string (uuid) | да |  |
+| `permissions` | array | да |  |
+
+### delegation.revoked
+
+A delegation was revoked.
+
+Сущность: `delegation`.
+
+Версия 1:
+
+Данных нет.
+
+### event_journal.archived
+
+Journal events were moved to the archive (ADR-0038).
+
+Сущность: `event_journal`.
+
+Версия 1:
+
+| Поле | Тип | Всегда | Описание |
+|---|---|---|---|
+| `archived` | integer | да |  |
+| `throughCursor` | string | да |  |
+| `minAgeSeconds` | integer | да |  |
+
+### event_journal.pruned
+
+Archived journal events were deleted.
+
+Сущность: `event_journal`.
+
+Версия 1:
+
+| Поле | Тип | Всегда | Описание |
+|---|---|---|---|
+| `pruned` | integer | да |  |
+| `throughCursor` | string | да |  |
+| `minAgeSeconds` | integer | да |  |
+
+### goal.created
+
+A goal was created (CP-ADR-0062).
+
+Сущность: `goal`.
+
+Версия 1:
+
+| Поле | Тип | Всегда | Описание |
+|---|---|---|---|
+| `goalId` | string (uuid) | да |  |
+| `title` | string | да |  |
+| `status` | string | да |  |
+| `workspaceId` | string \| null (uuid) | да |  |
+| `ownerId` | string \| null (uuid) | да |  |
+| `parentGoalId` | string \| null (uuid) | да |  |
+| `criteriaCount` | integer | да |  |
+| `createdFrom` | any | да |  |
+
+### goal.updated
+
+Goal attributes or its status changed.
+
+Сущность: `goal`.
+
+Версия 1:
+
+| Поле | Тип | Всегда | Описание |
+|---|---|---|---|
+| `goalId` | string (uuid) | да |  |
+| `changes` | any | да |  |
+| `version` | integer | да |  |
+| `fromStatus` | string | нет |  |
+| `status` | string | нет |  |
+
+### iam_binding.created
+
+An IAM identity was bound to a local principal (CP-ADR-0053).
+
+Сущность: `iam_binding`.
+
+Версия 1:
+
+| Поле | Тип | Всегда | Описание |
+|---|---|---|---|
+| `principalId` | string (uuid) | да |  |
+| `issuer` | string | да |  |
+| `iamTenantId` | any | да |  |
+| `iamPrincipalId` | any | да |  |
+| `permissions` | array | да |  |
+
+### iam_binding.revoked
+
+An IAM binding was revoked; the identity no longer enters.
+
+Сущность: `iam_binding`.
+
+Версия 1:
+
+| Поле | Тип | Всегда | Описание |
+|---|---|---|---|
+| `principalId` | string (uuid) | да |  |
+| `issuer` | string | да |  |
+| `iamPrincipalId` | any | да |  |
+
+### iam_binding.updated
+
+The permissions of an IAM binding changed.
+
+Сущность: `iam_binding`.
+
+Версия 1:
+
+| Поле | Тип | Всегда | Описание |
+|---|---|---|---|
+| `principalId` | string (uuid) | да |  |
+| `issuer` | string | да |  |
+| `iamTenantId` | any | да |  |
+| `iamPrincipalId` | any | да |  |
+| `permissions` | array | да |  |
+
+### knowledge.pack_registered
+
+A domain knowledge pack version was registered.
+
+Сущность: `knowledge_pack`.
+
+Версия 1:
+
+| Поле | Тип | Всегда | Описание |
+|---|---|---|---|
+| `name` | string | да |  |
+| `version` | any | да |  |
+| `status` | string \| null | да |  |
+
+### knowledge.packs_configured
+
+The knowledge packs of a workspace tree were configured.
+
+Сущность: `workspace`.
+
+Версия 1:
+
+| Поле | Тип | Всегда | Описание |
+|---|---|---|---|
+| `workspaceId` | string (uuid) | да |  |
+| `namespace` | string | да |  |
+| `packs` | array | да |  |
+| `strict` | boolean | да |  |
+
+### knowledge.snapshot_reconciled
+
+A knowledge snapshot was reconciled into the memory service (CP-ADR-0060).
+
+Сущность: `workspace`.
+
+Версия 1:
+
+| Поле | Тип | Всегда | Описание |
+|---|---|---|---|
+| `snapshotId` | any | да |  |
+| `pack` | any | да |  |
+| `source` | any | да |  |
+| `observedAt` | any | да |  |
+| `workspaceId` | string (uuid) | да |  |
+| `rootWorkspaceId` | string (uuid) | да |  |
+| `namespace` | string | да |  |
+| `entityCount` | integer | да |  |
+| `relationCount` | integer | да |  |
+| `duplicate` | boolean | да |  |
+| `counters` | object | да |  |
+
+### observation.recorded
+
+An observation was recorded (ADR-0057).
+
+Сущность: `observation`.
+
+Версия 1:
+
+| Поле | Тип | Всегда | Описание |
+|---|---|---|---|
+| `kind` | string | да |  |
+| `content` | any | да |  |
+| `observedAt` | string (date-time) | да |  |
+| `source` | string | нет |  |
+| `dedupKey` | string | нет |  |
+| `externalRef` | object | нет |  |
+| `assertions` | array | нет |  |
+| `data` | object | нет |  |
+| `taskId` | string (uuid) | нет |  |
+| `runId` | string (uuid) | нет |  |
+| `workspaceId` | string (uuid) | нет |  |
+| `supersedes` | string (uuid) | нет |  |
+
+### principal.created
+
+A principal (human, agent or service) was created.
+
+Сущность: `principal`.
+
+Версия 1:
+
+| Поле | Тип | Всегда | Описание |
+|---|---|---|---|
+| `kind` | string | да |  |
+| `displayName` | string | да |  |
+
+### project.archived
+
+The project was archived.
+
+Сущность: `project`.
+
+Версия 1:
+
+| Поле | Тип | Всегда | Описание |
+|---|---|---|---|
+| `workspaceId` | string (uuid) | да |  |
+| `version` | integer | да |  |
+
+### project.config_revision_activated
+
+A configuration revision became the active one.
+
+Сущность: `project`.
+
+Версия 1:
+
+| Поле | Тип | Всегда | Описание |
+|---|---|---|---|
+| `revision` | integer | да |  |
+| `revisionId` | string (uuid) | да |  |
+| `version` | integer | да |  |
+
+### project.config_revision_created
+
+A new configuration revision of the project was drafted.
+
+Сущность: `project`.
+
+Версия 1:
+
+| Поле | Тип | Всегда | Описание |
+|---|---|---|---|
+| `revision` | integer | да |  |
+| `revisionId` | string (uuid) | да |  |
+| `comment` | any | да |  |
+
+### project.created
+
+A project was created on a workspace (ADR-0031).
+
+Сущность: `project`.
+
+Версия 1:
+
+| Поле | Тип | Всегда | Описание |
+|---|---|---|---|
+| `workspaceId` | string (uuid) | да |  |
+| `parentProjectId` | string \| null (uuid) | да |  |
+| `templateKey` | string | да |  |
+| `templateVersion` | integer | да |  |
+| `statusKey` | string | да |  |
+| `systemStatusCategory` | string | да |  |
+
+### project.external_reference_added
+
+A reference to an external system was attached to the project (ADR-0047).
+
+Сущность: `project`.
+
+Версия 1:
+
+| Поле | Тип | Всегда | Описание |
+|---|---|---|---|
+| `externalReferenceId` | string (uuid) | да |  |
+| `externalSystem` | string | да |  |
+| `externalType` | string | да |  |
+| `externalId` | string | да |  |
+
+### project.external_reference_updated
+
+An external reference of the project changed.
+
+Сущность: `project`.
+
+Версия 1:
+
+| Поле | Тип | Всегда | Описание |
+|---|---|---|---|
+| `externalReferenceId` | string (uuid) | да |  |
+| `externalSystem` | string | да |  |
+| `externalType` | string | да |  |
+| `externalId` | string | да |  |
+
+### project.status_changed
+
+The project moved to another status.
+
+Сущность: `project`.
+
+Версия 1:
+
+| Поле | Тип | Всегда | Описание |
+|---|---|---|---|
+| `fromStatusKey` | string | да |  |
+| `fromSystemStatusCategory` | string | да |  |
+| `statusKey` | string | да |  |
+| `systemStatusCategory` | string | да |  |
+| `comment` | any | да |  |
+| `version` | integer | да |  |
+
+### project.updated
+
+Project attributes changed.
+
+Сущность: `project`.
+
+Версия 1:
+
+| Поле | Тип | Всегда | Описание |
+|---|---|---|---|
+| `changes` | array | да |  |
+| `version` | integer | да |  |
+
+### project_template.created
+
+A project template version was created.
+
+Сущность: `project_template`.
+
+Версия 1:
+
+| Поле | Тип | Всегда | Описание |
+|---|---|---|---|
+| `key` | string | да |  |
+| `version` | integer | да |  |
+| `displayName` | string | да |  |
+| `initialStatus` | any | да |  |
+
+### project_template.deprecated
+
+A project template version was deprecated.
+
+Сущность: `project_template`.
+
+Версия 1:
+
+| Поле | Тип | Всегда | Описание |
+|---|---|---|---|
+| `key` | string | да |  |
+| `version` | integer | да |  |
+
+### role.assigned
+
+A role was assigned to the principal, tenant-wide or in a workspace subtree.
+
+Сущность: `principal`.
+
+Версия 1:
+
+| Поле | Тип | Всегда | Описание |
+|---|---|---|---|
+| `roleId` | string (uuid) | да |  |
+| `workspaceId` | string \| null (uuid) | да |  |
+
+### role.created
+
+A role was created, tenant-wide or in a workspace.
+
+Сущность: `role`.
+
+Версия 1:
+
+| Поле | Тип | Всегда | Описание |
+|---|---|---|---|
+| `slug` | string | да |  |
+| `name` | string | да |  |
+| `workspaceId` | string \| null (uuid) | да |  |
+
+### role.revoked
+
+A role assignment was revoked.
+
+Сущность: `principal`.
+
+Версия 1:
+
+| Поле | Тип | Всегда | Описание |
+|---|---|---|---|
+| `roleId` | string (uuid) | да |  |
+| `workspaceId` | string \| null (uuid) | да |  |
+
+### role.updated
+
+A role was renamed or redescribed.
+
+Сущность: `role`.
+
+Версия 1:
+
+| Поле | Тип | Всегда | Описание |
+|---|---|---|---|
+| `changes` | any | да |  |
+| `version` | integer | да |  |
+
+### rule.archived
+
+A work rule was archived.
+
+Сущность: `rule`.
+
+Версия 1:
+
+| Поле | Тип | Всегда | Описание |
+|---|---|---|---|
+| `ruleId` | string (uuid) | да |  |
+| `key` | string | да |  |
+| `version` | integer | да |  |
+| `status` | string | да |  |
+| `workspaceId` | string \| null (uuid) | да |  |
+| `goalId` | string \| null (uuid) | да |  |
+| `trigger` | object | да |  |
+| `skill` | any | да |  |
+| `action` | object | да |  |
+
+### rule.created
+
+A work rule was created (CP-ADR-0063).
+
+Сущность: `rule`.
+
+Версия 1:
+
+| Поле | Тип | Всегда | Описание |
+|---|---|---|---|
+| `ruleId` | string (uuid) | да |  |
+| `key` | string | да |  |
+| `version` | integer | да |  |
+| `status` | string | да |  |
+| `workspaceId` | string \| null (uuid) | да |  |
+| `goalId` | string \| null (uuid) | да |  |
+| `trigger` | object | да |  |
+| `skill` | any | да |  |
+| `action` | object | да |  |
+
+### rule.disabled
+
+A work rule was disabled.
+
+Сущность: `rule`.
+
+Версия 1:
+
+| Поле | Тип | Всегда | Описание |
+|---|---|---|---|
+| `ruleId` | string (uuid) | да |  |
+| `key` | string | да |  |
+| `version` | integer | да |  |
+| `status` | string | да |  |
+| `workspaceId` | string \| null (uuid) | да |  |
+| `goalId` | string \| null (uuid) | да |  |
+| `trigger` | object | да |  |
+| `skill` | any | да |  |
+| `action` | object | да |  |
+
+### rule.enabled
+
+A work rule was enabled.
+
+Сущность: `rule`.
+
+Версия 1:
+
+| Поле | Тип | Всегда | Описание |
+|---|---|---|---|
+| `ruleId` | string (uuid) | да |  |
+| `key` | string | да |  |
+| `version` | integer | да |  |
+| `status` | string | да |  |
+| `workspaceId` | string \| null (uuid) | да |  |
+| `goalId` | string \| null (uuid) | да |  |
+| `trigger` | object | да |  |
+| `skill` | any | да |  |
+| `action` | object | да |  |
+
+### rule.evaluated
+
+A work rule was evaluated against a trigger.
+
+Сущность: `rule`.
+
+Версия 1:
+
+| Поле | Тип | Всегда | Описание |
+|---|---|---|---|
+| `ruleId` | string (uuid) | да |  |
+| `ruleKey` | string | да |  |
+| `ruleVersion` | integer | да |  |
+| `evaluationId` | string (uuid) | да |  |
+| `triggerRef` | any | да |  |
+| `trigger` | object | да |  |
+| `result` | string | да |  |
+| `conditionMatched` | any | да |  |
+| `evidence` | array | да |  |
+| `skillInvocationId` | string \| null (uuid) | да |  |
+| `work` | any | да |  |
+| `error` | object \| null | да |  |
+
+### rule.updated
+
+A work rule changed.
+
+Сущность: `rule`.
+
+Версия 1:
+
+| Поле | Тип | Всегда | Описание |
+|---|---|---|---|
+| `ruleId` | string (uuid) | да |  |
+| `key` | string | да |  |
+| `version` | integer | да |  |
+| `status` | string | да |  |
+| `workspaceId` | string \| null (uuid) | да |  |
+| `goalId` | string \| null (uuid) | да |  |
+| `trigger` | object | да |  |
+| `skill` | any | да |  |
+| `action` | object | да |  |
+| `changes` | array | да |  |
+
+### run.cancel_requested
+
+Cancellation of the run was requested.
+
+Сущность: `run`.
+
+Версия 1:
+
+| Поле | Тип | Всегда | Описание |
+|---|---|---|---|
+| `taskId` | string (uuid) | да |  |
+| `attempt` | integer | да |  |
+| `reason` | any | нет |  |
+| `controlMessageId` | string (uuid) | нет |  |
+
+### run.cancelled
+
+The run was cancelled.
+
+Сущность: `run`.
+
+Версия 1:
+
+| Поле | Тип | Всегда | Описание |
+|---|---|---|---|
+| `taskId` | string (uuid) | да |  |
+| `reason` | any | да |  |
+| `attempt` | integer | да |  |
+| `controlMessageId` | string (uuid) | нет |  |
+
+### run.checkpointed
+
+The run left a checkpoint.
+
+Сущность: `run`.
+
+Версия 1:
+
+| Поле | Тип | Всегда | Описание |
+|---|---|---|---|
+| `taskId` | string (uuid) | да |  |
+| `checkpointId` | string (uuid) | да |  |
+| `seq` | integer | да |  |
+| `kind` | string | да |  |
+
+### run.child.cancel_requested
+
+Cancellation of the child run was requested.
+
+Сущность: `run`.
+
+Версия 1:
+
+| Поле | Тип | Всегда | Описание |
+|---|---|---|---|
+| `childHandleId` | string (uuid) | да |  |
+| `correlationId` | any | да |  |
+| `childRunId` | string \| null (uuid) | да |  |
+| `controlMessageId` | string (uuid) | да |  |
+| `reason` | any | да |  |
+
+### run.child.launched
+
+The run launched a child task under a handle (ADR-0046).
+
+Сущность: `run`.
+
+Версия 1:
+
+| Поле | Тип | Всегда | Описание |
+|---|---|---|---|
+| `taskId` | string (uuid) | да |  |
+| `childHandleId` | string (uuid) | да |  |
+| `childTaskId` | string (uuid) | да |  |
+| `childTaskPublicId` | string | да |  |
+| `correlationId` | any | да |  |
+| `cancellationPolicy` | any | да |  |
+| `depth` | integer | да |  |
+| `grantSizes` | object | да |  |
+
+### run.child.resolved
+
+The child handle was resolved with the child's outcome.
+
+Сущность: `run`.
+
+Версия 1:
+
+| Поле | Тип | Всегда | Описание |
+|---|---|---|---|
+| `childHandleId` | string (uuid) | да |  |
+| `correlationId` | any | да |  |
+| `childRunId` | string \| null (uuid) | да |  |
+| `outcome` | any | да |  |
+| `resultHash` | any | да |  |
+| `artifactRefs` | array | да |  |
+
+### run.child.revoked
+
+The child handle was revoked.
+
+Сущность: `run`.
+
+Версия 1:
+
+| Поле | Тип | Всегда | Описание |
+|---|---|---|---|
+| `childHandleId` | string (uuid) | да |  |
+| `correlationId` | any | да |  |
+| `childTaskId` | string (uuid) | да |  |
+| `reason` | any | да |  |
+
+### run.child.started
+
+A run of the child task started.
+
+Сущность: `run`.
+
+Версия 1:
+
+| Поле | Тип | Всегда | Описание |
+|---|---|---|---|
+| `childHandleId` | string (uuid) | да |  |
+| `correlationId` | any | да |  |
+| `childTaskId` | string (uuid) | да |  |
+| `childRunId` | string (uuid) | да |  |
+| `attempt` | integer | да |  |
+
+### run.control_message.accepted
+
+A control message for the active turn was accepted (ADR-0044).
+
+Сущность: `run`.
+
+Версия 1:
+
+| Поле | Тип | Всегда | Описание |
+|---|---|---|---|
+| `taskId` | string (uuid) | да |  |
+| `controlMessageId` | string (uuid) | да |  |
+| `seq` | integer | да |  |
+| `operation` | any | да |  |
+| `status` | string | да |  |
+| `causalPosition` | any | да |  |
+
+### run.control_message.applied
+
+A control message was applied.
+
+Сущность: `run`.
+
+Версия 1:
+
+| Поле | Тип | Всегда | Описание |
+|---|---|---|---|
+| `taskId` | string (uuid) | да |  |
+| `controlMessageId` | string (uuid) | да |  |
+| `seq` | integer | да |  |
+| `operation` | any | да |  |
+| `status` | string | да |  |
+| `causalPosition` | any | да |  |
+| `safeBoundary` | any | да |  |
+
+### run.control_message.rejected
+
+A control message was rejected.
+
+Сущность: `run`.
+
+Версия 1:
+
+| Поле | Тип | Всегда | Описание |
+|---|---|---|---|
+| `taskId` | string (uuid) | да |  |
+| `controlMessageId` | string (uuid) | да |  |
+| `seq` | integer | да |  |
+| `operation` | any | да |  |
+| `status` | string | да |  |
+| `causalPosition` | any | да |  |
+| `safeBoundary` | any | да |  |
+
+### run.control_message.superseded
+
+A control message was superseded.
+
+Сущность: `run`.
+
+Версия 1:
+
+| Поле | Тип | Всегда | Описание |
+|---|---|---|---|
+| `taskId` | string (uuid) | да |  |
+| `controlMessageId` | string (uuid) | да |  |
+| `seq` | integer | да |  |
+| `operation` | any | да |  |
+| `status` | string | да |  |
+| `causalPosition` | any | да |  |
+| `safeBoundary` | any | да |  |
+
+### run.failed
+
+The run failed.
+
+Сущность: `run`.
+
+Версия 1:
+
+| Поле | Тип | Всегда | Описание |
+|---|---|---|---|
+| `taskId` | string (uuid) | да |  |
+| `reason` | any | да |  |
+| `attempt` | integer | да |  |
+
+### run.handoff_prepared
+
+The run prepared a handoff to another executor.
+
+Сущность: `run`.
+
+Версия 1:
+
+| Поле | Тип | Всегда | Описание |
+|---|---|---|---|
+| `taskId` | string (uuid) | да |  |
+| `claimId` | string (uuid) | да |  |
+| `checkpointId` | string (uuid) | да |  |
+| `fencingToken` | integer | да |  |
+| `reason` | any | да |  |
+
+### run.manifest_compiled
+
+The effective harness manifest of the run was compiled (ADR-0043).
+
+Сущность: `run`.
+
+Версия 1:
+
+| Поле | Тип | Всегда | Описание |
+|---|---|---|---|
+| `taskId` | string (uuid) | да |  |
+| `manifestId` | string (uuid) | да |  |
+| `version` | integer | да |  |
+| `baseHash` | any | да |  |
+| `reason` | any | да |  |
+| `modelAttempt` | any | да |  |
+| `supersedesVersion` | any | да |  |
+
+### run.manifest_ephemeral_recorded
+
+An ephemeral manifest change was recorded.
+
+Сущность: `run`.
+
+Версия 1:
+
+| Поле | Тип | Всегда | Описание |
+|---|---|---|---|
+| `taskId` | string (uuid) | да |  |
+| `manifestId` | string (uuid) | да |  |
+| `version` | integer | да |  |
+| `seq` | integer | да |  |
+| `kind` | any | да |  |
+
+### run.started
+
+An execution attempt started under a claim.
+
+Сущность: `run`.
+
+Версия 1:
+
+| Поле | Тип | Всегда | Описание |
+|---|---|---|---|
+| `taskId` | string (uuid) | да |  |
+| `claimId` | string (uuid) | да |  |
+| `attempt` | integer | да |  |
+| `fencingToken` | integer | да |  |
+| `instructionsHash` | any | да |  |
+| `instructionsRefs` | any | да |  |
+
+### run.succeeded
+
+The run finished successfully.
+
+Сущность: `run`.
+
+Версия 1:
+
+| Поле | Тип | Всегда | Описание |
+|---|---|---|---|
+| `taskId` | string (uuid) | да |  |
+| `attempt` | integer | да |  |
+| `taskCompleted` | boolean | да |  |
+
+### run.suspended
+
+The run was suspended, e.g. to wait for a decision.
+
+Сущность: `run`.
+
+Версия 1:
+
+| Поле | Тип | Всегда | Описание |
+|---|---|---|---|
+| `taskId` | string (uuid) | да |  |
+| `reason` | any | да |  |
+| `attempt` | integer | да |  |
+| `waitingForApprovalId` | string \| null (uuid) | нет |  |
+
+### session.closed
+
+A work session was closed.
+
+Сущность: `session`.
+
+Версия 1:
+
+| Поле | Тип | Всегда | Описание |
+|---|---|---|---|
+| `releasedClaims` | array | да |  |
+
+### session.expired
+
+A work session expired; its claims were released.
+
+Сущность: `session`.
+
+Версия 1:
+
+| Поле | Тип | Всегда | Описание |
+|---|---|---|---|
+| `expiresAt` | any | да |  |
+| `releasedClaims` | array | нет |  |
+
+### session.opened
+
+A harness opened a work session.
+
+Сущность: `session`.
+
+Версия 1:
+
+| Поле | Тип | Всегда | Описание |
+|---|---|---|---|
+| `clientName` | any | да |  |
+| `harnessType` | any | да |  |
+| `controlLevel` | any | да |  |
+| `protocolVersion` | any | да |  |
+| `onBehalfOf` | string \| null (uuid) | да |  |
+| `expiresAt` | string (date-time) | да |  |
+
+### skill.assigned
+
+A skill was assigned.
+
+Сущность: `principal`.
+
+Версия 1:
+
+| Поле | Тип | Всегда | Описание |
+|---|---|---|---|
+| `skillId` | string (uuid) | да |  |
+
+### skill.invocation_cancelled
+
+The invocation was cancelled.
+
+Сущность: `skill_invocation`.
+
+Версия 1:
+
+| Поле | Тип | Всегда | Описание |
+|---|---|---|---|
+| `skillId` | string (uuid) | да |  |
+| `skill` | string | да |  |
+| `version` | any | да |  |
+| `attempt` | integer | да |  |
+| `taskId` | string \| null (uuid) | да |  |
+| `runId` | string \| null (uuid) | да |  |
+| `code` | any | да |  |
+| `reason` | string | да |  |
+| `wasRunning` | boolean | да |  |
+| `cancelledBy` | string \| null (uuid) | да |  |
+| `initiator` | any | да |  |
+
+### skill.invocation_claimed
+
+An executor took the invocation under a lease.
+
+Сущность: `skill_invocation`.
+
+Версия 1:
+
+| Поле | Тип | Всегда | Описание |
+|---|---|---|---|
+| `skillId` | string (uuid) | да |  |
+| `attempt` | integer | да |  |
+| `fencingToken` | integer | да |  |
+| `leaseExpiresAt` | string (date-time) | да |  |
+
+### skill.invocation_failed
+
+The invocation failed for good.
+
+Сущность: `skill_invocation`.
+
+Версия 1:
+
+| Поле | Тип | Всегда | Описание |
+|---|---|---|---|
+| `skillId` | string (uuid) | да |  |
+| `skill` | string | да |  |
+| `version` | any | да |  |
+| `attempt` | integer | да |  |
+| `maxAttempts` | integer | да |  |
+| `taskId` | string \| null (uuid) | да |  |
+| `runId` | string \| null (uuid) | да |  |
+| `error` | object | да |  |
+
+### skill.invocation_requested
+
+The core was asked to invoke a skill (CP-ADR-0056).
+
+Сущность: `skill_invocation`.
+
+Версия 1:
+
+| Поле | Тип | Всегда | Описание |
+|---|---|---|---|
+| `skillId` | string (uuid) | да |  |
+| `skill` | string | да |  |
+| `version` | any | да |  |
+| `sideEffects` | any | да |  |
+| `riskLevel` | any | да |  |
+| `requestedBy` | object | да |  |
+| `taskId` | string \| null (uuid) | да |  |
+| `runId` | string \| null (uuid) | да |  |
+| `authorizationBasis` | any | да |  |
+
+### skill.invocation_retry_scheduled
+
+The attempt failed with a retryable error; another one is scheduled.
+
+Сущность: `skill_invocation`.
+
+Версия 1:
+
+| Поле | Тип | Всегда | Описание |
+|---|---|---|---|
+| `skillId` | string (uuid) | да |  |
+| `attempt` | integer | да |  |
+| `maxAttempts` | integer | да |  |
+| `availableAt` | string (date-time) | да |  |
+| `error` | object | да |  |
+
+### skill.invocation_succeeded
+
+The invocation finished; its result is an artifact.
+
+Сущность: `skill_invocation`.
+
+Версия 1:
+
+| Поле | Тип | Всегда | Описание |
+|---|---|---|---|
+| `skillId` | string (uuid) | да |  |
+| `skill` | string | да |  |
+| `version` | any | да |  |
+| `attempt` | integer | да |  |
+| `taskId` | string \| null (uuid) | да |  |
+| `runId` | string \| null (uuid) | да |  |
+| `artifactId` | string \| null (uuid) | да |  |
+| `cost` | any | да |  |
+
+### skill.registered
+
+A skill version was registered.
+
+Сущность: `skill`.
+
+Версия 1:
+
+| Поле | Тип | Всегда | Описание |
+|---|---|---|---|
+| `name` | string | да |  |
+| `version` | any | да |  |
+| `protocol` | any | да |  |
+| `invocable` | boolean | да |  |
+| `sideEffects` | any | да |  |
+| `riskLevel` | any | да |  |
+
+### skill.revoked
+
+A skill was revoked.
+
+Сущность: `principal`.
+
+Версия 1:
+
+| Поле | Тип | Всегда | Описание |
+|---|---|---|---|
+| `skillId` | string (uuid) | да |  |
+
+### skill.updated
+
+The description or status of a skill version changed.
+
+Сущность: `skill`.
+
+Версия 1:
+
+| Поле | Тип | Всегда | Описание |
+|---|---|---|---|
+| `changedFields` | array | да |  |
+| `rowVersion` | integer | да |  |
+
+### task.claimed
+
+An executor claimed the task under a lease.
+
+Сущность: `task`.
+
+Версия 1:
+
+| Поле | Тип | Всегда | Описание |
+|---|---|---|---|
+| `publicId` | string | да |  |
+| `claimId` | string (uuid) | да |  |
+| `sessionId` | string \| null (uuid) | да |  |
+| `holderId` | string (uuid) | да |  |
+| `fencingToken` | integer | да |  |
+| `expiresAt` | string (date-time) | да |  |
+| `status` | string | да |  |
+| `systemStatusCategory` | string | да |  |
+| `version` | integer | да |  |
+
+### task.comment_added
+
+A comment was added to the task.
+
+Сущность: `task`.
+
+Версия 1:
+
+| Поле | Тип | Всегда | Описание |
+|---|---|---|---|
+| `commentId` | string (uuid) | да |  |
+| `authorPrincipalId` | string (uuid) | да |  |
+| `version` | integer | да |  |
+| `bodyLength` | integer | да |  |
+| `runId` | string \| null (uuid) | да |  |
+| `artifactId` | string \| null (uuid) | да |  |
+
+### task.comment_edited
+
+A task comment was edited.
+
+Сущность: `task`.
+
+Версия 1:
+
+| Поле | Тип | Всегда | Описание |
+|---|---|---|---|
+| `commentId` | string (uuid) | да |  |
+| `authorPrincipalId` | string (uuid) | да |  |
+| `version` | integer | да |  |
+| `bodyLength` | integer | да |  |
+| `runId` | string \| null (uuid) | да |  |
+| `artifactId` | string \| null (uuid) | да |  |
+
+### task.completed
+
+The task reached its completion status.
+
+Сущность: `task`.
+
+Версия 1:
+
+| Поле | Тип | Всегда | Описание |
+|---|---|---|---|
+| `publicId` | string | да |  |
+| `status` | string | да |  |
+| `systemStatusCategory` | string | да |  |
+| `version` | integer | да |  |
+| `verificationId` | string (uuid) | нет |  |
+| `attempt` | integer | нет |  |
+
+### task.completion_work_executed
+
+The completion work the task type declares was executed (ADR-0061).
+
+Сущность: `task`.
+
+Версия 1:
+
+| Поле | Тип | Всегда | Описание |
+|---|---|---|---|
+| `publicId` | string | да |  |
+| `taskTypeId` | string (uuid) | да |  |
+| `actions` | array | да |  |
+
+### task.completion_work_failed
+
+An action of the completion work failed; the completion stands.
+
+Сущность: `task`.
+
+Версия 1:
+
+| Поле | Тип | Всегда | Описание |
+|---|---|---|---|
+| `publicId` | string | да |  |
+| `taskTypeId` | string (uuid) | да |  |
+| `failedAction` | object | да |  |
+| `actions` | array | да |  |
+
+### task.context_pack_recorded
+
+The context pack assembled for the task on claim was recorded (CP-ADR-0064).
+
+Сущность: `task`.
+
+Версия 1:
+
+| Поле | Тип | Всегда | Описание |
+|---|---|---|---|
+| `publicId` | string | да |  |
+| `contextPackId` | string (uuid) | да |  |
+| `claimId` | string \| null (uuid) | да |  |
+| `asOf` | string | да |  |
+| `asOfMode` | string | да |  |
+| `entities` | integer | да |  |
+| `facts` | integer | да |  |
+| `snapshots` | integer | да |  |
+
+### task.created
+
+A task was created.
+
+Сущность: `task`.
+
+Версия 1:
+
+| Поле | Тип | Всегда | Описание |
+|---|---|---|---|
+| `publicId` | string | да |  |
+| `title` | string | да |  |
+| `status` | string | да |  |
+| `systemStatusCategory` | string | да |  |
+| `typeKey` | string | да |  |
+| `typeVersion` | integer | да |  |
+| `priority` | any | да |  |
+| `workspaceId` | string \| null (uuid) | да |  |
+| `startDate` | string \| null | да |  |
+| `dueDate` | string \| null | да |  |
+| `customFields` | boolean | да |  |
+| `goalId` | string \| null (uuid) | да |  |
+| `origin` | any | да |  |
+| `acceptanceChecks` | integer | да |  |
+
+### task.external_reference_added
+
+A reference to an external system was attached to the task (ADR-0047).
+
+Сущность: `task`.
+
+Версия 1:
+
+| Поле | Тип | Всегда | Описание |
+|---|---|---|---|
+| `externalReferenceId` | string (uuid) | да |  |
+| `externalSystem` | string | да |  |
+| `externalType` | string | да |  |
+| `externalId` | string | да |  |
+
+### task.external_reference_updated
+
+An external reference of the task changed.
+
+Сущность: `task`.
+
+Версия 1:
+
+| Поле | Тип | Всегда | Описание |
+|---|---|---|---|
+| `externalReferenceId` | string (uuid) | да |  |
+| `externalSystem` | string | да |  |
+| `externalType` | string | да |  |
+| `externalId` | string | да |  |
+
+### task.relation_added
+
+A relation to another task was added.
+
+Сущность: `task`.
+
+Версия 1:
+
+| Поле | Тип | Всегда | Описание |
+|---|---|---|---|
+| `relationId` | string (uuid) | да |  |
+| `toTaskId` | string (uuid) | да |  |
+| `type` | string | да |  |
+
+### task.relation_removed
+
+A relation between tasks was removed.
+
+Сущность: `task`.
+
+Версия 1:
+
+| Поле | Тип | Всегда | Описание |
+|---|---|---|---|
+| `relationId` | string (uuid) | да |  |
+| `fromTaskId` | string (uuid) | да |  |
+| `toTaskId` | string (uuid) | да |  |
+| `type` | string | да |  |
+
+### task.updated
+
+Task attributes or its status changed.
+
+Сущность: `task`.
+
+Версия 1:
+
+| Поле | Тип | Всегда | Описание |
+|---|---|---|---|
+| `publicId` | string | да |  |
+| `changes` | any | да |  |
+| `version` | integer | да |  |
+| `fromStatus` | string | нет |  |
+| `status` | string | нет |  |
+| `systemStatusCategory` | string | нет |  |
+
+### task.verification_failed
+
+An acceptance check failed; the task went back to its executor or got blocked.
+
+Сущность: `task`.
+
+Версия 1:
+
+| Поле | Тип | Всегда | Описание |
+|---|---|---|---|
+| `publicId` | string | да |  |
+| `taskId` | string (uuid) | да |  |
+| `verificationId` | string (uuid) | да |  |
+| `attempt` | integer | да |  |
+| `trigger` | any | да |  |
+| `checks` | integer | да |  |
+| `results` | array | да |  |
+| `failedCheck` | any | да |  |
+| `reason` | any | да |  |
+| `consecutiveFailures` | integer | да |  |
+| `blocked` | boolean | да |  |
+| `fromStatus` | string | да |  |
+| `status` | string | да |  |
+| `systemStatusCategory` | string | да |  |
+
+### task.verification_started
+
+A verification attempt of the task's acceptance checks opened (CP-ADR-0067).
+
+Сущность: `task`.
+
+Версия 1:
+
+| Поле | Тип | Всегда | Описание |
+|---|---|---|---|
+| `publicId` | string | да |  |
+| `taskId` | string (uuid) | да |  |
+| `verificationId` | string (uuid) | да |  |
+| `attempt` | integer | да |  |
+| `trigger` | any | да |  |
+| `checks` | integer | да |  |
+| `triggerRef` | any | нет |  |
+
+### task.verified
+
+Every acceptance check passed; the task is complete.
+
+Сущность: `task`.
+
+Версия 1:
+
+| Поле | Тип | Всегда | Описание |
+|---|---|---|---|
+| `publicId` | string | да |  |
+| `taskId` | string (uuid) | да |  |
+| `verificationId` | string (uuid) | да |  |
+| `attempt` | integer | да |  |
+| `trigger` | any | да |  |
+| `checks` | integer | да |  |
+| `results` | array | да |  |
+| `artifactId` | string (uuid) | да |  |
+
+### task_type.created
+
+A task type version was created (ADR-0048).
+
+Сущность: `task_type`.
+
+Версия 1:
+
+| Поле | Тип | Всегда | Описание |
+|---|---|---|---|
+| `key` | string | да |  |
+| `version` | integer | да |  |
+| `displayName` | string | да |  |
+| `initialStatus` | any | да |  |
+| `completionStatus` | any | да |  |
+| `execution` | any | да |  |
+| `declaresApprovalOutcomes` | boolean | да |  |
+| `declaresContextProfile` | boolean | да |  |
+| `declaresInstructions` | boolean | да |  |
+| `declaresCompletionWork` | boolean | да |  |
+
+### task_type.deprecated
+
+A task type version was deprecated.
+
+Сущность: `task_type`.
+
+Версия 1:
+
+| Поле | Тип | Всегда | Описание |
+|---|---|---|---|
+| `key` | string | да |  |
+| `version` | integer | да |  |
+
+### tenant.bootstrapped
+
+The tenant was created with its first administrator.
+
+Сущность: `tenant`.
+
+Версия 1:
+
+| Поле | Тип | Всегда | Описание |
+|---|---|---|---|
+| `slug` | string | да |  |
+| `adminPrincipalId` | string (uuid) | да |  |
+| `apiKeyId` | string (uuid) | да |  |
+| `apiKeyPrefix` | string | да |  |
+| `iamBindingId` | string \| null (uuid) | да |  |
+| `iamPrincipalId` | any | да |  |
+
+### work.derived
+
+A rule derived new work.
+
+Сущность: `task`.
+
+Версия 1:
+
+| Поле | Тип | Всегда | Описание |
+|---|---|---|---|
+| `ruleId` | string (uuid) | да |  |
+| `ruleKey` | string | да |  |
+| `ruleVersion` | integer | да |  |
+| `evaluationId` | string (uuid) | да |  |
+| `taskId` | string (uuid) | да |  |
+| `publicId` | string | да |  |
+| `evidence` | array | да |  |
+| `action` | string | да |  |
+| `dedupKey` | string | да |  |
+| `created` | boolean | да |  |
+| `approvalId` | string (uuid) | нет |  |
+
+### work.reconciled
+
+A rule updated, cancelled or completed the work it derived earlier.
+
+Сущность: `task`.
+
+Версия 1:
+
+| Поле | Тип | Всегда | Описание |
+|---|---|---|---|
+| `ruleId` | string (uuid) | да |  |
+| `ruleKey` | string | да |  |
+| `ruleVersion` | integer | да |  |
+| `evaluationId` | string (uuid) | да |  |
+| `taskId` | string (uuid) | да |  |
+| `publicId` | string | да |  |
+| `evidence` | array | да |  |
+| `action` | string | да |  |
+| `dedupKey` | string | да |  |
+| `changes` | array | да |  |
+| `verificationId` | string (uuid) | нет |  |
+| `check` | any | нет |  |
+
+### workspace.archived
+
+A workspace was archived.
+
+Сущность: `workspace`.
+
+Версия 1:
+
+| Поле | Тип | Всегда | Описание |
+|---|---|---|---|
+| `slug` | string | да |  |
+
+### workspace.created
+
+A workspace was created.
+
+Сущность: `workspace`.
+
+Версия 1:
+
+| Поле | Тип | Всегда | Описание |
+|---|---|---|---|
+| `slug` | string | да |  |
+| `name` | string | да |  |
+| `parentId` | string \| null (uuid) | да |  |
+| `typeKey` | any | да |  |
+
+### workspace.member_added
+
+A principal became a member of the workspace.
+
+Сущность: `workspace`.
+
+Версия 1:
+
+| Поле | Тип | Всегда | Описание |
+|---|---|---|---|
+| `principalId` | string (uuid) | да |  |
+
+### workspace.member_removed
+
+A principal stopped being a member of the workspace.
+
+Сущность: `workspace`.
+
+Версия 1:
+
+| Поле | Тип | Всегда | Описание |
+|---|---|---|---|
+| `principalId` | string (uuid) | да |  |
+
+### workspace.moved
+
+A workspace moved under another parent.
+
+Сущность: `workspace`.
+
+Версия 1:
+
+| Поле | Тип | Всегда | Описание |
+|---|---|---|---|
+| `fromParentId` | string \| null (uuid) | да |  |
+| `toParentId` | string \| null (uuid) | да |  |
+
+### workspace.updated
+
+Workspace attributes changed.
+
+Сущность: `workspace`.
+
+Версия 1:
+
+| Поле | Тип | Всегда | Описание |
+|---|---|---|---|
+| `changes` | any | да |  |
+| `version` | integer | да |  |
+
+### workspace_type.archived
+
+A workspace type was archived.
+
+Сущность: `workspace_type`.
+
+Версия 1:
+
+| Поле | Тип | Всегда | Описание |
+|---|---|---|---|
+| `key` | string | да |  |
+
+### workspace_type.created
+
+A workspace type was created.
+
+Сущность: `workspace_type`.
+
+Версия 1:
+
+| Поле | Тип | Всегда | Описание |
+|---|---|---|---|
+| `key` | string | да |  |
+| `displayName` | string | да |  |
+| `allowedChildTypes` | any | да |  |
+
+### workspace_type.updated
+
+A workspace type changed.
+
+Сущность: `workspace_type`.
+
+Версия 1:
+
+| Поле | Тип | Всегда | Описание |
+|---|---|---|---|
+| `changes` | any | да |  |
+| `version` | integer | да |  |

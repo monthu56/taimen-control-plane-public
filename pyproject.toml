@@ -1,0 +1,132 @@
+[project]
+name = "control-plane"
+version = "0.9.0"
+description = "Control plane: coordination backend for humans, AI agents and automated processes"
+readme = "README.md"
+requires-python = ">=3.12"
+license = { text = "Apache-2.0" }
+dependencies = [
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.30",
+    "pydantic>=2.8",
+    "pydantic-settings>=2.4",
+    "sqlalchemy[asyncio]>=2.0.35",
+    "psycopg[binary]>=3.2",
+    "alembic>=1.13",
+    "mcp>=2.0.0",
+    "httpx>=0.28.1",
+    "jsonschema>=4.23",
+    "platform-auth-sdk>=0.1.0",
+    "control-plane-client",
+    "regex>=2024.11.6",
+    "anyio>=4.4",
+]
+
+# Enforcement SDK — отдельный product-neutral репозиторий, общий для всех
+# resource services. Здесь он подключается путём: единого внутреннего индекса
+# пакетов у платформы пока нет.
+[tool.uv.sources]
+platform-auth-sdk = { path = "../platform-auth-sdk", editable = true }
+# Клиент — отдельный дистрибутив в этом же репозитории (client/), чтобы его
+# могли ставить потребители без серверных зависимостей (ADR-0030 суперпроекта).
+control-plane-client = { path = "client", editable = true }
+
+[dependency-groups]
+dev = [
+    "pytest>=8.3",
+    "pytest-asyncio>=0.24",
+    "httpx>=0.27",
+    "ruff>=0.6",
+    "mypy>=1.11",
+    "websockets>=13.0",
+    "types-jsonschema>=4.26.0.20260518",
+    "types-regex>=2026.9.10.20260911",
+    "pytest-timeout>=2.3",
+    "pyyaml>=6.0",
+]
+
+[project.scripts]
+control-plane = "control_plane_cli.main:main"
+control-plane-mcp = "control_plane_mcp.server:main"
+control-plane-agent = "control_plane_agent.main:main"
+control-plane-opencode = "control_plane_opencode.main:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = [
+    "src/control_plane",
+    "src/control_plane_cli",
+    "src/control_plane_mcp",
+    "src/control_plane_agent",
+    "src/control_plane_opencode",
+    "src/control_plane_claude",
+    "src/control_plane_codex",
+]
+
+[tool.uv]
+package = true
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+src = ["src", "client/src", "tests"]
+
+[tool.ruff.lint.per-file-ignores]
+# Русский текст по назначению: описания задач ревью, которые читают люди и
+# агенты, и русские docstrings регресс-тестов. Кириллица в них не опечатка.
+"src/control_plane_agent/review.py" = ["RUF001", "RUF002", "RUF003"]
+"tests/unit/test_agent_review.py" = ["RUF001", "RUF002", "RUF003"]
+"tests/unit/test_execution_workspace.py" = ["RUF001", "RUF002", "RUF003"]
+"tests/integration/test_org.py" = ["RUF001", "RUF002", "RUF003"]
+"tests/unit/test_claude_adapter.py" = ["RUF001", "RUF002", "RUF003"]
+"migrations/versions/e3b8c1a6d9f4_approval_outcomes.py" = ["RUF001"]
+# The generated event catalog page (docs/events/catalog.md) is Russian documentation.
+"src/control_plane/domain/event_catalog.py" = ["RUF001"]
+
+[tool.ruff.lint]
+select = [
+    "E", "W",   # pycodestyle
+    "F",        # pyflakes
+    "I",        # isort
+    "UP",       # pyupgrade
+    "B",        # bugbear
+    "SIM",      # simplify
+    "ASYNC",    # async pitfalls
+    "RUF",      # ruff-specific
+]
+ignore = [
+    "B008",  # FastAPI Depends() in defaults is idiomatic
+]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+plugins = ["pydantic.mypy"]
+mypy_path = "src:client/src"
+packages = [
+    "control_plane",
+    "control_plane_client",
+    "control_plane_cli",
+    "control_plane_mcp",
+    "control_plane_agent",
+    "control_plane_opencode",
+    "control_plane_claude",
+    "control_plane_codex",
+]
+warn_unused_ignores = true
+disallow_untyped_decorators = false
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+testpaths = ["tests"]
+# pytest-timeout: зависший тест (например, ждущий блокировку) падает за
+# минуты со стеком, а не съедает молча общий таймаут прогона. Долгим тестам
+# предел поднимают маркером @pytest.mark.timeout(<секунды>).
+timeout = 120
+markers = [
+    "raw_journal: тест пишет в журнал события SQL-ом мимо ядра — проверка журнала по каталогу событий (CP-ADR-0068) к нему не применяется",
+]

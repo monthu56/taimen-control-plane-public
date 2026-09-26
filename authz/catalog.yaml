@@ -1,0 +1,117 @@
+# Каталог действий Control Plane для policy-service (TAI-ADR-0025, дизайн v0 §8).
+# Регистрируется deploy/bootstrap.py; проверяется в CI. Имена действий 1:1 с
+# enum Permission (domain/enums.py), кроме admin (→ роль tenant-admin),
+# delegations.manage (→ admin API policy-service) и observations.write
+# (→ каталог memory-service).
+service: control-plane
+version: 1
+
+resource_types:
+  project_profile:
+    scope: workspace
+    relations: [owner]
+  task:
+    scope: workspace
+    # type_role — contextual tuple, который Control Plane вычисляет из
+    # principal_roles на момент check (роль типа задачи, ADR-0015).
+    relations: [owner, requested_by, assignee, type_role]
+  run:
+    parent: task
+    relations: [holder]
+  approval:
+    scope: workspace
+    relations: [requested_by]
+  artifact:
+    parent: task
+
+actions:
+  # --- задачи ---
+  tasks.read:
+    resource: task
+    derived: "owner or requested_by or assignee or tasks.read@scope"
+  tasks.write:
+    resource: task
+    derived: "owner or tasks.write@scope"
+  # Запуск прогона (claim, start run, запуск дочернего run) проверяется
+  # через tasks.claim; отдельного действия запуска в Permission нет.
+  tasks.claim:
+    resource: task
+    derived: "tasks.claim@scope"
+  # Управление прогоном (control messages) проверяется через tasks.write,
+  # force-cancel — через claims.manage, подтверждение держателем — через
+  # tasks.claim; отдельного действия управления в Permission нет.
+  claims.manage:
+    resource: task
+  # --- approvals ---
+  approvals.read:
+    resource: approval
+    derived: "requested_by or approvals.read@scope"
+  approvals.manage:
+    resource: approval
+  approvals.decide:
+    resource: approval
+    derived: "approvals.decide@scope but not requested_by"
+  # --- артефакты: через задачу ---
+  artifacts.read:
+    resources:
+      task: "tasks.read"
+      artifact: "artifacts.read@task"
+  artifacts.write:
+    resources:
+      task: "tasks.write"
+      artifact: "artifacts.write@task"
+  # --- цели (CP-ADR-0062): решаются на воркспейсе цели (цель уровня
+  # tenant — на tenant); отношения owner у цели в модели PDP нет ---
+  goals.read:
+    resource: workspace
+  goals.write:
+    resource: workspace
+  # --- правила вывода работы (CP-ADR-0063): как цели — на воркспейсе
+  # правила (правило уровня tenant — на tenant) ---
+  rules.read:
+    resource: workspace
+  rules.write:
+    resource: workspace
+  # --- воркспейсы и проекты ---
+  workspaces.read:
+    resource: workspace
+  workspaces.manage:
+    resource: workspace
+  events.read:
+    resource: workspace
+  projects.read:
+    resource: project_profile
+    derived: "owner or projects.read@scope"
+  projects.manage:
+    resource: project_profile
+    derived: "owner or projects.manage@scope"
+  # --- уровень tenant ---
+  org.read:
+    resource: tenant
+  org.manage:
+    resource: tenant
+  task_types.read:
+    resource: tenant
+  task_types.manage:
+    resource: tenant
+  project_templates.read:
+    resource: tenant
+  project_templates.manage:
+    resource: tenant
+  sessions.open:
+    resource: tenant
+  sessions.manage:
+    resource: tenant
+  operations.read:
+    resource: tenant
+  operations.manage:
+    resource: tenant
+  principals.read:
+    resource: tenant
+  principals.write:
+    resource: tenant
+  # --- Skill runtime (ADR-0056): вызов и исполнение — разные права ---
+  skills.invoke:
+    resource: tenant
+  skills.execute:
+    resource: tenant
