@@ -23,8 +23,14 @@ HASH_ALGORITHM = "sha256"
 MAX_STRING_CHARS = 2_000
 
 
-def canonicalize(value: Any, *, path: str, depth: int = 1) -> Any:
-    """Return a canonical clone of ``value`` or raise on anything unstable."""
+def canonicalize(
+    value: Any, *, path: str, depth: int = 1, max_string_chars: int = MAX_STRING_CHARS
+) -> Any:
+    """Return a canonical clone of ``value`` or raise on anything unstable.
+
+    ``max_string_chars`` is the per-string bound; documents that carry prose
+    (an agent spec with executor instructions, CP-ADR-0073 §2) pass a larger one.
+    """
     if depth > MAX_JSON_DEPTH:
         raise ValidationError(
             "payload_too_deep",
@@ -47,11 +53,11 @@ def canonicalize(value: Any, *, path: str, depth: int = 1) -> Any:
     if isinstance(value, int):
         return value
     if isinstance(value, str):
-        if len(value) > MAX_STRING_CHARS:
+        if len(value) > max_string_chars:
             raise ValidationError(
                 "payload_too_large",
-                f"String exceeds the {MAX_STRING_CHARS}-character limit",
-                details={"path": path, "maxChars": MAX_STRING_CHARS},
+                f"String exceeds the {max_string_chars}-character limit",
+                details={"path": path, "maxChars": max_string_chars},
             )
         return unicodedata.normalize("NFC", value)
     if isinstance(value, dict):
@@ -72,11 +78,15 @@ def canonicalize(value: Any, *, path: str, depth: int = 1) -> Any:
                     "Object keys collide after Unicode normalization",
                     details={"path": path, "key": key},
                 )
-            canonical[key] = canonicalize(item, path=f"{path}.{key}", depth=depth + 1)
+            canonical[key] = canonicalize(
+                item, path=f"{path}.{key}", depth=depth + 1, max_string_chars=max_string_chars
+            )
         return canonical
     if isinstance(value, (list, tuple)):
         return [
-            canonicalize(item, path=f"{path}[{index}]", depth=depth + 1)
+            canonicalize(
+                item, path=f"{path}[{index}]", depth=depth + 1, max_string_chars=max_string_chars
+            )
             for index, item in enumerate(value)
         ]
     raise ValidationError(
@@ -86,9 +96,9 @@ def canonicalize(value: Any, *, path: str, depth: int = 1) -> Any:
     )
 
 
-def canonical_bytes(value: Any) -> bytes:
+def canonical_bytes(value: Any, *, max_string_chars: int = MAX_STRING_CHARS) -> bytes:
     """Byte-stable representation: sorted keys, no whitespace, NFC, UTF-8."""
-    canonical = canonicalize(value, path="$")
+    canonical = canonicalize(value, path="$", max_string_chars=max_string_chars)
     return json.dumps(
         canonical,
         sort_keys=True,

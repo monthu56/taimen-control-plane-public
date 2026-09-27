@@ -19,6 +19,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from control_plane.application.common import new_uuid, utcnow
 from control_plane.domain.event_catalog import current_version
 from control_plane.infrastructure.db.models import (
+    Agent,
     Approval,
     Artifact,
     Event,
@@ -45,6 +46,7 @@ current_iam_actor: ContextVar[uuid.UUID | None] = ContextVar("current_iam_actor"
 # workspace, else the workspace of the task it hangs off.
 _WORKSPACE_ENTITIES: dict[str, type[Any]] = {
     "task": Task,
+    "agent": Agent,
     "approval": Approval,
     "artifact": Artifact,
     "goal": Goal,

@@ -5,6 +5,7 @@ from control_plane_codex.adapter import (
     HARNESS_TYPE,
     CodexAdapter,
     adapter_from_environment,
+    adapter_from_params,
 )
 from control_plane_codex.cli import (
     CodexCLI,
@@ -22,4 +23,5 @@ __all__ = [
     "CodexQuotaExhaustedError",
     "CodexResult",
     "adapter_from_environment",
+    "adapter_from_params",
 ]

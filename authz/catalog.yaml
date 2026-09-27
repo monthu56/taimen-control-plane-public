@@ -102,6 +102,13 @@ actions:
     resource: tenant
   artifact_types.manage:
     resource: tenant
+  # --- реестр агентов (CP-ADR-0073 §5) ---
+  agents.read:
+    resource: tenant
+  agents.manage:
+    resource: tenant
+  agents.status.write:
+    resource: tenant
   project_templates.read:
     resource: tenant
   project_templates.manage:

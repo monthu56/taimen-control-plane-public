@@ -1,5 +1,8 @@
 # SPEC: Effective Harness Manifest for Run (HRS-2)
 
+> Исторический документ: ADR-0043 заменён [ADR-0073](adr/0073-agent-registry.md),
+> поверхность манифестов удалена (declarative-agents D007, TASK-000592).
+
 Статус: draft (до spike и ADR)
 Источник контекста: `docs/reference/hermes-agent.md` верхнеуровневого репозитория,
 разделы «Детерминированная сборка prompt/context» и «HRS-2. Effective Harness

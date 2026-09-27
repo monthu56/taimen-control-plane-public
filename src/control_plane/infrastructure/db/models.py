@@ -1196,6 +1196,9 @@ class Run(Base):
     # runs started before the column existed.
     instructions_hash: Mapped[str | None] = mapped_column(Text)
     instructions_refs: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
+    # The agent revision the run went by (CP-ADR-0073 §7); NULL for executors
+    # that are not registered agents.
+    agent_revision_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("agent_revisions.id"))
     version: Mapped[int] = mapped_column(Integer, default=1)
     created_at: Mapped[datetime]
     updated_at: Mapped[datetime]
@@ -1315,6 +1318,106 @@ class ArtifactType(Base):
     status: Mapped[str] = mapped_column(Text, default="active")
     created_by: Mapped[uuid.UUID] = mapped_column(ForeignKey("principals.id"))
     created_at: Mapped[datetime]
+    updated_at: Mapped[datetime]
+
+
+class Agent(Base):
+    """A registered agent: its key, desired state and current revision (CP-ADR-0073).
+
+    The spec itself lives in ``agent_revisions``; this row carries what moves
+    without a new revision — ``state``/``replicas`` (§3), the principal the
+    core derived for the agent and the IAM identity bound to it (§6), and the
+    retirement, after which the key is never reused (§9).
+    """
+
+    __tablename__ = "agents"
+    __table_args__ = (
+        CheckConstraint("status IN ('active', 'retired')", name="status"),
+        CheckConstraint("state IN ('running', 'stopped')", name="state"),
+        CheckConstraint("replicas >= 0 AND replicas <= 100", name="replicas_range"),
+        CheckConstraint("current_revision >= 1", name="current_revision_positive"),
+        CheckConstraint("version >= 1", name="version_positive"),
+        CheckConstraint(
+            "(principal_id IS NULL) = (iam_principal_id IS NULL)",
+            name="identity_with_principal",
+        ),
+        UniqueConstraint("tenant_id", "key", name="uq_agents_tenant_key"),
+        UniqueConstraint("principal_id", name="uq_agents_principal_id"),
+        Index("ix_agents_tenant_created", "tenant_id", "created_at", "id"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True)
+    tenant_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("tenants.id"))
+    key: Mapped[str] = mapped_column(Text)
+    display_name: Mapped[str] = mapped_column(Text)
+    status: Mapped[str] = mapped_column(Text, default="active")
+    state: Mapped[str] = mapped_column(Text)
+    replicas: Mapped[int] = mapped_column(Integer)
+    current_revision: Mapped[int] = mapped_column(Integer)
+    # Workspace of ``spec.work``: the workspace of the agent's events.
+    workspace_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("workspaces.id"))
+    principal_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("principals.id"))
+    iam_issuer: Mapped[str | None] = mapped_column(Text)
+    iam_tenant_id: Mapped[uuid.UUID | None]
+    iam_principal_id: Mapped[uuid.UUID | None]
+    retired_at: Mapped[datetime | None]
+    retired_by: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("principals.id"))
+    version: Mapped[int] = mapped_column(Integer, default=1)
+    created_by: Mapped[uuid.UUID] = mapped_column(ForeignKey("principals.id"))
+    created_at: Mapped[datetime]
+    updated_at: Mapped[datetime]
+
+
+class AgentRevision(Base):
+    """One immutable published spec of an agent (CP-ADR-0073 §2).
+
+    A trigger rejects every UPDATE and DELETE. ``spec`` is stored as applied,
+    without the desired state (``state``, ``placement.replicas``);
+    ``spec_hash`` is ``sha256:<hex>`` of its canonical JSON.
+    """
+
+    __tablename__ = "agent_revisions"
+    __table_args__ = (
+        CheckConstraint("revision >= 1", name="revision_positive"),
+        UniqueConstraint("agent_id", "revision", name="uq_agent_revisions_agent_revision"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True)
+    tenant_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("tenants.id"))
+    agent_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("agents.id"))
+    revision: Mapped[int] = mapped_column(Integer)
+    spec: Mapped[dict[str, Any]] = mapped_column(JSONB)
+    spec_hash: Mapped[str] = mapped_column(Text)
+    created_by: Mapped[uuid.UUID] = mapped_column(ForeignKey("principals.id"))
+    created_at: Mapped[datetime]
+
+
+class AgentObservedStatus(Base):
+    """What actually runs, as the placement service last reported it (CP-ADR-0073 §4)."""
+
+    __tablename__ = "agent_status"
+    __table_args__ = (
+        CheckConstraint(
+            "phase IN ('pending', 'running', 'waiting_for_node', 'crash_looping', "
+            "'node_unavailable', 'stopped')",
+            name="phase",
+        ),
+        CheckConstraint(
+            "instances_desired >= 0 AND instances_ready >= 0", name="instances_non_negative"
+        ),
+    )
+
+    agent_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("agents.id"), primary_key=True)
+    tenant_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("tenants.id"))
+    phase: Mapped[str] = mapped_column(Text)
+    reason_code: Mapped[str | None] = mapped_column(Text)
+    reason_message: Mapped[str | None] = mapped_column(Text)
+    observed_revision: Mapped[int | None] = mapped_column(Integer)
+    node: Mapped[str | None] = mapped_column(Text)
+    instances_desired: Mapped[int] = mapped_column(Integer)
+    instances_ready: Mapped[int] = mapped_column(Integer)
+    observed_at: Mapped[datetime]
+    reported_by: Mapped[uuid.UUID] = mapped_column(ForeignKey("principals.id"))
     updated_at: Mapped[datetime]
 
 
@@ -1811,83 +1914,6 @@ class RunAction(Base):
     metadata_json: Mapped[dict[str, Any]] = mapped_column("metadata", default=dict)
     started_at: Mapped[datetime]
     finished_at: Mapped[datetime | None]
-    created_at: Mapped[datetime]
-
-
-# --- v0.7 Effective Harness Manifest (HRS-2) ----------------------------------
-
-
-class RunHarnessManifest(Base):
-    """Immutable snapshot of the effective runtime configuration of a run.
-
-    ``base`` + ``provenance`` are the frozen, hashed part; ``captured`` holds
-    the moving operational cursor and the Memory Context Pack *reference* and
-    is deliberately outside ``base_hash`` (HRS-2). Rows never change: a
-    database trigger rejects UPDATE and DELETE, so a new effective revision
-    means a new version, not an edit.
-    """
-
-    __tablename__ = "run_harness_manifests"
-    __table_args__ = (
-        CheckConstraint("version >= 1", name="version_positive"),
-        CheckConstraint("model_attempt >= 1", name="model_attempt_positive"),
-        CheckConstraint("base_hash ~ '^sha256:[0-9a-f]{64}$'", name="base_hash"),
-        CheckConstraint("snapshot_hash ~ '^sha256:[0-9a-f]{64}$'", name="snapshot_hash"),
-        CheckConstraint(
-            "compile_reason IN ('run_started', 'recompile', 'provider_fallback')",
-            name="compile_reason",
-        ),
-        UniqueConstraint("run_id", "version", name="uq_run_harness_manifests_run_version"),
-        UniqueConstraint("tenant_id", "id", name="uq_run_harness_manifests_tenant_id_id"),
-        Index("ix_run_harness_manifests_run_version", "run_id", text("version DESC")),
-        Index("ix_run_harness_manifests_tenant_created", "tenant_id", "created_at", "id"),
-        Index("ix_run_harness_manifests_task", "task_id"),
-    )
-
-    id: Mapped[uuid.UUID] = mapped_column(primary_key=True)
-    tenant_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("tenants.id"))
-    run_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("runs.id"))
-    task_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("tasks.id"))
-    project_id: Mapped[uuid.UUID | None]
-    version: Mapped[int] = mapped_column(Integer)
-    base_hash: Mapped[str] = mapped_column(Text)
-    snapshot_hash: Mapped[str] = mapped_column(Text)
-    base: Mapped[dict[str, Any]] = mapped_column(default=dict)
-    provenance: Mapped[dict[str, Any]] = mapped_column(default=dict)
-    captured: Mapped[dict[str, Any]] = mapped_column(default=dict)
-    compile_reason: Mapped[str] = mapped_column(Text)
-    model_attempt: Mapped[int] = mapped_column(Integer, default=1)
-    supersedes_version: Mapped[int | None] = mapped_column(Integer)
-    created_by: Mapped[uuid.UUID] = mapped_column(ForeignKey("principals.id"))
-    created_at: Mapped[datetime]
-
-
-class RunManifestEphemeral(Base):
-    """Append-only steering/warning marker attached to a manifest version.
-
-    Ephemeral by construction: it never enters ``base``, ``provenance`` or any
-    hash, so a temporary correction can never masquerade as durable intent.
-    """
-
-    __tablename__ = "run_manifest_ephemerals"
-    __table_args__ = (
-        CheckConstraint("seq >= 1", name="seq_positive"),
-        CheckConstraint("kind IN ('steering', 'warning', 'budget_warning', 'note')", name="kind"),
-        CheckConstraint("char_length(summary) BETWEEN 1 AND 500", name="summary_length"),
-        UniqueConstraint("manifest_id", "seq", name="uq_run_manifest_ephemerals_manifest_seq"),
-        Index("ix_run_manifest_ephemerals_manifest", "manifest_id", "seq"),
-        Index("ix_run_manifest_ephemerals_run", "run_id"),
-    )
-
-    id: Mapped[uuid.UUID] = mapped_column(primary_key=True)
-    tenant_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("tenants.id"))
-    run_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("runs.id"))
-    manifest_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("run_harness_manifests.id"))
-    seq: Mapped[int] = mapped_column(Integer)
-    kind: Mapped[str] = mapped_column(Text)
-    summary: Mapped[str] = mapped_column(Text)
-    data: Mapped[dict[str, Any]] = mapped_column(default=dict)
-    created_by: Mapped[uuid.UUID] = mapped_column(ForeignKey("principals.id"))
     created_at: Mapped[datetime]
 
 

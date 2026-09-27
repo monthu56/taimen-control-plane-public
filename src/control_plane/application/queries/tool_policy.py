@@ -32,8 +32,8 @@ from control_plane.application.queries.projects import (
 from control_plane.domain.child_handle import grant_from_stored
 from control_plane.domain.enums import Permission, SessionStatus, SkillStatus
 from control_plane.domain.errors import NotFoundError, ValidationError
-from control_plane.domain.harness_manifest import ProjectPolicyInput
 from control_plane.domain.tool_discovery import (
+    ProjectPolicyInput,
     ToolCandidate,
     ToolDecision,
     catalog_revision,
@@ -92,12 +92,8 @@ async def project_policy_for_task(
     own_layer = layers[-1] if layers else {}
     return ProjectPolicyInput(
         project_id=str(project.id),
-        template_key=own_layer.get("templateKey"),
-        template_version=own_layer.get("templateVersion"),
         active_revision=own_layer.get("revision"),
         governance=dict(effective.config.get("governance") or {}),
-        governance_origins=dict(effective.provenance.get("governance") or {}),
-        layers=tuple(layers),
     )
 
 
@@ -180,8 +176,8 @@ async def _child_grant_skills(
 ) -> frozenset[str] | None:
     """Skill ceiling of a run that was launched by a parent (HRS-7).
 
-    Read here rather than enforced separately so that search, describe, the
-    manifest and the invocation gate all narrow through the same decision — a
+    Read here rather than enforced separately so that search, describe and
+    the invocation gate all narrow through the same decision — a
     second enforcement point would eventually disagree with this one.
     """
     if run is None:

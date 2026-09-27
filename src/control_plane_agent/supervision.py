@@ -16,7 +16,13 @@ both are the daemon's business, not the executor's:
   task to the queue. While the last action is still ``started`` (a long test
   suite, a build) it counts as alive: the ``stall`` checkpoint still comes at
   ``stall_warn_seconds`` and says the action is running, but the stop waits
-  for ``action_max_seconds`` instead. Finishing that action is progress.
+  for ``action_max_seconds`` instead. Finishing that action is progress;
+* **drain** — the daemon itself is stopping (``SIGTERM`` from whoever placed
+  it, a new revision of its agent) and the run in flight has had the drain
+  time of the agent's placement (``placement.drainSeconds``, CP-ADR-0073) to
+  finish. It is stopped like a cancelled one and the run is cancelled
+  ``drained``, so the task goes back to the queue for the next instance
+  rather than waiting for the lease to expire.
 
 Stopping is one mechanism for every adapter: the executor runs as an asyncio
 task and is cancelled. An adapter that drives a process must end it when it
@@ -42,6 +48,7 @@ logger = logging.getLogger("control_plane_agent.supervision")
 CANCEL_REQUESTED = "cancel_requested"
 NO_PROGRESS = "no_progress"
 RUN_ENDED = "run_ended"
+DRAINED = "drained"
 #: The checkpoint the watchdog leaves when a run goes quiet.
 STALL_CHECKPOINT = "stall"
 #: A cancellation must be noticed within this, whatever is configured.
@@ -91,6 +98,9 @@ class RunSupervisor:
     run_id: str
     settings: SupervisionSettings = field(default_factory=SupervisionSettings)
     clock: Callable[[], float] = time.monotonic
+    # When the daemon is draining: the ``clock`` value after which the executor
+    # is stopped. Read on every look, since a drain starts while the run goes.
+    drain_deadline: Callable[[], float | None] = lambda: None
     _cursor: str | None = field(default=None, init=False)
     _last_seq: int = field(default=0, init=False)
     _last_action: dict[str, Any] | None = field(default=None, init=False)
@@ -117,6 +127,9 @@ class RunSupervisor:
             raise
 
     async def _look(self) -> ExecutionStopped | None:
+        deadline = self.drain_deadline()
+        if deadline is not None and self.clock() >= deadline:
+            return ExecutionStopped(DRAINED)
         try:
             run = await self.client.get_run(self.run_id)
         except ControlPlaneError as exc:
@@ -226,8 +239,9 @@ async def settle_stopped(
     Cancellation: the accepted control messages are acknowledged at the
     executor's stop (the cancel request ``applied``, anything queued behind
     it ``superseded``), then the run is cancelled. No progress: the run fails
-    ``no_progress``. Either way the claim is released, so the task is free
-    for whatever comes next — the rule's decision or another executor.
+    ``no_progress``. Drain: the run is cancelled ``drained``. Either way the
+    claim is released, so the task is free for whatever comes next — the
+    rule's decision or another executor.
     """
     if stop.reason == CANCEL_REQUESTED:
         await _acknowledge_controls(client, run_id, claim_id, fencing_token)
@@ -236,6 +250,9 @@ async def settle_stopped(
     elif stop.reason == NO_PROGRESS:
         with contextlib.suppress(ControlPlaneError):
             await client.fail_run(run_id, failure_reason=NO_PROGRESS)
+    elif stop.reason == DRAINED:
+        with contextlib.suppress(ControlPlaneError):
+            await client.cancel_run(run_id, reason=DRAINED)
     with contextlib.suppress(ControlPlaneError):
         await client.release_claim(claim_id, reason=stop.reason)
 

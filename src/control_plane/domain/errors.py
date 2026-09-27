@@ -98,3 +98,17 @@ class AuthorizationError(DomainError):
         details: dict[str, Any] | None = None,
     ) -> None:
         super().__init__(code, message, details=details)
+
+
+class NotImplementedYetError(DomainError):
+    """A route whose contract is accepted but whose implementation has not landed (501).
+
+    Contract-first work (constitution art. V) publishes the route in OpenAPI
+    before the step that implements it; until then the route answers this
+    instead of pretending to work.
+    """
+
+    http_status = 501
+
+    def __init__(self, message: str, *, details: dict[str, Any] | None = None) -> None:
+        super().__init__("not_implemented", message, details=details)

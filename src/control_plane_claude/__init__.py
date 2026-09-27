@@ -5,6 +5,7 @@ from control_plane_claude.adapter import (
     HARNESS_TYPE,
     ClaudeCodeAdapter,
     adapter_from_environment,
+    adapter_from_params,
 )
 from control_plane_claude.cli import ClaudeCodeCLI, ClaudeCodeError, ClaudeResult
 
@@ -16,4 +17,5 @@ __all__ = [
     "ClaudeCodeError",
     "ClaudeResult",
     "adapter_from_environment",
+    "adapter_from_params",
 ]

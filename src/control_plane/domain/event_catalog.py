@@ -905,19 +905,31 @@ _register(
 _register("session.closed", "session", "A work session was closed.", data({"releasedClaims": ARR}))
 
 _RUN = {"taskId": UUID}
+_RUN_STARTED_V1 = {
+    **_RUN,
+    "claimId": UUID,
+    "attempt": INT,
+    "fencingToken": INT,
+    "instructionsHash": ANY,
+    "instructionsRefs": ANY,
+}
 _register(
     "run.started",
     "run",
     "An execution attempt started under a claim.",
-    data(
-        {
-            **_RUN,
-            "claimId": UUID,
-            "attempt": INT,
-            "fencingToken": INT,
-            "instructionsHash": ANY,
-            "instructionsRefs": ANY,
-        }
+    data(_RUN_STARTED_V1),
+    (
+        data(
+            {
+                **_RUN_STARTED_V1,
+                "agentRevisionId": described(
+                    UUID_N,
+                    "Agent revision the run goes by (CP-ADR-0073 §7); "
+                    "null for executors that are not registered agents",
+                ),
+            }
+        ),
+        "agentRevisionId",
     ),
 )
 _register(
@@ -965,7 +977,8 @@ _register(
 _register(
     "run.manifest_compiled",
     "run",
-    "The effective harness manifest of the run was compiled (ADR-0043).",
+    "The effective harness manifest of the run was compiled (ADR-0043). No longer "
+    "written since ADR-0073; kept for events already in the journal.",
     data(
         {
             **_RUN,
@@ -981,7 +994,8 @@ _register(
 _register(
     "run.manifest_ephemeral_recorded",
     "run",
-    "An ephemeral manifest change was recorded.",
+    "An ephemeral manifest change was recorded (ADR-0043). No longer written since "
+    "ADR-0073; kept for events already in the journal.",
     data({**_RUN, "manifestId": UUID, "version": INT, "seq": INT, "kind": ANY}),
 )
 _CONTROL_MESSAGE = {
@@ -1141,6 +1155,92 @@ _register(
             "mediaTypes": ARR,
             "maxBytes": INT,
             "declaresMetadataSchema": BOOL,
+        }
+    ),
+)
+# --- agent registry (CP-ADR-0073) ---------------------------------------------
+
+_AGENT_HASH: JsonSchema = {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"}
+_AGENT_STATE: JsonSchema = {"type": "string", "enum": ["running", "stopped"]}
+_AGENT_PHASE: JsonSchema = {
+    "type": "string",
+    "enum": [
+        "pending",
+        "running",
+        "waiting_for_node",
+        "crash_looping",
+        "node_unavailable",
+        "stopped",
+    ],
+}
+_register(
+    "agent.revision_published",
+    "agent",
+    "A new immutable revision of an agent spec was published (CP-ADR-0073 §2).",
+    data(
+        {
+            "key": STR,
+            "revision": INT,
+            "specHash": _AGENT_HASH,
+            "previousRevision": described(INT_N, "Null for the first revision of the key"),
+            "executorKind": described(STR_N, "Null for an identity without placement"),
+            "placed": described(BOOL, "False for placement none"),
+            "permissionsChanged": described(
+                BOOL, "Identity (roles, permissions, capabilities) differs from the previous one"
+            ),
+        }
+    ),
+)
+_register(
+    "agent.state_changed",
+    "agent",
+    "The desired state or replica count of an agent changed; no new revision.",
+    data(
+        {
+            "key": STR,
+            "state": _AGENT_STATE,
+            "replicas": INT,
+            "previousState": described(
+                {"type": ["string", "null"], "enum": [*_AGENT_STATE["enum"], None]},
+                "Null when the agent is first published",
+            ),
+            "previousReplicas": INT_N,
+        }
+    ),
+)
+_register(
+    "agent.status_changed",
+    "agent",
+    "The observed state of an agent changed: phase, reason, node or revision.",
+    data(
+        {
+            "key": STR,
+            "phase": _AGENT_PHASE,
+            "previousPhase": described(
+                {"type": ["string", "null"], "enum": [*_AGENT_PHASE["enum"], None]},
+                "Null on the first report",
+            ),
+            "reasonCode": described(STR_N, "Why it is not running, e.g. no_matching_node"),
+            "node": STR_N,
+            "observedRevision": INT_N,
+            "observedAt": TIME,
+        }
+    ),
+)
+_register(
+    "agent.retired",
+    "agent",
+    "An agent was retired: stopped, binding revoked, history kept.",
+    data(
+        {
+            "key": STR,
+            "revision": described(INT, "The last revision of the agent"),
+            "principalId": UUID_N,
+            "reason": described(
+                {"type": "string", "maxLength": PAYLOAD_TEXT_LIMIT},
+                "Reason given; credential-shaped material redacted, cut to the limit",
+            ),
+            "releasedClaims": described(INT, "Active claims of the agent released to the queue"),
         }
     ),
 )

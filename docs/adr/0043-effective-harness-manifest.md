@@ -1,6 +1,13 @@
 # ADR-0043: Effective Harness Manifest как immutable evidence Run
 
-Статус: Принято (v0.7)
+Статус: Superseded — [ADR-0073](0073-agent-registry.md) (заменён CP-ADR-0073,
+2026-09-27): конфигурация исполнителя — ревизия агента, прогон называет её в
+`agentRevisionId`. Поверхность удалена в declarative-agents D007 (TASK-000592):
+таблицы `run_harness_manifests` и `run_manifest_ephemerals` сносит миграция
+`439255fb8627`, маршруты `/runs/{id}/harness-manifest*`, метод клиента и MCP-tool
+`cp_harness_manifest` удалены. Типы событий `run.manifest_compiled` и
+`run.manifest_ephemeral_recorded` остаются в каталоге для событий, уже лежащих
+в журнале, но больше не пишутся. Принято (v0.7).
 
 Предпосылка: spike HRS-2 выполнен и зелёный (`tests/unit/test_harness_manifest.py`),
 trade-offs подтверждены. Контракт — `docs/effective-harness-manifest-spec.md`,
@@ -107,18 +114,14 @@ Steering и warnings — append-only строки отдельной табли�
 
 ## Conformance
 
-Пробы для `adr.conformance_check` (пилот «саморазработка»):
+Пробы для `adr.conformance_check` (пилот «саморазработка»). После замены
+ADR-0073 они проверяют, что поверхность удалена; канонический JSON остаётся
+(его используют discovery и реестр агентов):
 
 ```conformance
-- grep: {path: src/control_plane/infrastructure/db/models.py, pattern: '__tablename__ = "run_harness_manifests"'}
+- absent: {path: "src/control_plane/**/*.py", pattern: '__tablename__ = "run_harness_manifests"'}
   repo: control-plane
-- grep: {path: src/control_plane/infrastructure/db/models.py, pattern: '__tablename__ = "run_manifest_ephemerals"'}
-  repo: control-plane
-- route: "POST /runs/{run_id}/harness-manifest:compile"
-  repo: control-plane
-- grep: {path: src/control_plane/application/commands/manifests.py, pattern: '"invalid_fallback_attempt"'}
-  repo: control-plane
-- grep: {path: src/control_plane/domain/harness_manifest.py, pattern: '"server_authoritative_section"'}
+- absent: {path: "src/control_plane/**/*.py", pattern: 'harness-manifest'}
   repo: control-plane
 - grep: {path: src/control_plane/domain/canonical.py, pattern: 'Floating point numbers are not allowed'}
   repo: control-plane

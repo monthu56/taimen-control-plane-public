@@ -115,6 +115,12 @@ class Permission(StrEnum):
     # of artifact must look like.
     ARTIFACT_TYPES_READ = "artifact_types.read"
     ARTIFACT_TYPES_MANAGE = "artifact_types.manage"
+    # declarative-agents (CP-ADR-0073 §5). Describing an agent and reporting
+    # what actually runs are different roles: the placement service writes the
+    # observed state and nothing else, an administrator never writes it.
+    AGENTS_READ = "agents.read"
+    AGENTS_MANAGE = "agents.manage"
+    AGENTS_STATUS_WRITE = "agents.status.write"
     ADMIN = "admin"
 
 
@@ -146,6 +152,31 @@ class TaskTypeStatus(StrEnum):
 class ArtifactTypeStatus(StrEnum):
     ACTIVE = "active"
     DEPRECATED = "deprecated"
+
+
+class AgentStatus(StrEnum):
+    """Record state of an agent (CP-ADR-0073 §2): a retired key stays retired."""
+
+    ACTIVE = "active"
+    RETIRED = "retired"
+
+
+class AgentState(StrEnum):
+    """Desired state of an agent, kept apart from its revisions (CP-ADR-0073 §3)."""
+
+    RUNNING = "running"
+    STOPPED = "stopped"
+
+
+class AgentPhase(StrEnum):
+    """Observed state of an agent as the placement service reports it (§4)."""
+
+    PENDING = "pending"
+    RUNNING = "running"
+    WAITING_FOR_NODE = "waiting_for_node"
+    CRASH_LOOPING = "crash_looping"
+    NODE_UNAVAILABLE = "node_unavailable"
+    STOPPED = "stopped"
 
 
 class SkillStatus(StrEnum):

@@ -29,8 +29,6 @@ from control_plane.infrastructure.db.models import (
     RunAction,
     RunCheckpoint,
     RunControlMessage,
-    RunHarnessManifest,
-    RunManifestEphemeral,
     Session,
     Skill,
     Task,
@@ -301,87 +299,6 @@ async def list_run_actions(
     await authorize(ctx, Permission.TASKS_READ)
     await get_run(session, ctx, run_id)
     return await _paginate_by_seq(session, RunAction, run_id, limit=limit, cursor=cursor)
-
-
-def _manifest_summary(manifest: RunHarnessManifest) -> dict[str, Any]:
-    return {
-        "id": str(manifest.id),
-        "runId": str(manifest.run_id),
-        "taskId": str(manifest.task_id),
-        "projectId": str(manifest.project_id) if manifest.project_id else None,
-        "version": manifest.version,
-        "baseHash": manifest.base_hash,
-        "snapshotHash": manifest.snapshot_hash,
-        "compileReason": manifest.compile_reason,
-        "modelAttempt": manifest.model_attempt,
-        "supersedesVersion": manifest.supersedes_version,
-        "createdAt": manifest.created_at.isoformat(),
-    }
-
-
-async def get_run_manifest(
-    session: AsyncSession, ctx: AuthContext, run_id: uuid.UUID, *, version: int | None = None
-) -> dict[str, Any]:
-    """One manifest version with its ephemeral markers, kept apart (HRS-2).
-
-    ``base``/``provenance`` are the frozen, hashed evidence; ``captured`` is the
-    moving state captured alongside it; ``ephemeral`` is everything temporary.
-    The three never merge, in storage or on the wire.
-    """
-    await authorize(ctx, Permission.TASKS_READ)
-    await get_run(session, ctx, run_id)  # tenant scoping + 404
-    stmt = select(RunHarnessManifest).where(RunHarnessManifest.run_id == run_id)
-    stmt = (
-        stmt.where(RunHarnessManifest.version == version)
-        if version is not None
-        else stmt.order_by(RunHarnessManifest.version.desc()).limit(1)
-    )
-    manifest = await session.scalar(stmt)
-    if manifest is None:
-        raise NotFoundError(
-            "Run has no harness manifest",
-            details={"runId": str(run_id), "version": version},
-        )
-    ephemerals = (
-        await session.scalars(
-            select(RunManifestEphemeral)
-            .where(RunManifestEphemeral.manifest_id == manifest.id)
-            .order_by(RunManifestEphemeral.seq.asc())
-        )
-    ).all()
-    return {
-        "manifest": {
-            **_manifest_summary(manifest),
-            "base": manifest.base,
-            "provenance": manifest.provenance,
-            "captured": manifest.captured,
-        },
-        "ephemeral": [
-            {
-                "id": str(record.id),
-                "seq": record.seq,
-                "kind": record.kind,
-                "summary": record.summary,
-                "data": record.data,
-                "createdAt": record.created_at.isoformat(),
-            }
-            for record in ephemerals
-        ],
-    }
-
-
-async def list_run_manifests(
-    session: AsyncSession, ctx: AuthContext, run_id: uuid.UUID
-) -> list[dict[str, Any]]:
-    """Version history of one run's manifest, newest first."""
-    await authorize(ctx, Permission.TASKS_READ)
-    await get_run(session, ctx, run_id)
-    rows = await session.scalars(
-        select(RunHarnessManifest)
-        .where(RunHarnessManifest.run_id == run_id)
-        .order_by(RunHarnessManifest.version.desc())
-    )
-    return [_manifest_summary(manifest) for manifest in rows.all()]
 
 
 _CONTEXT_ARTIFACTS_LIMIT = 50

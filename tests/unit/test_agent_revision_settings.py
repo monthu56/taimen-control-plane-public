@@ -1,0 +1,312 @@
+"""A revision turned into the daemon's settings (control_plane_agent.revision, D006).
+
+The examples of the catalog schema (``tests/fixtures/agents/``) are what a
+package installs; each maps onto the arguments the daemon, its adapters and
+its skill executor already take. What the host owns stays the host's.
+"""
+
+import copy
+import subprocess
+from pathlib import Path
+from typing import Any
+
+import pytest
+import yaml
+
+from control_plane_agent.main import EchoAdapter, adapter_for_revision
+from control_plane_agent.revision import (
+    DEFAULT_DRAIN_SECONDS,
+    AgentRevision,
+    RevisionError,
+    config_mode,
+    mirror,
+    settings_of,
+    skills_environ,
+    workspace_pool_of,
+)
+from control_plane_agent.skills import (
+    ENV_CONCURRENCY,
+    ENV_HTTP_ORIGINS,
+    ENV_LOCAL_ISOLATION,
+    ENV_LOCAL_PACKAGES,
+    ENV_MCP_ORIGINS,
+    ENV_PROTOCOLS,
+)
+from control_plane_claude import ClaudeCodeAdapter
+from control_plane_codex import CodexAdapter
+
+FIXTURES = Path(__file__).resolve().parents[1] / "fixtures" / "agents"
+HOST = {"CONTROL_PLANE_CLAUDE_MCP": "0", "CONTROL_PLANE_CLAUDE_LOGS": "0"}
+
+
+def _revision(name: str, **overrides: Any) -> AgentRevision:
+    spec = copy.deepcopy(yaml.safe_load((FIXTURES / name).read_text(encoding="utf-8"))["spec"])
+    spec.pop("state", None)
+    spec.update(overrides)
+    return AgentRevision(
+        key="coder",
+        revision=4,
+        revision_id="11111111-1111-1111-1111-111111111111",
+        spec_hash="sha256:0",
+        spec=spec,
+        status="active",
+        state="running",
+        workspace_id="22222222-2222-2222-2222-222222222222",
+    )
+
+
+# --- work, review, drain -----------------------------------------------------------
+
+
+def test_the_coder_example_takes_its_work_and_asks_a_human_to_review() -> None:
+    settings = settings_of(_revision("coder.yaml"))
+
+    assert settings.workspace_id == "22222222-2222-2222-2222-222222222222"
+    assert (settings.only_assigned, settings.include_subprojects) == (True, False)
+    assert settings.task_types == frozenset({"coding-task"})
+    assert settings.drain_seconds == 14400
+    policy = settings.review_policy
+    assert policy is not None
+    assert (policy.mode, policy.review_type, policy.reviewer_principal_id) == (
+        "human",
+        "code-review-merge",
+        "${SELFDEV_REVIEWER_PRINCIPAL}",
+    )
+    assert policy.reviewed_types == frozenset({"coding-task"})
+    assert settings.review_type == "code-review-merge"
+
+
+def test_defaults_are_the_schemas_not_the_env_modes() -> None:
+    """``onlyAssigned`` defaults to true in the kind's schema: take only what is meant for you."""
+    settings = settings_of(_revision("reviewer.yaml"))
+
+    assert settings.only_assigned is True
+    assert settings.task_types == frozenset()
+    assert settings.review_policy is None
+    assert settings.drain_seconds == DEFAULT_DRAIN_SECONDS
+    assert settings_of(_revision("process-bridge.yaml")).drain_seconds is None
+
+
+def test_no_placement_is_placed_with_the_defaults() -> None:
+    """No ``placement`` field: a placed agent (one replica), drained like any other."""
+    revision = _revision("coder.yaml")
+    del revision.spec["placement"]  # type: ignore[attr-defined]
+
+    settings = settings_of(revision)
+    assert settings.drain_seconds == DEFAULT_DRAIN_SECONDS
+    adapter = adapter_for_revision(revision, HOST)
+    assert isinstance(adapter, ClaudeCodeAdapter)
+
+
+def test_review_none_and_review_without_a_reviewer() -> None:
+    none = _revision("coder.yaml")
+    none.spec["workingCopy"]["review"] = {"mode": "none", "taskType": "code-review"}
+    assert settings_of(none).review_policy is None
+
+    missing = _revision("coder.yaml")
+    missing.spec["workingCopy"]["review"] = {"mode": "agent"}
+    with pytest.raises(RevisionError, match="reviewer"):
+        settings_of(missing)
+
+
+def test_config_mode() -> None:
+    assert config_mode({}) == "auto"
+    assert config_mode({"CONTROL_PLANE_AGENT_CONFIG": "env"}) == "env"
+    with pytest.raises(RevisionError):
+        config_mode({"CONTROL_PLANE_AGENT_CONFIG": "yaml"})
+
+
+# --- skills ---------------------------------------------------------------------
+
+
+def test_skill_settings_of_the_revision_replace_the_hosts() -> None:
+    host = {
+        ENV_PROTOCOLS: "local,http,mcp",
+        ENV_MCP_ORIGINS: "https://elsewhere.example",
+        ENV_CONCURRENCY: "8",
+        ENV_LOCAL_ISOLATION: "thread",
+    }
+    revision = _revision("coder.yaml")
+    values = skills_environ(revision, host)
+
+    assert values is not None
+    assert values[ENV_PROTOCOLS] == "local,http"
+    assert values[ENV_LOCAL_PACKAGES] == ",".join(revision.spec["skills"]["local"])
+    assert values[ENV_HTTP_ORIGINS] == "https://platform.example.com"
+    # Not in the spec: not run, whatever the host says.
+    assert ENV_MCP_ORIGINS not in values
+    assert ENV_CONCURRENCY not in values
+    # The host's own.
+    assert values[ENV_LOCAL_ISOLATION] == "thread"
+
+    assert skills_environ(_revision("skills-executor.yaml"), {})[ENV_CONCURRENCY] == "2"  # type: ignore[index]
+    assert skills_environ(_revision("reviewer.yaml"), host) is None
+
+
+# --- executor ------------------------------------------------------------------------
+
+
+def test_claude_code_params_and_instructions_come_from_the_revision() -> None:
+    adapter = adapter_for_revision(_revision("coder.yaml"), HOST)
+
+    assert isinstance(adapter, ClaudeCodeAdapter)
+    assert adapter.cli.model == "claude-opus-5-5"
+    assert adapter.cli.permission_mode == "bypassPermissions"
+    assert adapter.cli.timeout_seconds == 10800
+    assert list(adapter.cli.disallowed_tools) == ["WebFetch"]
+    assert adapter.instructions == "Соглашения репозитория: …"
+    assert adapter.prompt_file is None
+
+
+def test_revision_instructions_replace_the_conventions_file(tmp_path: Path) -> None:
+    adapter = adapter_for_revision(_revision("coder.yaml"), HOST)
+    assert isinstance(adapter, ClaudeCodeAdapter)
+    stale = tmp_path / "conventions.md"
+    stale.write_text("from the file")
+    adapter.prompt_file = stale
+
+    prompt = adapter._build_prompt({"id": "t", "publicId": "TASK-1", "title": "x"}, {})
+
+    assert "### Repository conventions" in prompt
+    assert "Соглашения репозитория" in prompt
+    assert "from the file" not in prompt
+
+
+async def test_tools_narrow_on_top_of_the_withheld_commands(tmp_path: Path) -> None:
+    revision = _revision("coder.yaml")
+    revision.spec["executor"]["params"]["tools"] = {
+        "allow": ["Bash(uv run pytest:*)", "mcp__control-plane__cp_complete_run"],
+        "deny": ["WebFetch"],
+    }
+    adapter = adapter_for_revision(
+        revision,
+        {
+            **HOST,
+            "CONTROL_PLANE_CLAUDE_MCP": "1",
+            "CONTROL_PLANE_CLAUDE_RUNTIME_DIR": str(tmp_path),
+        },
+    )
+    assert isinstance(adapter, ClaudeCodeAdapter)
+
+    await adapter._narrow_tools()
+    await adapter._narrow_tools()  # once per process
+    argv = adapter.cli.command(session_id="s", resume=False)
+
+    denied = argv[argv.index("--disallowedTools") + 1 :]
+    allowed = argv[argv.index("--allowedTools") + 1 : argv.index("--disallowedTools")]
+    # The authoritative commands stay withheld whatever the revision allows.
+    assert "mcp__control-plane__cp_complete_run" in denied
+    assert "mcp__control-plane__cp_complete_run" not in allowed
+    assert "WebFetch" in denied
+    assert denied.count("WebFetch") == 1
+    assert allowed == ["Bash(uv run pytest:*)"]
+
+
+def test_codex_params_come_from_the_revision() -> None:
+    adapter = adapter_for_revision(_revision("reviewer.yaml"), {"CONTROL_PLANE_CODEX_LOGS": "0"})
+
+    assert isinstance(adapter, CodexAdapter)
+    assert adapter.cli.sandbox == "read-only"
+    assert adapter.credential_class == "subscription"
+    assert adapter.cli.timeout_seconds == 3600
+    assert adapter.instructions == ""
+
+
+@pytest.mark.parametrize(
+    ("executor", "message"),
+    [
+        ({"kind": "claude-code", "params": {"modle": "x"}}, "unknown executor params"),
+        ({"kind": "claude-code", "params": {"permissionMode": "yolo"}}, "permissionMode"),
+        ({"kind": "claude-code", "params": {"tools": {"only": []}}}, "allow and deny"),
+        ({"kind": "codex", "params": {"sandbox": "none"}}, "sandbox"),
+        ({"kind": "codex", "params": {"timeoutSeconds": "60"}}, "timeoutSeconds"),
+        ({"kind": "skills", "params": {"x": 1}}, "takes no params"),
+        ({"kind": "opencode"}, "not run by this daemon"),
+    ],
+)
+def test_params_an_adapter_refuses(executor: dict[str, Any], message: str) -> None:
+    with pytest.raises(RevisionError, match=message):
+        adapter_for_revision(_revision("reviewer.yaml", executor=executor), HOST)
+
+
+def test_skills_and_echo_kinds() -> None:
+    assert adapter_for_revision(_revision("skills-executor.yaml"), HOST) is None
+    echo = adapter_for_revision(_revision("reviewer.yaml", executor={"kind": "echo"}), HOST)
+    assert isinstance(echo, EchoAdapter)
+    with pytest.raises(RevisionError, match="no executor"):
+        adapter_for_revision(_revision("process-bridge.yaml"), HOST)
+
+
+# --- working copy -----------------------------------------------------------------
+
+
+def _git(cwd: Path, *args: str) -> str:
+    return subprocess.run(
+        ["git", *args], cwd=cwd, check=True, capture_output=True, text=True
+    ).stdout.strip()
+
+
+def _repository(path: Path) -> Path:
+    path.mkdir(parents=True)
+    _git(path, "init", "--quiet", "--initial-branch=main")
+    _git(path, "config", "user.email", "t@example.test")
+    _git(path, "config", "user.name", "t")
+    (path / "README").write_text("x")
+    _git(path, "add", ".")
+    _git(path, "commit", "--quiet", "-m", "init")
+    return path
+
+
+def test_a_repository_url_is_mirrored_once_and_checked(tmp_path: Path) -> None:
+    source = _repository(tmp_path / "forge" / "service")
+    url = f"file://{source}"
+    mirrors = tmp_path / "mirrors"
+
+    path = mirror(url, mirrors)
+    assert path == mirrors / "service.git"
+    assert _git(path, "rev-parse", "--is-bare-repository") == "true"
+    assert mirror(url, mirrors) == path  # the host's mirror is reused
+
+    other = _repository(tmp_path / "elsewhere" / "service")
+    with pytest.raises(RevisionError, match="not"):
+        mirror(f"file://{other}", mirrors)
+    # A directory on this host is used as it is.
+    assert mirror(str(source), mirrors) == source
+
+
+def test_the_working_copy_of_a_revision(tmp_path: Path) -> None:
+    source = _repository(tmp_path / "forge" / "service")
+    revision = _revision(
+        "reviewer.yaml",
+        workingCopy={
+            "repository": f"file://{source}",
+            "directory": "service",
+            "baseRef": "main",
+        },
+    )
+    root = tmp_path / "worktrees"
+
+    pool = workspace_pool_of(revision, {"CONTROL_PLANE_AGENT_WORKTREE_ROOT": str(root)})
+
+    assert pool is not None
+    assert pool.origin == (root / ".mirrors" / "service.git").resolve()
+    assert (pool.repo_dir, pool.base_ref) == ("service", "main")
+    # publish defaults to true: branches go back where the mirror came from.
+    assert pool.push_remote == "origin"
+
+    local = _revision("reviewer.yaml", workingCopy={"repository": str(source), "publish": False})
+    pool = workspace_pool_of(local, {"CONTROL_PLANE_AGENT_WORKTREE_ROOT": str(root)})
+    assert pool is not None
+    assert (pool.origin, pool.push_remote) == (source.resolve(), "")
+    assert workspace_pool_of(_revision("reviewer.yaml"), {}) is None
+
+
+def test_neighbours_without_a_superproject_are_refused(tmp_path: Path) -> None:
+    source = _repository(tmp_path / "forge" / "service")
+    sdk = _repository(tmp_path / "forge" / "sdk")
+    revision = _revision(
+        "reviewer.yaml",
+        workingCopy={"repository": str(source), "neighbours": {"sdk": str(sdk)}},
+    )
+    with pytest.raises(RevisionError, match="superproject"):
+        workspace_pool_of(revision, {"CONTROL_PLANE_AGENT_WORKTREE_ROOT": str(tmp_path / "w")})

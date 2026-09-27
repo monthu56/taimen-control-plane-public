@@ -1,8 +1,7 @@
 """Scoped Tool Discovery: one decision, one projection, one revision (HRS-3).
 
-Three consumers ask overlapping questions about the same tool:
+Two consumers ask overlapping questions about the same tool:
 
-* the Effective Harness Manifest asks "was it visible, and why" (HRS-2);
 * discovery asks "what may this run see right now";
 * action authorization asks "may this run execute it *now*".
 
@@ -19,7 +18,7 @@ See ``docs/specs/TASK-000005-scoped-tool-discovery.md``.
 """
 
 from collections.abc import Iterable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 from control_plane.domain.canonical import canonical_bytes, content_hash
@@ -48,6 +47,16 @@ REASON_HARNESS = "protocol_not_supported_by_harness"
 REASON_CHILD_GRANT = "not_granted_by_child_handle"
 
 SKILL_STATUS_DISABLED = "disabled"
+
+
+@dataclass(frozen=True)
+class ProjectPolicyInput:
+    """Effective project configuration as of the decision (ADR-0032 layers)."""
+
+    project_id: str | None = None
+    active_revision: int | None = None
+    governance: dict[str, Any] = field(default_factory=dict)
+
 
 #: The structural vocabulary of JSON Schema — and nothing else. Discovery
 #: projects a schema so a model can build a valid call, not so it can read the
@@ -179,8 +188,8 @@ def decide_visibility(
     given as ``name@version`` refs; ``None`` means "no handle, no narrowing",
     which is not the same as an empty set. It belongs on the authorization
     side, not the capability side: it is the server's own restriction, and
-    routing it through this one function is what keeps search, the manifest and
-    the invocation gate from disagreeing about the same tool.
+    routing it through this one function is what keeps search and the
+    invocation gate from disagreeing about the same tool.
     """
     allowed_by_governance = (
         True if allowed_protocols is None else candidate.protocol in tuple(allowed_protocols)

@@ -1,0 +1,19 @@
+# An identity only: a service account with nothing to place.
+apiVersion: taimen.ai/v1
+kind: Agent
+key: process-bridge
+spec:
+  displayName: Process runtime bridge
+  identity:
+    kind: service
+    permissions:
+    - tasks.read
+    - tasks.write
+    - events.read
+    iam:
+      audiences:
+      - control-plane
+      scopeCeiling:
+      - control-plane:read
+      - control-plane:write
+  placement: none

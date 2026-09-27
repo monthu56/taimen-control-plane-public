@@ -148,7 +148,7 @@ async def revoke_api_key(
 # --- IAM identity bindings (ADR-0053) -----------------------------------------
 
 
-def _forget_binding(request: Request, issuer: str, iam_principal_id: uuid.UUID) -> None:
+def forget_binding_cache(request: Request, issuer: str, iam_principal_id: uuid.UUID) -> None:
     """Drop the enforcement cache for one identity once its binding changed.
 
     Done after the transaction committed, never inside it: a cache dropped for
@@ -205,7 +205,7 @@ async def upsert_iam_binding(
         canonical_body=payload.model_dump_json(exclude_unset=True),
         executor=executor,
     )
-    _forget_binding(request, payload.issuer, payload.iam_principal_id)
+    forget_binding_cache(request, payload.issuer, payload.iam_principal_id)
     return response
 
 
@@ -233,5 +233,5 @@ async def revoke_iam_binding(
         request, ctx, settings, session_factory, canonical_body="", executor=executor
     )
     for issuer, iam_principal_id in identity:
-        _forget_binding(request, issuer, iam_principal_id)
+        forget_binding_cache(request, issuer, iam_principal_id)
     return response

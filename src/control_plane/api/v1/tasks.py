@@ -466,6 +466,7 @@ async def start_run(
             metadata=payload.metadata,
             max_duration_seconds=payload.max_duration_seconds,
             max_actions=payload.max_actions,
+            agent_revision_id=payload.agent_revision_id,
         )
         return 201, dump(RunOut, run)
 

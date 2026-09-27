@@ -30,8 +30,10 @@ V08_TYPES = "c8a51d70b394"
 # Second revision of the v0.8 line: custom fields and planned dates (ADR-0049).
 V08_FIELDS = "a1c7e94b2f60"
 # The current head of the chain the v0.8 tests upgrade back to (the last
-# revision adds the artifact schema of a task type, CP-ADR-0072).
-V08_HEAD = "c3f8a2d6e1b7"
+# revision adds the agent registry, CP-ADR-0073).
+V08_HEAD = "439255fb8627"
+# The revision right before the agent registry.
+BEFORE_AGENT_REGISTRY = "c3f8a2d6e1b7"
 # The revision right before attention feedback (CP-ADR-0068 approval workspaces).
 BEFORE_ATTENTION_FEEDBACK = "d2f8b4a6e1c3"
 # Observation dedup keys (CP-ADR-0057) and the revision right before them.
@@ -283,6 +285,32 @@ async def test_attention_feedback_revision_is_additive_and_reversible(
     response = await client.get(f"/api/v1/tasks/{task['id']}", headers=auth(admin_key))
     assert response.status_code == 200
     assert (await client.get("/api/v1/me/attention", headers=auth(admin_key))).status_code == 200
+
+
+async def test_agent_registry_revision_is_additive_and_reversible(
+    client: httpx.AsyncClient, sync_engine: Engine, v08_alembic_config: Config
+) -> None:
+    """The revision only ADDS the registry and a nullable run column; downgrade drops them."""
+    admin_key = (await do_bootstrap(client))["apiKey"]["key"]
+    task = await create_task(client, admin_key, title="Kept")
+
+    alembic_command.downgrade(v08_alembic_config, BEFORE_AGENT_REGISTRY)
+    inspector = inspect(sync_engine)
+    assert not {"agents", "agent_revisions", "agent_status"} & set(inspector.get_table_names())
+    assert "agent_revision_id" not in {c["name"] for c in inspector.get_columns("runs")}
+    alembic_command.upgrade(v08_alembic_config, V08_HEAD)
+
+    inspector = inspect(sync_engine)
+    assert {"agents", "agent_revisions", "agent_status"} <= set(inspector.get_table_names())
+    assert "agent_revision_id" in {c["name"] for c in inspector.get_columns("runs")}
+    with sync_engine.connect() as connection:
+        triggers = connection.execute(
+            text("SELECT tgname FROM pg_trigger WHERE tgrelid = 'agent_revisions'::regclass")
+        ).scalars()
+        assert "agent_revisions_immutable" in set(triggers)
+    response = await client.get(f"/api/v1/tasks/{task['id']}", headers=auth(admin_key))
+    assert response.status_code == 200
+    assert (await client.get("/api/v1/agents", headers=auth(admin_key))).status_code == 200
 
 
 async def test_head_matches_code(sync_engine: Engine) -> None:

@@ -1,5 +1,8 @@
 # Verification report: Effective Harness Manifest (HRS-2)
 
+> Исторический документ: ADR-0043 заменён [ADR-0073](adr/0073-agent-registry.md),
+> поверхность манифестов удалена (declarative-agents D007, TASK-000592).
+
 Дата: 2026-08-12. Ревизия схемы: `9c41ee0d7b52` (v0.7).
 Проверяемые документы: [SPEC](effective-harness-manifest-spec.md),
 [PLAN](effective-harness-manifest-plan.md),

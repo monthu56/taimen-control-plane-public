@@ -34,6 +34,10 @@ N+1 без изменений и игнорирует незнакомые по�
 
 | Тип | Сущность | Версия | Описание |
 |---|---|---|---|
+| [`agent.retired`](#agentretired) | `agent` | 1 | An agent was retired: stopped, binding revoked, history kept. |
+| [`agent.revision_published`](#agentrevision_published) | `agent` | 1 | A new immutable revision of an agent spec was published (CP-ADR-0073 §2). |
+| [`agent.state_changed`](#agentstate_changed) | `agent` | 1 | The desired state or replica count of an agent changed; no new revision. |
+| [`agent.status_changed`](#agentstatus_changed) | `agent` | 1 | The observed state of an agent changed: phase, reason, node or revision. |
 | [`api_key.break_glass_issued`](#api_keybreak_glass_issued) | `api_key` | 1 | A short-lived break-glass key was issued from the host shell (CP-ADR-0065). |
 | [`api_key.created`](#api_keycreated) | `api_key` | 1 | An API key was issued to a principal. |
 | [`api_key.revoked`](#api_keyrevoked) | `api_key` | 1 | An API key was revoked. |
@@ -104,9 +108,9 @@ N+1 без изменений и игнорирует незнакомые по�
 | [`run.control_message.superseded`](#runcontrol_messagesuperseded) | `run` | 1 | A control message was superseded. |
 | [`run.failed`](#runfailed) | `run` | 1 | The run failed. |
 | [`run.handoff_prepared`](#runhandoff_prepared) | `run` | 1 | The run prepared a handoff to another executor. |
-| [`run.manifest_compiled`](#runmanifest_compiled) | `run` | 1 | The effective harness manifest of the run was compiled (ADR-0043). |
-| [`run.manifest_ephemeral_recorded`](#runmanifest_ephemeral_recorded) | `run` | 1 | An ephemeral manifest change was recorded. |
-| [`run.started`](#runstarted) | `run` | 1 | An execution attempt started under a claim. |
+| [`run.manifest_compiled`](#runmanifest_compiled) | `run` | 1 | The effective harness manifest of the run was compiled (ADR-0043). No longer written since ADR-0073; kept for events already in the journal. |
+| [`run.manifest_ephemeral_recorded`](#runmanifest_ephemeral_recorded) | `run` | 1 | An ephemeral manifest change was recorded (ADR-0043). No longer written since ADR-0073; kept for events already in the journal. |
+| [`run.started`](#runstarted) | `run` | 2 | An execution attempt started under a claim. |
 | [`run.succeeded`](#runsucceeded) | `run` | 1 | The run finished successfully. |
 | [`run.suspended`](#runsuspended) | `run` | 1 | The run was suspended, e.g. to wait for a decision. |
 | [`session.closed`](#sessionclosed) | `session` | 1 | A work session was closed. |
@@ -152,6 +156,74 @@ N+1 без изменений и игнорирует незнакомые по�
 | [`workspace_type.archived`](#workspace_typearchived) | `workspace_type` | 1 | A workspace type was archived. |
 | [`workspace_type.created`](#workspace_typecreated) | `workspace_type` | 1 | A workspace type was created. |
 | [`workspace_type.updated`](#workspace_typeupdated) | `workspace_type` | 1 | A workspace type changed. |
+
+### agent.retired
+
+An agent was retired: stopped, binding revoked, history kept.
+
+Сущность: `agent`.
+
+Версия 1:
+
+| Поле | Тип | Всегда | Описание |
+|---|---|---|---|
+| `key` | string | да |  |
+| `revision` | integer | да | The last revision of the agent |
+| `principalId` | string \| null (uuid) | да |  |
+| `reason` | string | да | Reason given; credential-shaped material redacted, cut to the limit |
+| `releasedClaims` | integer | да | Active claims of the agent released to the queue |
+
+### agent.revision_published
+
+A new immutable revision of an agent spec was published (CP-ADR-0073 §2).
+
+Сущность: `agent`.
+
+Версия 1:
+
+| Поле | Тип | Всегда | Описание |
+|---|---|---|---|
+| `key` | string | да |  |
+| `revision` | integer | да |  |
+| `specHash` | string | да |  |
+| `previousRevision` | integer \| null | да | Null for the first revision of the key |
+| `executorKind` | string \| null | да | Null for an identity without placement |
+| `placed` | boolean | да | False for placement none |
+| `permissionsChanged` | boolean | да | Identity (roles, permissions, capabilities) differs from the previous one |
+
+### agent.state_changed
+
+The desired state or replica count of an agent changed; no new revision.
+
+Сущность: `agent`.
+
+Версия 1:
+
+| Поле | Тип | Всегда | Описание |
+|---|---|---|---|
+| `key` | string | да |  |
+| `state` | string | да |  |
+| `replicas` | integer | да |  |
+| `previousState` | string \| null | да | Null when the agent is first published |
+| `previousReplicas` | integer \| null | да |  |
+
+### agent.status_changed
+
+The observed state of an agent changed: phase, reason, node or revision.
+
+Сущность: `agent`.
+
+Версия 1:
+
+| Поле | Тип | Всегда | Описание |
+|---|---|---|---|
+| `key` | string | да |  |
+| `phase` | string | да |  |
+| `previousPhase` | string \| null | да | Null on the first report |
+| `reasonCode` | string \| null | да | Why it is not running, e.g. no_matching_node |
+| `node` | string \| null | да |  |
+| `observedRevision` | integer \| null | да |  |
+| `observedAt` | string (date-time) | да |  |
 
 ### api_key.break_glass_issued
 
@@ -1330,7 +1402,7 @@ The run prepared a handoff to another executor.
 
 ### run.manifest_compiled
 
-The effective harness manifest of the run was compiled (ADR-0043).
+The effective harness manifest of the run was compiled (ADR-0043). No longer written since ADR-0073; kept for events already in the journal.
 
 Сущность: `run`.
 
@@ -1348,7 +1420,7 @@ The effective harness manifest of the run was compiled (ADR-0043).
 
 ### run.manifest_ephemeral_recorded
 
-An ephemeral manifest change was recorded.
+An ephemeral manifest change was recorded (ADR-0043). No longer written since ADR-0073; kept for events already in the journal.
 
 Сущность: `run`.
 
@@ -1367,6 +1439,18 @@ An ephemeral manifest change was recorded.
 An execution attempt started under a claim.
 
 Сущность: `run`.
+
+Версия 2 (добавлено: agentRevisionId):
+
+| Поле | Тип | Всегда | Описание |
+|---|---|---|---|
+| `taskId` | string (uuid) | да |  |
+| `claimId` | string (uuid) | да |  |
+| `attempt` | integer | да |  |
+| `fencingToken` | integer | да |  |
+| `instructionsHash` | any | да |  |
+| `instructionsRefs` | any | да |  |
+| `agentRevisionId` | string \| null (uuid) | да | Agent revision the run goes by (CP-ADR-0073 §7); null for executors that are not registered agents |
 
 Версия 1:
 

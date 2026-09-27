@@ -36,6 +36,16 @@ CONTROL_PLANE_AGENT_ADAPTER=claude-code control-plane-agent
 | `CONTROL_PLANE_CLAUDE_PROMPT_FILE` | файл соглашений репозитория — четвёртый слой инструкций после platform/project/taskType (CP-ADR-0066); читается на каждом запуске. У Codex и OpenCode — `CONTROL_PLANE_CODEX_PROMPT_FILE`, `CONTROL_PLANE_OPENCODE_PROMPT_FILE` |
 | `CONTROL_PLANE_CLAUDE_RUNTIME_DIR` | где лежат mcp.json и логи (`~/.claude-runner`) |
 
+В режиме агента (CP-ADR-0073 п.14) модель, режим разрешений, таймаут,
+возобновление и набор инструментов задаёт ревизия агента —
+`executor.params` вида `claude-code`: `model`, `permissionMode`,
+`timeoutSeconds`, `resume`, `tools.allow/deny`; `executor.instructions`
+заменяет `CONTROL_PLANE_CLAUDE_PROMPT_FILE`. Переменные `…_MODEL`,
+`…_PERMISSION_MODE`, `…_TIMEOUT`, `…_RESUME`, `…_PROMPT_FILE` тогда не
+читаются; остальные принадлежат хосту и действуют как раньше. `tools.deny`
+добавляется к запрету авторитетных команд CP, `tools.allow` этот запрет не
+снимает.
+
 Аутентификация — `CLAUDE_CODE_OAUTH_TOKEN` в окружении runner (подписка) или
 `ANTHROPIC_API_KEY` (класс credential `api_key` по ADR-0016 п. 4). Адаптер
 токен не читает и никуда не копирует: дочерний процесс наследует окружение.

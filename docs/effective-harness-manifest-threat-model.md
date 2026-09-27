@@ -1,5 +1,8 @@
 # Threat / failure model и verification matrix — HRS-2
 
+> Исторический документ: ADR-0043 заменён [ADR-0073](adr/0073-agent-registry.md),
+> поверхность манифестов удалена (declarative-agents D007, TASK-000592).
+
 Спутник [SPEC](effective-harness-manifest-spec.md) и
 [PLAN](effective-harness-manifest-plan.md).
 

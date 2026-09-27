@@ -1,7 +1,7 @@
 """Durable Child Run Handle: pure functions (HRS-7).
 
-No database, no HTTP, no clock — the same reason as ``harness_manifest``: the
-two claims this module makes are checkable by a table of unit cases.
+No database, no HTTP, no clock: the two claims this module makes are
+checkable by a table of unit cases.
 
 ``narrow_grant``
     The ceiling of a child is the intersection of what was requested with what

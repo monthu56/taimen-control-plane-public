@@ -16,7 +16,8 @@ Permissions ключа: `principals.read|write`, `delegations.manage`,
 `artifacts.read|write`, `approvals.read|manage|decide`,
 `observations.write`, `projects.read|manage`,
 `project_templates.read|manage`, `operations.read|manage`,
-`artifact_types.read|manage` (CP-ADR-0072), `admin`
+`artifact_types.read|manage` (CP-ADR-0072),
+`agents.read|manage|status.write` (CP-ADR-0073), `admin`
 (подразумевает все). Права v0.5 не выдаются старым ключам неявно —
 их нужно назначить явно (см. [migration-v0.5](migration-v0.5.md)). Проверка выполняется и в route-слое, и в командах
 application-слоя.
@@ -410,7 +411,11 @@ PATCH /api/v1/tasks/{ref}/comments/{id}   tasks.write  (If-Match; только �
 GET   /api/v1/tasks/{ref}/comments/{id}/revisions   tasks.read   (append-only история правок)
 
 POST /api/v1/tasks/{ref}:start-run        tasks.claim  (body: claimId, fencingToken, input?,
-                                          maxDurationSeconds?, maxActions? — бюджет run)
+                                          maxDurationSeconds?, maxActions? — бюджет run;
+                                          agentRevisionId? — ревизия своего
+                                          агента, обязательна principal'у агента, иначе
+                                          422 agent_revision_required|mismatch; у run —
+                                          agentRevisionId, null не у агента, CP-ADR-0073 §7)
 GET  /api/v1/runs                         tasks.read   (?taskId=&claimId=&status=)
 GET  /api/v1/runs/{id}                    tasks.read
 GET  /api/v1/runs/{id}/context            tasks.read   (Run Context: task/claim/requirements/
@@ -459,14 +464,6 @@ POST /api/v1/child-handles/{id}:revoke    держатель родительс�
 POST /api/v1/runs/{id}/checkpoints        tasks.claim  (владелец с живым claim; body: kind, data)
 GET  /api/v1/runs/{id}/checkpoints        tasks.read   (?limit=&cursor=; по seq, старые первыми;
                                           без limit и cursor — весь журнал)
-GET  /api/v1/runs/{id}/harness-manifest   tasks.read   (Effective Harness Manifest: frozen
-                                          base + provenance + captured; ?version=N)
-GET  /api/v1/runs/{id}/harness-manifests  tasks.read   (история версий манифеста)
-POST /api/v1/runs/{id}/harness-manifest:compile  tasks.claim (владелец с живым claim;
-                                          Idempotency-Key; 200 без изменений, 201 новая версия;
-                                          reason=recompile|provider_fallback)
-POST /api/v1/runs/{id}/harness-manifest/ephemeral  tasks.claim (steering/warning marker;
-                                          frozen base не меняется)
 POST /api/v1/runs/{id}/actions            tasks.claim  (владелец с живым claim; audit trail;
                                           enforce бюджета -> 409 budget_exceeded;
                                           skill: uuid|name|name@version; effective tool policy
@@ -548,6 +545,46 @@ POST /api/v1/artifact-types               artifact_types.manage (следующ�
 GET  /api/v1/artifact-types               artifact_types.read (?key=&status=)
 GET  /api/v1/artifact-types/{key}[@version]  artifact_types.read (без версии — последняя;
                                           нет такой — 404)
+
+Реестр агентов (CP-ADR-0073):
+POST /api/v1/agents                       agents.manage (body {key, spec} — spec объекта
+                                          каталога вида Agent; ревизия только при отличии
+                                          sha256 канонического JSON spec без state и
+                                          placement.replicas: 201 новая, 200 без изменений;
+                                          state/replicas из spec — желаемое состояние;
+                                          права ревизии ⊆ права применяющего — 403
+                                          permission_escalation, роли/capabilities — org.manage;
+                                          422 invalid_permissions|permissions_not_allowed_for_kind|
+                                          unknown_reference|secret_material_rejected; 409
+                                          agent_retired; событие agent.revision_published)
+POST /api/v1/agents:validate              agents.manage (те же проверки без записи; ответ
+                                          {key, specHash, currentRevision,
+                                          wouldCreateRevision, wouldChangeState}; отказ — та же
+                                          ошибка, что у POST /agents)
+GET  /api/v1/agents                       agents.read (?status=active|retired&state=
+                                          running|stopped&workspaceId=)
+GET  /api/v1/agents/me                    аутентификация (агент вызывающего с текущей
+                                          ревизией; не агент — 404; ретайрнутый — status
+                                          retired)
+GET  /api/v1/agents/{key}[@revision]      agents.read (без ревизии — текущая; AgentOut:
+                                          state, replicas, currentRevision, revision{spec,
+                                          specHash, createdBy}, principalId)
+PATCH /api/v1/agents/{key}/state          agents.manage ({state?, replicas?}; ревизию не
+                                          создаёт; событие agent.state_changed)
+POST /api/v1/agents/{key}:retire          agents.manage ({reason}; state stopped, связки
+                                          отозваны, principal disabled, claim'ы отпущены;
+                                          событие agent.retired)
+PUT  /api/v1/agents/{key}/identity        agents.status.write ({issuer, iamTenantId,
+                                          iamPrincipalId}; ядро заводит principal, роли и
+                                          связку по ревизии идемпотентно: повтор — 200 без
+                                          изменений; другая идентичность — 409
+                                          agent_identity_conflict)
+GET  /api/v1/agents/{key}/status          agents.read (phase unknown до первого отчёта)
+PUT  /api/v1/agents/{key}/status          agents.status.write ({phase, reason?,
+                                          observedRevision?, node?, instances{desired, ready},
+                                          observedAt}; старше сохранённого — 409
+                                          stale_status_report; событие agent.status_changed
+                                          только при изменении phase/reason/node/ревизии)
 
 POST /api/v1/approvals                    approvals.manage (ровно одно из requiredRoleId |
                                           assignedPrincipalId; gate=true требует task и

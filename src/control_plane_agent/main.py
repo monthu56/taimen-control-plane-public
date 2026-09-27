@@ -34,6 +34,14 @@ and executes Work whose type declares ``execution = {skill, version}`` through
 exactly one invocation instead of the adapter. Work of such a type is never
 handed to the adapter: a daemon that cannot run the skill — or cannot read the
 type to tell — leaves it for one that can.
+
+Agent mode (CP-ADR-0073 §8, ``revision.py``): a principal bound to an agent
+is configured by its agent's current revision (``GET /agents/me``) instead of
+the environment, names that revision on every run it starts, and ends with
+exit code 75 once the run in flight is over when a newer revision appears. A
+stop request drains: the run in flight gets ``placement.drainSeconds`` to
+finish and is then stopped and cancelled, like a cancel request. A principal
+that is no agent keeps the env mode.
 """
 
 import asyncio
@@ -42,6 +50,7 @@ import inspect
 import logging
 import os
 import signal
+import time
 from collections.abc import Coroutine
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -60,6 +69,18 @@ from control_plane_agent.review import (
     published_commit,
     review_policy_from_env,
     summary_of,
+)
+from control_plane_agent.revision import (
+    ENV_CONFIG_MODE,
+    EXIT_MISCONFIGURED,
+    EXIT_REVISION_CHANGED,
+    AgentRevision,
+    RevisionError,
+    config_mode,
+    my_agent,
+    settings_of,
+    skills_of,
+    workspace_pool_of,
 )
 from control_plane_agent.skills import SkillExecutor, executor_from_environment
 from control_plane_agent.supervision import (
@@ -96,6 +117,9 @@ logger = logging.getLogger("control_plane_agent")
 #: How many available Work items one cycle looks at: an item this daemon must
 #: not take (a skill it cannot run) should not hide the next one.
 WORK_SCAN = 10
+#: How often an idle daemon asks whether its agent has a newer revision; after
+#: a run it asks right away.
+REVISION_CHECK_SECONDS = 30.0
 
 
 class _TypeUnreadable(Exception):
@@ -177,11 +201,48 @@ def build_adapter(name: str) -> Adapter:
     raise LookupError(name)
 
 
+def adapter_for_revision(
+    revision: AgentRevision, environ: dict[str, str] | None = None
+) -> Adapter | None:
+    """The executor a revision names, built from its ``params`` and ``instructions``.
+
+    ``skills`` has no adapter: such an agent runs only the skills of its
+    ``skills`` section, and ordinary Work is left to others (None). A kind
+    this daemon does not know, or parameters its adapter refuses, is a
+    :class:`RevisionError` — the core stores ``executor.params`` without
+    reading them, so the adapter is where they are checked.
+    """
+    kind = revision.executor_kind
+    if kind is None:
+        raise RevisionError(f"{revision.label} has no executor: there is nothing to run")
+    params = revision.executor_params
+    try:
+        if kind == "claude-code":
+            from control_plane_claude import adapter_from_params
+
+            return adapter_from_params(params, instructions=revision.instructions, environ=environ)
+        if kind == "codex":
+            from control_plane_codex import adapter_from_params as codex_adapter_from_params
+
+            return codex_adapter_from_params(
+                params, instructions=revision.instructions, environ=environ
+            )
+    except ImportError as exc:
+        raise RevisionError(f"executor {kind} is not installed on this runner: {exc}") from exc
+    except ValueError as exc:
+        raise RevisionError(str(exc)) from exc
+    if kind == "skills" or kind in ADAPTERS:
+        if params:
+            raise RevisionError(f"executor {kind} takes no params, got {sorted(params)}")
+        return None if kind == "skills" else ADAPTERS[kind]()
+    raise RevisionError(f"executor kind {kind!r} is not run by this daemon")
+
+
 class Agent:
     def __init__(
         self,
         client: ControlPlaneClient,
-        adapter: Adapter,
+        adapter: Adapter | None,
         *,
         poll_interval: float = 5.0,
         workspace_id: str | None = None,
@@ -196,9 +257,27 @@ class Agent:
         skills: SkillExecutor | None = None,
         supervision: SupervisionSettings | None = None,
         runtime_dir: Path | None = None,
+        task_types: frozenset[str] = frozenset(),
+        revision: AgentRevision | None = None,
+        drain_seconds: float | None = None,
     ) -> None:
         self.client = client
+        # None: ordinary Work is not taken — an agent of kind ``skills`` runs
+        # only Work its skills execute, and skill invocations.
         self.adapter = adapter
+        # Task type keys taken; empty — any (``work.taskTypes``).
+        self.task_types = task_types
+        # The revision this process was built from (agent mode), or None (env
+        # mode). Named on every run; a newer one ends the process with
+        # ``exit_code`` 75 between runs.
+        self.revision = revision
+        # How long a stop waits for the run in flight before stopping it;
+        # None — until it ends (``placement.drainSeconds``).
+        self.drain_seconds = drain_seconds
+        self._drain_deadline: float | None = None
+        self._revision_checked_at = time.monotonic()
+        #: What the process should exit with once ``run_forever`` returns.
+        self.exit_code = 0
         # Where the inputs of a task are downloaded, one directory per task
         # (CP-ADR-0072 §8). None: nothing is downloaded, and the prompt lists
         # the inputs of the working context without files.
@@ -243,7 +322,57 @@ class Agent:
         self._stop = asyncio.Event()
 
     def request_stop(self) -> None:
+        """Stop taking work; the run in flight gets ``drain_seconds`` to finish."""
+        if not self._stop.is_set() and self.drain_seconds is not None:
+            self._drain_deadline = time.monotonic() + self.drain_seconds
+            logger.info("stopping: the run in flight has %ds to finish", self.drain_seconds)
         self._stop.set()
+
+    def _drain_deadline_of(self) -> float | None:
+        return self._drain_deadline
+
+    async def _revision_is_current(self, *, after_work: bool) -> bool:
+        """Between runs: is this process still the one its agent describes?
+
+        A newer revision — exit code 75, so whoever placed the process starts
+        it again on the new one. Retired or stopped — exit code 0: nothing is
+        to be restarted. A failure to read is not a reason to stop working.
+        """
+        if self.revision is None:
+            return True
+        now = time.monotonic()
+        if not after_work and now - self._revision_checked_at < REVISION_CHECK_SECONDS:
+            return True
+        self._revision_checked_at = now
+        try:
+            current = await my_agent(self.client)
+        except ControlPlaneError as exc:
+            logger.warning("could not read the agent's revision: %s", exc.code)
+            return True
+        if current is None:
+            logger.warning(
+                "%s: the principal is no longer an agent; restarting", self.revision.label
+            )
+            self.exit_code = EXIT_REVISION_CHANGED
+            return False
+        if current.retired or current.stopped:
+            logger.info(
+                "%s is %s; stopping",
+                current.label,
+                current.status if current.retired else "stopped",
+            )
+            self.exit_code = 0
+            return False
+        if current.revision_id != self.revision.revision_id:
+            logger.info(
+                "agent %s moved from revision %d to %d; restarting on the new one",
+                current.key,
+                self.revision.revision,
+                current.revision,
+            )
+            self.exit_code = EXIT_REVISION_CHANGED
+            return False
+        return True
 
     # -- lifecycle -------------------------------------------------------------
 
@@ -258,7 +387,10 @@ class Agent:
                 "artifacts.publish",
                 *(self.skills.capabilities if self.skills is not None else []),
             ],
-            environment={"adapter": type(self.adapter).__name__},
+            environment={
+                "adapter": type(self.adapter).__name__ if self.adapter is not None else "none",
+                **({"agent": self.revision.label} if self.revision is not None else {}),
+            },
         )
         self.session_id = str(session["id"])
         # Keep the session lease alive across idle polls, not only during a run
@@ -331,6 +463,7 @@ class Agent:
         await self.recover()
         await self._open_session()
         cycles = 0
+        worked = False
         skills = self.skills
         workers = (
             [asyncio.create_task(self._skill_worker(skills)) for _ in range(skills.concurrency)]
@@ -340,6 +473,8 @@ class Agent:
         try:
             while not self._stop.is_set():
                 if self.max_cycles is not None and cycles >= self.max_cycles:
+                    return
+                if not await self._revision_is_current(after_work=worked):
                     return
                 cycles += 1
                 try:
@@ -397,7 +532,7 @@ class Agent:
     async def _takes(self, execution: dict[str, Any] | None) -> bool:
         """Ordinary work goes to the adapter; skill work only to a capable executor."""
         if execution is None:
-            return True
+            return self.adapter is not None
         if self.skills is None:
             return False
         try:
@@ -425,6 +560,8 @@ class Agent:
         task: dict[str, Any] | None = None
         execution: dict[str, Any] | None = None
         for item in page["items"]:
+            if self.task_types and item.get("typeKey") not in self.task_types:
+                continue
             try:
                 execution = await self._execution_of(item)
             except _TypeUnreadable:
@@ -471,6 +608,7 @@ class Agent:
                 task["id"],
                 claim_id=str(claim["id"]),
                 fencing_token=int(claim["fencingToken"]),
+                agent_revision_id=self.revision.revision_id if self.revision is not None else None,
             )
             if execution is not None:
                 assert self.skills is not None
@@ -488,7 +626,12 @@ class Agent:
                         await self.client.fail_run(str(run["id"]), failure_reason="workspace_busy")
                     return False
                 inputs = await self._fetch_inputs(task, run)
-                supervisor = RunSupervisor(self.client, str(run["id"]), self.supervision)
+                supervisor = RunSupervisor(
+                    self.client,
+                    str(run["id"]),
+                    self.supervision,
+                    drain_deadline=self._drain_deadline_of,
+                )
                 artifacts = await supervisor.run(self._execute(task, run, workspace, inputs))
                 if heartbeats.error is not None:
                     # The lease died while the adapter worked: the server would
@@ -810,6 +953,7 @@ class Agent:
         workspace: Workspace | None,
         inputs: list[LocalInput] | None,
     ) -> Coroutine[Any, Any, list[ArtifactSpec]]:
+        assert self.adapter is not None  # only ordinary Work reaches here (_takes)
         if inputs is not None and _takes_inputs(self.adapter):
             return self.adapter.execute(  # type: ignore[call-arg]
                 task, run, self.client, workspace, inputs=inputs
@@ -954,12 +1098,76 @@ def _workspace_pool_from_env() -> ExecutionWorkspacePool | None:  # pragma: no c
     )
 
 
+def _agent_from_revision(
+    client: ControlPlaneClient, revision: AgentRevision
+) -> Agent:  # pragma: no cover - wiring
+    """Agent mode: everything the revision says, the host's environment for the rest."""
+    environ = dict(os.environ)
+    adapter = adapter_for_revision(revision, environ)
+    skills = skills_of(revision, client, environ)
+    if adapter is None and skills is None:
+        raise RevisionError(f"{revision.label}: executor skills without a skills section")
+    pool = workspace_pool_of(revision, environ)
+    return Agent(
+        client,
+        adapter,
+        skills=skills,
+        supervision=SupervisionSettings.from_environment(),
+        workspaces=pool,
+        runtime_dir=_runtime_dir_from_env(pool),
+        poll_interval=float(os.environ.get("CONTROL_PLANE_AGENT_POLL", "5")),
+        revision=revision,
+        **settings_of(revision).agent_kwargs(),
+    )
+
+
+def _agent_from_environment(
+    client: ControlPlaneClient, adapter: Adapter
+) -> Agent:  # pragma: no cover - wiring
+    """Env mode: a principal that is no agent, configured as it always was."""
+    try:
+        skills = executor_from_environment(client)
+    except ValueError as exc:
+        logger.error("skill executor misconfigured: %s", exc)
+        raise SystemExit(EXIT_MISCONFIGURED) from exc
+    pool = _workspace_pool_from_env()
+    drain = os.environ.get("CONTROL_PLANE_AGENT_DRAIN_SECONDS")
+    return Agent(
+        client,
+        adapter,
+        skills=skills,
+        supervision=SupervisionSettings.from_environment(),
+        workspaces=pool,
+        runtime_dir=_runtime_dir_from_env(pool),
+        workspace_id=os.environ.get("CONTROL_PLANE_AGENT_WORKSPACE") or None,
+        project_id=os.environ.get("CONTROL_PLANE_AGENT_PROJECT") or None,
+        include_subprojects=os.environ.get("CONTROL_PLANE_AGENT_SUBPROJECTS") == "1",
+        only_assigned=os.environ.get("CONTROL_PLANE_AGENT_ONLY_ASSIGNED") == "1",
+        poll_interval=float(os.environ.get("CONTROL_PLANE_AGENT_POLL", "5")),
+        review_policy=review_policy_from_env(),
+        review_type=os.environ.get("CONTROL_PLANE_AGENT_REVIEW_TYPE") or "code-review",
+        drain_seconds=float(drain) if drain else None,
+    )
+
+
+def _env_adapter() -> Adapter | int:  # pragma: no cover - wiring
+    adapter_name = os.environ.get("CONTROL_PLANE_AGENT_ADAPTER", "echo")
+    try:
+        return build_adapter(adapter_name)
+    except LookupError:
+        available = sorted({*ADAPTERS, *EXTERNAL_ADAPTERS})
+        print(f"unknown adapter '{adapter_name}' (available: {available})")
+    except ImportError as exc:
+        print(f"adapter '{adapter_name}' is not installed on this runner: {exc}")
+    return EXIT_MISCONFIGURED
+
+
 def main() -> int:  # pragma: no cover - process entrypoint
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(message)s")
     server = os.environ.get("CONTROL_PLANE_SERVER", "").rstrip("/")
     if not server:
         print("control-plane-agent requires CONTROL_PLANE_SERVER")
-        return 2
+        return EXIT_MISCONFIGURED
     # The same resolution the human harness uses: an IAM identity first, then a
     # legacy API key. Reading CONTROL_PLANE_API_KEY directly would have sent the
     # Platform Access Token itself as a Bearer — a PAT is exchanged for an
@@ -973,49 +1181,55 @@ def main() -> int:  # pragma: no cover - process entrypoint
             "Access Token in IAM_PLATFORM_ACCESS_TOKEN, or CONTROL_PLANE_API_KEY "
             "where legacy keys are still enabled"
         )
-        return 2
-    adapter_name = os.environ.get("CONTROL_PLANE_AGENT_ADAPTER", "echo")
+        return EXIT_MISCONFIGURED
     try:
-        adapter = build_adapter(adapter_name)
-    except LookupError:
-        available = sorted({*ADAPTERS, *EXTERNAL_ADAPTERS})
-        print(f"unknown adapter '{adapter_name}' (available: {available})")
-        return 2
-    except ImportError as exc:
-        print(f"adapter '{adapter_name}' is not installed on this runner: {exc}")
-        return 2
+        mode = config_mode()
+    except RevisionError as exc:
+        print(exc)
+        return EXIT_MISCONFIGURED
 
-    async def _run() -> None:
+    async def _run() -> int:
         async with ControlPlaneClient(server, credential) as client:
+            # A principal bound to an agent must name its revision on every
+            # run (CP-ADR-0073 §7), so "auto" is not a convenience: the env
+            # mode would fail every start-run of an agent.
+            # Not knowing which one it is, the process must not guess: it
+            # asks to be started again (75) rather than run in the env mode.
             try:
-                skills = executor_from_environment(client)
-            except ValueError as exc:
-                logger.error("skill executor misconfigured: %s", exc)
-                raise SystemExit(2) from exc
-            pool = _workspace_pool_from_env()
-            agent = Agent(
-                client,
-                adapter,
-                skills=skills,
-                supervision=SupervisionSettings.from_environment(),
-                workspaces=pool,
-                runtime_dir=_runtime_dir_from_env(pool),
-                workspace_id=os.environ.get("CONTROL_PLANE_AGENT_WORKSPACE") or None,
-                project_id=os.environ.get("CONTROL_PLANE_AGENT_PROJECT") or None,
-                include_subprojects=os.environ.get("CONTROL_PLANE_AGENT_SUBPROJECTS") == "1",
-                only_assigned=os.environ.get("CONTROL_PLANE_AGENT_ONLY_ASSIGNED") == "1",
-                poll_interval=float(os.environ.get("CONTROL_PLANE_AGENT_POLL", "5")),
-                review_policy=review_policy_from_env(),
-                review_type=os.environ.get("CONTROL_PLANE_AGENT_REVIEW_TYPE") or "code-review",
-            )
+                revision = await my_agent(client) if mode != "env" else None
+            except ControlPlaneError as exc:
+                logger.error("could not read this principal's agent: %s", exc.code)
+                return EXIT_REVISION_CHANGED
+            if revision is None and mode == "revision":
+                logger.error("%s=revision, but this principal is not an agent", ENV_CONFIG_MODE)
+                return EXIT_MISCONFIGURED
+            if revision is not None:
+                if revision.retired or revision.stopped:
+                    logger.info(
+                        "%s is %s; nothing to run",
+                        revision.label,
+                        revision.status if revision.retired else "stopped",
+                    )
+                    return 0
+                try:
+                    agent = _agent_from_revision(client, revision)
+                except RevisionError as exc:
+                    logger.error("%s cannot be run here: %s", revision.label, exc)
+                    return EXIT_MISCONFIGURED
+                logger.info("agent mode: %s (%s)", revision.label, revision.spec_hash)
+            else:
+                adapter = _env_adapter()
+                if isinstance(adapter, int):
+                    return adapter
+                agent = _agent_from_environment(client, adapter)
             loop = asyncio.get_running_loop()
             for sig in (signal.SIGTERM, signal.SIGINT):
                 with contextlib.suppress(NotImplementedError):
                     loop.add_signal_handler(sig, agent.request_stop)
             await agent.run_forever()
+            return agent.exit_code
 
-    asyncio.run(_run())
-    return 0
+    return asyncio.run(_run())
 
 
 if __name__ == "__main__":  # pragma: no cover

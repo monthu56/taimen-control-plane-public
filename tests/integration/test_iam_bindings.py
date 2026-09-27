@@ -460,3 +460,51 @@ async def test_binding_changes_take_effect_despite_a_warm_cache(
 
     await iam_client.post(f"/api/v1/iam-bindings/{binding['id']}:revoke", headers=auth(admin_key))
     assert (await iam_client.get("/api/v1/tasks", headers=auth(token))).status_code == 401
+
+
+async def test_an_agent_binding_admits_despite_a_cached_refusal(
+    iam_app: FastAPI, iam_client: httpx.AsyncClient, signing_key: SigningKey
+) -> None:
+    """The core derives an agent's binding (CP-ADR-0073 §6) and drops the cache too.
+
+    The executor usually knocks before the placement service has linked its
+    identity; that refusal must not outlive the link, and the retirement must
+    close entry just as promptly — without restarting the API.
+    """
+    enable_iam(iam_app, signing_key, ttl_seconds=600.0)
+    admin_key = (await do_bootstrap(iam_client))["apiKey"]["key"]
+    spec = {
+        "displayName": "Notifier",
+        "identity": {"kind": "service", "permissions": ["tasks.read"]},
+        "placement": "none",
+    }
+    published = await iam_client.post(
+        "/api/v1/agents", json={"key": "notifier", "spec": spec}, headers=auth(admin_key)
+    )
+    assert published.status_code == 201, published.text
+    iam_tenant, iam_principal = uuid.uuid4(), uuid.uuid4()
+    token = signing_key.issue(
+        subject=iam_principal, tenant_id=iam_tenant, scopes=[SCOPE_READ], ttl_seconds=3600
+    )
+    assert (await iam_client.get("/api/v1/tasks", headers=auth(token))).status_code == 401
+
+    linked = await iam_client.put(
+        "/api/v1/agents/notifier/identity",
+        json={
+            "issuer": ISSUER,
+            "iamTenantId": str(iam_tenant),
+            "iamPrincipalId": str(iam_principal),
+        },
+        headers=auth(admin_key),
+    )
+    assert linked.status_code == 200, linked.text
+    assert (await iam_client.get("/api/v1/tasks", headers=auth(token))).status_code == 200
+    me = await iam_client.get("/api/v1/agents/me", headers=auth(token))
+    assert me.status_code == 200, me.text
+    assert me.json()["principalId"] == linked.json()["principalId"]
+
+    retired = await iam_client.post(
+        "/api/v1/agents/notifier:retire", json={"reason": "gone"}, headers=auth(admin_key)
+    )
+    assert retired.status_code == 200, retired.text
+    assert (await iam_client.get("/api/v1/tasks", headers=auth(token))).status_code == 401

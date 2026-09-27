@@ -1,7 +1,8 @@
 """v0.6 -> integrated v0.7 -> v0.6 migration matrix.
 
-The v0.7 merge head combines Effective Harness Manifest and Durable Active
+The v0.7 merge head combined Effective Harness Manifest and Durable Active
 Turn Control, which were developed as parallel additive revisions from v0.6.
+The manifests were dropped again with CP-ADR-0073 (declarative-agents, D007).
 Durable Child Run Handle extends the same line, so the roundtrip is always run
 against the current head rather than a frozen intermediate revision: the
 server code expects the schema of the head it ships with.
@@ -9,17 +10,16 @@ server code expects the schema of the head it ships with.
 
 from collections.abc import Iterator
 
-import httpx
 import pytest
 from alembic import command as alembic_command
 from alembic.config import Config
 from sqlalchemy import inspect, text
 from sqlalchemy.engine import Engine
 
-from tests.helpers import auth, create_agent_with_key, create_task, do_bootstrap, open_session
-
 V06_HEAD = "72ef8bc31a06"
-CURRENT_HEAD = "c3f8a2d6e1b7"
+CURRENT_HEAD = "439255fb8627"
+# The revision right before the harness manifests were dropped (D007).
+BEFORE_MANIFEST_DROP = "d7e2a9c4f1b8"
 MANIFEST_TABLES = {"run_harness_manifests", "run_manifest_ephemerals"}
 CHILD_TABLES = {"run_child_handles", "run_child_results"}
 
@@ -34,70 +34,32 @@ def v07_alembic_config(migrated_database: str) -> Iterator[Config]:
     alembic_command.upgrade(config, "head")
 
 
-async def _run_with_manifest(
-    client: httpx.AsyncClient, admin_key: str, *, agent: str = "agent-1"
-) -> tuple[str, str]:
-    _, agent_key = await create_agent_with_key(client, admin_key, name=agent)
-    task = await create_task(client, admin_key)
-    session = await open_session(client, agent_key)
-    claim = (
-        await client.post(
-            f"/api/v1/tasks/{task['id']}:claim",
-            json={"sessionId": session["id"]},
-            headers=auth(agent_key),
-        )
-    ).json()
-    run = (
-        await client.post(
-            f"/api/v1/tasks/{task['id']}:start-run",
-            json={"claimId": claim["id"], "fencingToken": claim["fencingToken"]},
-            headers=auth(agent_key),
-        )
-    ).json()
-    return agent_key, run["id"]
+def _manifest_objects(engine: Engine) -> tuple[set[str], int]:
+    with engine.connect() as connection:
+        functions = connection.execute(
+            text("SELECT count(*) FROM pg_proc WHERE proname = 'reject_manifest_mutation'")
+        ).scalar_one()
+    return MANIFEST_TABLES & set(inspect(engine).get_table_names()), functions
 
 
-async def test_manifest_migration_roundtrip(
-    client: httpx.AsyncClient, sync_engine: Engine, v07_alembic_config: Config
+def test_harness_manifests_are_dropped_and_restored_empty(
+    sync_engine: Engine, v07_alembic_config: Config
 ) -> None:
-    admin_key = (await do_bootstrap(client))["apiKey"]["key"]
-    agent_key, run_id = await _run_with_manifest(client, admin_key)
-    body = (
-        await client.get(f"/api/v1/runs/{run_id}/harness-manifest", headers=auth(agent_key))
-    ).json()
-    assert body["manifest"]["version"] == 1
+    """CP-ADR-0073 supersedes CP-ADR-0043: the head carries no manifest tables."""
+    assert _manifest_objects(sync_engine) == (set(), 0)
 
-    alembic_command.downgrade(v07_alembic_config, V06_HEAD)
-    tables = set(inspect(sync_engine).get_table_names())
-    assert not (MANIFEST_TABLES & tables)
-    assert not (CHILD_TABLES & tables)
-    assert "run_control_messages" not in tables
+    alembic_command.downgrade(v07_alembic_config, BEFORE_MANIFEST_DROP)
+    assert _manifest_objects(sync_engine) == (MANIFEST_TABLES, 1)
+    with sync_engine.connect() as connection:
+        assert (
+            connection.execute(text("SELECT count(*) FROM run_harness_manifests")).scalar_one() == 0
+        )
 
     alembic_command.upgrade(v07_alembic_config, "head")
     with sync_engine.connect() as connection:
         revision = connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one()
-        remaining = connection.execute(
-            text("SELECT count(*) FROM run_harness_manifests")
-        ).scalar_one()
     assert revision == CURRENT_HEAD
-    assert remaining == 0
-
-    agent_key, run_id = await _run_with_manifest(client, admin_key, agent="agent-2")
-    again = await client.get(f"/api/v1/runs/{run_id}/harness-manifest", headers=auth(agent_key))
-    assert again.status_code == 200, again.text
-    assert again.json()["manifest"]["version"] == 1
-
-
-async def test_immutability_trigger_survives_the_roundtrip(
-    client: httpx.AsyncClient, sync_engine: Engine, v07_alembic_config: Config
-) -> None:
-    alembic_command.downgrade(v07_alembic_config, V06_HEAD)
-    alembic_command.upgrade(v07_alembic_config, "head")
-    admin_key = (await do_bootstrap(client))["apiKey"]["key"]
-    await _run_with_manifest(client, admin_key)
-
-    with pytest.raises(Exception, match="immutable"), sync_engine.begin() as connection:
-        connection.execute(text("DELETE FROM run_harness_manifests"))
+    assert _manifest_objects(sync_engine) == (set(), 0)
 
 
 def test_active_turn_control_migration_roundtrip(
@@ -133,5 +95,5 @@ def test_active_turn_control_migration_roundtrip(
     assert revision == CURRENT_HEAD
     tables = set(inspect(sync_engine).get_table_names())
     assert "run_control_messages" in tables
-    assert tables >= MANIFEST_TABLES
+    assert not (MANIFEST_TABLES & tables)
     assert tables >= CHILD_TABLES

@@ -1,0 +1,692 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://taimen.ai/schema/packages/v1/object.schema.json",
+  "title": "Объект пакета каталога Control Plane (TAI-ADR-0044)",
+  "description": "Одна обёртка для манифеста и всех видов каталога: apiVersion + kind + key + spec. spec — тело запроса API control-plane в camelCase без поля идентичности. Схема проверяет форму; окончательную проверку делает ядро (и tools/cp_packages.py check его валидаторами).",
+  "type": "object",
+  "required": ["apiVersion", "kind", "key", "spec"],
+  "additionalProperties": false,
+  "properties": {
+    "apiVersion": {"const": "taimen.ai/v1"},
+    "kind": {
+      "enum": ["Package", "Installation", "ArtifactType", "TaskType", "ProjectTemplate", "WorkspaceType", "Role", "Capability", "Skill", "WorkRule", "Agent"]
+    },
+    "key": {"type": "string", "minLength": 1, "maxLength": 200},
+    "spec": {"type": "object"}
+  },
+  "allOf": [
+    {"if": {"properties": {"kind": {"const": "Package"}}},
+     "then": {"properties": {"key": {"$ref": "#/$defs/typeKey"}, "spec": {"$ref": "#/$defs/packageSpec"}}}},
+    {"if": {"properties": {"kind": {"const": "Installation"}}},
+     "then": {"properties": {"spec": {"$ref": "#/$defs/installationSpec"}}}},
+    {"if": {"properties": {"kind": {"const": "ArtifactType"}}},
+     "then": {"properties": {"key": {"$ref": "#/$defs/typeKey"}, "spec": {"$ref": "#/$defs/artifactTypeSpec"}}}},
+    {"if": {"properties": {"kind": {"const": "TaskType"}}},
+     "then": {"properties": {"key": {"$ref": "#/$defs/typeKey"}, "spec": {"$ref": "#/$defs/taskTypeSpec"}}}},
+    {"if": {"properties": {"kind": {"const": "ProjectTemplate"}}},
+     "then": {"properties": {"key": {"$ref": "#/$defs/typeKey"}, "spec": {"$ref": "#/$defs/projectTemplateSpec"}}}},
+    {"if": {"properties": {"kind": {"const": "WorkspaceType"}}},
+     "then": {"properties": {"key": {"$ref": "#/$defs/typeKey"}, "spec": {"$ref": "#/$defs/workspaceTypeSpec"}}}},
+    {"if": {"properties": {"kind": {"const": "Role"}}},
+     "then": {"properties": {"key": {"$ref": "#/$defs/slug"}, "spec": {"$ref": "#/$defs/roleSpec"}}}},
+    {"if": {"properties": {"kind": {"const": "Capability"}}},
+     "then": {"properties": {"spec": {"$ref": "#/$defs/capabilitySpec"}}}},
+    {"if": {"properties": {"kind": {"const": "Skill"}}},
+     "then": {"properties": {"spec": {"$ref": "#/$defs/skillSpec"}}}},
+    {"if": {"properties": {"kind": {"const": "WorkRule"}}},
+     "then": {"properties": {"key": {"$ref": "#/$defs/ruleKey"}, "spec": {"$ref": "#/$defs/workRuleSpec"}}}},
+    {"if": {"properties": {"kind": {"const": "Agent"}}},
+     "then": {"properties": {"key": {"$ref": "#/$defs/slug"}, "spec": {"$ref": "#/$defs/agentSpec"}}}}
+  ],
+  "$defs": {
+    "envOrUuid": {
+      "type": "string",
+      "pattern": "^(\\$\\{[A-Z][A-Z0-9_]*\\}|[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})$",
+      "description": "UUID или ${ПЕРЕМЕННАЯ} установки (топология окружения в пакет не пишется)"
+    },
+    "permission": {
+      "type": "string", "pattern": "^[a-z_]+(\\.[a-z_]+)+$",
+      "description": "Право Control Plane, например tasks.claim"
+    },
+    "nodeLabel": {
+      "type": "string", "maxLength": 100,
+      "pattern": "^[a-z0-9][a-z0-9.-]*(=[a-zA-Z0-9._-]+)?$",
+      "description": "Метка узла: имя или имя=значение"
+    },
+    "secretName": {
+      "type": "string", "pattern": "^[a-z0-9][a-z0-9-]{0,62}$",
+      "description": "Имя секрета на узле; значение в описание не пишется"
+    },
+    "agentSpec": {
+      "type": "object",
+      "required": ["displayName", "identity"],
+      "additionalProperties": false,
+      "description": "Агент (TAI-ADR-0052, CP-ADR-0073): кто он, какую работу берёт, чем и как исполняет, где размещается. Каждое изменение — новая неизменяемая ревизия в ядре; прогон помнит ревизию.",
+      "properties": {
+        "displayName": {"$ref": "#/$defs/displayName"},
+        "description": {"type": "string", "maxLength": 2000},
+        "identity": {
+          "type": "object",
+          "required": ["kind"],
+          "additionalProperties": false,
+          "description": "Личность: principal ядра и IAM и связка с правами — их заводит и поддерживает платформа. Права не шире прав того, кто применяет описание.",
+          "properties": {
+            "kind": {"enum": ["agent", "service"]},
+            "roles": {"type": "array", "uniqueItems": true, "items": {"$ref": "#/$defs/slug"}, "description": "Роли tenant'а (из пакетов)"},
+            "permissions": {"type": "array", "uniqueItems": true, "items": {"$ref": "#/$defs/permission"}},
+            "capabilities": {"type": "array", "uniqueItems": true, "items": {"type": "string", "minLength": 1, "maxLength": 200}},
+            "iam": {
+              "type": "object",
+              "required": ["audiences", "scopeCeiling"],
+              "additionalProperties": false,
+              "description": "IAM-часть учётки: audiences и потолок scope. Данные для того, кто выпускает учётку (bootstrap, fleet-controller); ядро их хранит, но не толкует.",
+              "properties": {
+                "audiences": {"type": "array", "minItems": 1, "maxItems": 20, "uniqueItems": true, "items": {"type": "string", "minLength": 1, "maxLength": 100}},
+                "scopeCeiling": {"type": "array", "minItems": 1, "maxItems": 50, "uniqueItems": true, "items": {"type": "string", "maxLength": 200, "pattern": "^[a-z][a-z0-9-]*:[a-z][a-z0-9-]*$"}, "description": "Scope вида <audience>:<действие>"}
+              }
+            }
+          }
+        },
+        "work": {
+          "type": "object",
+          "additionalProperties": false,
+          "description": "Какую работу агент берёт из очереди",
+          "properties": {
+            "workspace": {"$ref": "#/$defs/envOrUuid"},
+            "project": {"$ref": "#/$defs/envOrUuid"},
+            "includeSubprojects": {"type": "boolean", "default": false},
+            "onlyAssigned": {"type": "boolean", "default": true, "description": "Только назначенная ему работа"},
+            "taskTypes": {"type": "array", "uniqueItems": true, "items": {"$ref": "#/$defs/typeKey"}, "description": "Пусто — любые типы"}
+          }
+        },
+        "executor": {
+          "type": "object",
+          "required": ["kind"],
+          "additionalProperties": false,
+          "description": "Чем агент исполняет работу. Вид — данные; образ вида выбирает узел.",
+          "properties": {
+            "kind": {"enum": ["claude-code", "codex", "skills"]},
+            "params": {"type": "object"},
+            "instructions": {"type": "string", "maxLength": 65536, "description": "Инструкции исполнителю — слой после инструкций платформы, проекта и типа задачи (CP-ADR-0066)"}
+          },
+          "allOf": [
+            {"if": {"properties": {"kind": {"const": "claude-code"}}}, "then": {"properties": {"params": {"$ref": "#/$defs/agentExecutors/claude-code"}}}},
+            {"if": {"properties": {"kind": {"const": "codex"}}}, "then": {"properties": {"params": {"$ref": "#/$defs/agentExecutors/codex"}}}},
+            {"if": {"properties": {"kind": {"const": "skills"}}}, "then": {"properties": {"params": {"$ref": "#/$defs/agentExecutors/skills"}}}}
+          ]
+        },
+        "workingCopy": {
+          "type": "object",
+          "required": ["repository"],
+          "additionalProperties": false,
+          "description": "Рабочая копия задачи (TAI-ADR-0016 п.5): репозиторий, соседи, публикация ветки и ревью",
+          "properties": {
+            "repository": {"type": "string", "minLength": 1, "maxLength": 500},
+            "directory": {"type": "string", "pattern": "^[a-z0-9][a-z0-9._-]*$", "description": "Имя каталога репозитория в рабочей копии (плоская раскладка ADR-0029)"},
+            "baseRef": {"type": "string", "minLength": 1, "maxLength": 200},
+            "neighbours": {"type": "object", "propertyNames": {"pattern": "^[a-z0-9][a-z0-9._-]*$"}, "additionalProperties": {"type": "string", "minLength": 1, "maxLength": 500}, "description": "Соседние репозитории на ревизиях, закреплённых суперпроектом"},
+            "superproject": {"type": "string", "minLength": 1, "maxLength": 500},
+            "publish": {"type": "boolean", "default": true, "description": "Публиковать ветку задачи в forge"},
+            "review": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "mode": {"enum": ["human", "agent", "none"]},
+                "taskType": {"$ref": "#/$defs/typeKey"},
+                "taskTypes": {"type": "array", "uniqueItems": true, "items": {"$ref": "#/$defs/typeKey"}, "description": "Для каких типов задач заводится ревью"},
+                "reviewer": {"$ref": "#/$defs/envOrUuid"},
+                "base": {"type": "string", "minLength": 1, "maxLength": 200}
+              }
+            }
+          }
+        },
+        "skills": {
+          "type": "object",
+          "additionalProperties": false,
+          "description": "Какие скиллы агент исполняет сам (CP-ADR-0056) и куда им можно ходить",
+          "properties": {
+            "protocols": {"type": "array", "uniqueItems": true, "items": {"enum": ["local", "http", "mcp"]}},
+            "local": {"type": "array", "uniqueItems": true, "items": {"type": "string", "pattern": "^[A-Za-z_][\\w.]*(:[A-Za-z_]\\w*)?$"}, "description": "Разрешённые entrypoints или пакеты"},
+            "httpOrigins": {"type": "array", "uniqueItems": true, "items": {"type": "string", "minLength": 1, "maxLength": 500}},
+            "mcpOrigins": {"type": "array", "uniqueItems": true, "items": {"type": "string", "minLength": 1, "maxLength": 500}},
+            "audiences": {"type": "array", "uniqueItems": true, "items": {"type": "string", "minLength": 1, "maxLength": 100}, "description": "Audiences IAM, в которые скиллы получают токен"},
+            "concurrency": {"type": "integer", "minimum": 1, "maximum": 32}
+          }
+        },
+        "placement": {
+          "description": "Где и сколько: none — только личность, без процесса (сервисная учётка)",
+          "oneOf": [
+            {"const": "none"},
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "requires": {"type": "array", "uniqueItems": true, "items": {"$ref": "#/$defs/nodeLabel"}, "description": "Метки, которые должны быть у узла"},
+                "secrets": {"type": "array", "uniqueItems": true, "items": {"$ref": "#/$defs/secretName"}, "description": "Секреты, которые должны быть на узле"},
+                "resources": {
+                  "type": "object", "additionalProperties": false,
+                  "properties": {
+                    "cpus": {"type": "number", "exclusiveMinimum": 0, "maximum": 64},
+                    "memoryMb": {"type": "integer", "minimum": 64, "maximum": 262144}
+                  }
+                },
+                "replicas": {"type": "integer", "minimum": 0, "maximum": 20, "default": 1},
+                "drainSeconds": {"type": "integer", "minimum": 0, "maximum": 14400, "default": 14400, "description": "Сколько ждать текущий прогон перед переходом на новую ревизию"}
+              }
+            }
+          ]
+        },
+        "state": {"enum": ["running", "stopped"], "default": "running"}
+      },
+      "allOf": [
+        {"if": {"not": {"properties": {"placement": {"const": "none"}}, "required": ["placement"]}},
+         "then": {"required": ["executor"]}}
+      ]
+    },
+    "agentExecutors": {
+      "description": "Параметры видов исполнителя; ядро хранит их, не толкуя, проверяет эта схема и адаптер",
+      "claude-code": {
+        "type": "object", "additionalProperties": false,
+        "properties": {
+          "model": {"type": "string", "minLength": 1, "maxLength": 100},
+          "permissionMode": {"enum": ["default", "acceptEdits", "plan", "bypassPermissions"], "default": "acceptEdits"},
+          "timeoutSeconds": {"type": "integer", "minimum": 60, "maximum": 14400, "default": 3600},
+          "resume": {"type": "boolean", "default": true},
+          "tools": {
+            "type": "object", "additionalProperties": false,
+            "description": "Сужение инструментов агента; запрет авторитетных команд Control Plane не снимается",
+            "properties": {
+              "allow": {"type": "array", "uniqueItems": true, "items": {"type": "string", "minLength": 1, "maxLength": 200}},
+              "deny": {"type": "array", "uniqueItems": true, "items": {"type": "string", "minLength": 1, "maxLength": 200}}
+            }
+          }
+        }
+      },
+      "codex": {
+        "type": "object", "additionalProperties": false,
+        "properties": {
+          "model": {"type": "string", "minLength": 1, "maxLength": 100},
+          "sandbox": {"enum": ["read-only", "workspace-write", "danger-full-access"], "default": "workspace-write"},
+          "timeoutSeconds": {"type": "integer", "minimum": 60, "maximum": 14400, "default": 3600},
+          "resume": {"type": "boolean", "default": true},
+          "credentialClass": {"enum": ["subscription", "api_key"], "description": "Чей credential расходуется (TAI-ADR-0016 п.4)"}
+        }
+      },
+      "skills": {
+        "type": "object", "additionalProperties": false,
+        "description": "Исполнитель только скиллов: параметров нет, что исполнять — секция skills агента"
+      }
+    },
+    "typeKey": {
+      "type": "string", "minLength": 1, "maxLength": 63,
+      "pattern": "^[a-z0-9][a-z0-9_-]*$",
+      "description": "Ключ типа: латиница в нижнем регистре, цифры, _ и -"
+    },
+    "slug": {
+      "type": "string", "minLength": 2, "maxLength": 63,
+      "pattern": "^[a-z0-9][a-z0-9-]*$"
+    },
+    "displayName": {"type": "string", "minLength": 1, "maxLength": 200},
+    "jsonSchema": {
+      "type": "object",
+      "description": "JSON Schema документа (draft 2020-12). Удалённые $ref ядро отвергает."
+    },
+
+    "packageSpec": {
+      "type": "object",
+      "required": ["version", "displayName"],
+      "additionalProperties": false,
+      "properties": {
+        "version": {"type": "string", "pattern": "^\\d+\\.\\d+\\.\\d+$", "description": "SemVer пакета"},
+        "displayName": {"$ref": "#/$defs/displayName"},
+        "description": {"type": "string"},
+        "requires": {
+          "type": "array", "uniqueItems": true,
+          "items": {"$ref": "#/$defs/typeKey"},
+          "description": "Пакеты, на объекты которых этот пакет ссылается"
+        }
+      }
+    },
+
+    "installationSpec": {
+      "type": "object",
+      "required": ["packages"],
+      "additionalProperties": false,
+      "properties": {
+        "packages": {
+          "type": "array", "minItems": 0, "uniqueItems": true,
+          "items": {"$ref": "#/$defs/typeKey"},
+          "description": "Ключи пакетов из packages/; requires подтягиваются сами. Пусто — только системный тип task ядра"
+        },
+        "retire": {
+          "type": "object",
+          "additionalProperties": false,
+          "description": "Ключи, которые окружение выводит из оборота (все активные версии → deprecated)",
+          "properties": {
+            "TaskType": {"type": "array", "uniqueItems": true, "items": {"$ref": "#/$defs/typeKey"}},
+            "ProjectTemplate": {"type": "array", "uniqueItems": true, "items": {"$ref": "#/$defs/typeKey"}},
+            "Agent": {"type": "array", "uniqueItems": true, "items": {"$ref": "#/$defs/slug"}, "description": "Агент выводится из оборота: исполнитель остановлен, credential отозван, история сохранена (TAI-ADR-0052)"}
+          }
+        }
+      }
+    },
+
+    "workItemCategory": {"enum": ["backlog", "active", "blocked", "terminal_success", "terminal_cancelled"]},
+    "projectCategory": {"enum": ["planned", "active", "paused", "terminal_success", "terminal_cancelled"]},
+    "statusKey": {"type": "string", "minLength": 1, "maxLength": 64},
+
+    "lifecycle": {
+      "type": "object",
+      "required": ["statuses"],
+      "properties": {
+        "statuses": {
+          "type": "array", "minItems": 1, "maxItems": 100,
+          "items": {
+            "type": "object",
+            "required": ["key", "category"],
+            "properties": {
+              "key": {"$ref": "#/$defs/statusKey"},
+              "category": {"type": "string"},
+              "displayName": {"type": "string", "maxLength": 200}
+            }
+          }
+        },
+        "transitions": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["from", "to"],
+            "properties": {
+              "from": {"$ref": "#/$defs/statusKey"},
+              "to": {"type": "array", "items": {"$ref": "#/$defs/statusKey"}}
+            }
+          }
+        },
+        "initialStatus": {"$ref": "#/$defs/statusKey"}
+      }
+    },
+    "workItemLifecycle": {
+      "allOf": [{"$ref": "#/$defs/lifecycle"}],
+      "properties": {
+        "statuses": {"items": {"properties": {"category": {"$ref": "#/$defs/workItemCategory"}}}},
+        "claimStatus": {"$ref": "#/$defs/statusKey", "description": "Статус при claim; не терминальный"},
+        "releaseStatus": {"$ref": "#/$defs/statusKey", "description": "Статус при release; не терминальный"},
+        "completionStatus": {"$ref": "#/$defs/statusKey", "description": "Статус успешного завершения; категория terminal_success"}
+      }
+    },
+    "projectLifecycle": {
+      "allOf": [{"$ref": "#/$defs/lifecycle"}],
+      "properties": {
+        "statuses": {"items": {"properties": {"category": {"$ref": "#/$defs/projectCategory"}}}}
+      }
+    },
+
+    "outcomeAction": {
+      "type": "object",
+      "description": "Одно действие исхода approval (CP-ADR-0061): объект ровно с одним ключом. В строках — выражения $.path, суффикс ! делает значение обязательным.",
+      "minProperties": 1, "maxProperties": 1,
+      "properties": {
+        "ensureWork": {
+          "type": "object",
+          "required": ["type", "key", "title"],
+          "additionalProperties": false,
+          "properties": {
+            "type": {"type": "string", "description": "Ключ типа задачи"},
+            "key": {"type": "string", "description": "Ключ идемпотентности создаваемой работы"},
+            "title": {"type": "string"},
+            "description": {"type": "string"},
+            "assignee": {"type": "string"},
+            "priority": {"type": "string"},
+            "workspace": {"type": "string"},
+            "relation": {
+              "type": "object", "minProperties": 1, "maxProperties": 1,
+              "propertyNames": {"enum": ["parent", "blocks", "depends_on", "spawned_by", "related_to"]},
+              "additionalProperties": {"type": "string"}
+            },
+            "customFields": {
+              "type": "object", "maxProperties": 32,
+              "description": "Поля создаваемой задачи — выражения/шаблоны (CP-ADR-0061, амендмент 2026-09-25); проверяются по fieldSchema целевого типа при исполнении",
+              "propertyNames": {"pattern": "^[A-Za-z_][A-Za-z0-9_]*$"},
+              "additionalProperties": {"type": "string"}
+            },
+            "requestApproval": {
+              "type": "object", "required": ["assignee"], "additionalProperties": false,
+              "description": "Gate-approval на только что созданной задаче (CP-ADR-0061, амендмент 2026-09-25)",
+              "properties": {"assignee": {"type": "string"}, "comment": {"type": "string"}}
+            }
+          }
+        },
+        "completeTask": {
+          "type": "object", "additionalProperties": false,
+          "properties": {"task": {"type": "string"}}
+        },
+        "comment": {
+          "type": "object", "required": ["body"], "additionalProperties": false,
+          "properties": {"body": {"type": "string"}, "task": {"type": "string"}}
+        },
+        "transition": {
+          "type": "object", "required": ["status"], "additionalProperties": false,
+          "properties": {"status": {"type": "string"}, "task": {"type": "string"}}
+        },
+        "invokeSkill": {
+          "type": "object", "required": ["skill"], "additionalProperties": false,
+          "description": "CP-ADR-0061 §10: вызов скилла; реакции исполняются по итогу вызова",
+          "properties": {
+            "skill": {"type": "string", "description": "name@version (для external_write — обязательно с версией)"},
+            "inputs": {"type": "object", "description": "входы скилла; строки — выражения $.task…, $.spawnedBy…, $.approval…"},
+            "expect": {"type": "object", "description": "ожидаемые поля outputs; расхождение — onFailure"},
+            "onSuccess": {"type": "array", "items": {"$ref": "#/$defs/outcomeAction"}},
+            "onFailure": {"type": "array", "items": {"$ref": "#/$defs/outcomeAction"}}
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "approvalSchema": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "gates": {
+          "type": "object",
+          "description": "Пока поддерживается только gate default",
+          "propertyNames": {"pattern": "^[a-z][a-z0-9_.-]*$"},
+          "additionalProperties": {
+            "type": "object",
+            "required": ["outcomes"],
+            "additionalProperties": false,
+            "properties": {
+              "outcomes": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                  "approved": {"type": "array", "items": {"$ref": "#/$defs/outcomeAction"}},
+                  "rejected": {"type": "array", "items": {"$ref": "#/$defs/outcomeAction"}}
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "execution": {
+      "type": "object",
+      "description": "Задачу типа исполняет один вызов скилла (CP-ADR-0056 §3)",
+      "required": ["skill", "version"],
+      "additionalProperties": false,
+      "properties": {
+        "skill": {"type": "string", "minLength": 1, "maxLength": 200, "pattern": "^[^@]+$"},
+        "version": {"type": "string", "minLength": 1, "maxLength": 50},
+        "inputs": {
+          "description": "Путь $.… ко всему входу или объект {имяВхода: путь}; по умолчанию $.customFields",
+          "oneOf": [
+            {"type": "string"},
+            {"type": "object", "additionalProperties": {"type": "string"}}
+          ]
+        }
+      }
+    },
+
+    "taskTypeSpec": {
+      "type": "object",
+      "required": ["displayName", "lifecycleSchema"],
+      "additionalProperties": false,
+      "properties": {
+        "displayName": {"$ref": "#/$defs/displayName"},
+        "description": {"type": "string"},
+        "fieldSchema": {"$ref": "#/$defs/jsonSchema", "description": "Схема customFields задачи"},
+        "lifecycleSchema": {"$ref": "#/$defs/workItemLifecycle"},
+        "execution": {"$ref": "#/$defs/execution"},
+        "approvalSchema": {"$ref": "#/$defs/approvalSchema"},
+        "completionSchema": {
+          "type": "object",
+          "description": "Работа после завершения задачи (CP-ADR-0061, амендмент 2026-09-25): {onComplete: {when?, actions}} — ensureWork (customFields, relation, requestApproval) и comment. Грамматику проверяет ядро."
+        },
+        "instructions": {
+          "type": "string",
+          "maxLength": 16384,
+          "description": "Инструкции исполнителю (CP-ADR-0066): Markdown ≤ 16 KiB, слой типа задачи после контракта платформы и проекта. Размер в байтах и отсутствие секретов проверяет ядро."
+        },
+        "artifactSchema": {"$ref": "#/$defs/artifactSchema"},
+        "contextSchema": {
+          "type": "object",
+          "description": "Профиль контекста задачи (TAI-ADR-0042 п.3, CP-ADR-0064): anchors, traverse, asOf, budgetTokens. Грамматику проверяет ядро.",
+          "properties": {
+            "anchors": {"type": "array"},
+            "traverse": {"type": "array"},
+            "asOf": {"enum": ["taskCreated", "now", "origin"]},
+            "budgetTokens": {"type": "integer", "minimum": 1, "maximum": 32000}
+          }
+        }
+      }
+    },
+
+    "mediaType": {
+      "type": "string", "minLength": 3, "maxLength": 255,
+      "pattern": "^([a-z0-9][a-z0-9!#$&^_.+-]*|\\*)/([a-z0-9][a-z0-9!#$&^_.+-]*|\\*)$",
+      "description": "Media type в нижнем регистре; маска */* или type/* допустима"
+    },
+    "artifactTypeSpec": {
+      "type": "object",
+      "required": ["displayName"],
+      "additionalProperties": false,
+      "description": "Тип артефакта (CP-ADR-0072, TAI-ADR-0044 амендмент 2026-09-26): версионируемый неизменяемый объект каталога, как TaskType.",
+      "properties": {
+        "displayName": {"$ref": "#/$defs/displayName"},
+        "description": {"type": "string"},
+        "metadataSchema": {"$ref": "#/$defs/jsonSchema", "description": "Схема metadata артефакта этого типа (≤ 16 KiB)"},
+        "mediaTypes": {
+          "type": "array", "minItems": 1, "maxItems": 50, "uniqueItems": true,
+          "items": {"$ref": "#/$defs/mediaType"},
+          "description": "Допустимые media types содержимого; по умолчанию любой"
+        },
+        "maxBytes": {
+          "type": "integer", "minimum": 1,
+          "description": "Лимит размера содержимого; не больше глобального лимита установки (CP_ARTIFACT_MAX_BYTES)"
+        }
+      }
+    },
+    "artifactSlot": {
+      "type": "object",
+      "required": ["key", "type"],
+      "properties": {
+        "key": {"type": "string", "pattern": "^[a-z0-9][a-z0-9_-]{0,55}$", "description": "Имя входа или выхода; уникально внутри inputs и внутри outputs (CP-ADR-0072 п.7)"},
+        "type": {"$ref": "#/$defs/typeKey", "description": "Ключ типа артефакта (ArtifactType)"},
+        "required": {"type": "boolean", "default": false},
+        "mediaTypes": {
+          "type": "array", "minItems": 1, "uniqueItems": true,
+          "items": {"$ref": "#/$defs/mediaType"},
+          "description": "Сужение media types типа артефакта (подмножество его mediaTypes)"
+        }
+      }
+    },
+    "artifactSchema": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Входы и выходы типа задачи (CP-ADR-0072). Вход — head-ревизии артефактов нужного типа у задач по связи; без обязательного входа claim отвергается (409 input_missing). Обязательный выход — детерминированный критерий стадии проверки.",
+      "properties": {
+        "inputs": {
+          "type": "array", "maxItems": 32,
+          "items": {
+            "allOf": [{"$ref": "#/$defs/artifactSlot"}],
+            "required": ["from"],
+            "properties": {
+              "key": true, "type": true, "required": true,
+              "from": {"enum": ["depends_on", "spawned_by", "parent"], "description": "Связь, по которой ищется задача-источник"}
+            },
+            "additionalProperties": false
+          }
+        },
+        "outputs": {
+          "type": "array", "maxItems": 32,
+          "items": {
+            "allOf": [{"$ref": "#/$defs/artifactSlot"}],
+            "properties": {
+              "key": true, "type": true, "required": true, "mediaTypes": true,
+              "content": {"enum": ["required", "optional"], "default": "required", "description": "Нужно ли содержимое в хранилище (иначе достаточно ссылки)"}
+            },
+            "additionalProperties": false
+          }
+        }
+      }
+    },
+
+    "projectTemplateSpec": {
+      "type": "object",
+      "required": ["displayName"],
+      "additionalProperties": false,
+      "properties": {
+        "displayName": {"$ref": "#/$defs/displayName"},
+        "description": {"type": "string"},
+        "fieldSchema": {"$ref": "#/$defs/jsonSchema"},
+        "lifecycleSchema": {"$ref": "#/$defs/projectLifecycle"},
+        "defaultConfig": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "settings": {"type": "object"},
+            "views": {"type": "array", "maxItems": 50},
+            "governance": {"type": "object"},
+            "memory": {"type": "object"},
+            "inheritance": {"type": "object"}
+          }
+        },
+        "defaultViews": {"type": "array", "maxItems": 50},
+        "governanceSchema": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "maxAutonomyLevel": {},
+            "requireApprovalForRun": {"type": "boolean"},
+            "requireApprovalForCompletion": {"type": "boolean"},
+            "allowedTaskPriorities": {"type": "array", "items": {"type": "string"}},
+            "allowedSkillProtocols": {"type": "array", "items": {"type": "string"}},
+            "maxRunDurationSeconds": {"type": "number"},
+            "maxRunActions": {"type": "number"},
+            "maxConcurrentRuns": {"type": "number"},
+            "memoryScopeSharing": {}
+          }
+        },
+        "memoryDefaults": {"type": "object"}
+      }
+    },
+
+    "workspaceTypeSpec": {
+      "type": "object",
+      "required": ["displayName"],
+      "additionalProperties": false,
+      "properties": {
+        "displayName": {"$ref": "#/$defs/displayName"},
+        "description": {"type": "string"},
+        "fieldSchema": {"$ref": "#/$defs/jsonSchema"},
+        "allowedChildTypes": {"type": "array", "maxItems": 100, "items": {"type": "string", "minLength": 1, "maxLength": 63}}
+      }
+    },
+
+    "roleSpec": {
+      "type": "object",
+      "required": ["name"],
+      "additionalProperties": false,
+      "properties": {
+        "name": {"$ref": "#/$defs/displayName"},
+        "description": {"type": "string"}
+      }
+    },
+
+    "ruleKey": {
+      "type": "string", "minLength": 1, "maxLength": 128,
+      "pattern": "^[a-z0-9][a-z0-9._-]*$",
+      "description": "Ключ правила в tenant'е (CP-ADR-0063 §1)"
+    },
+
+    "workRuleSpec": {
+      "type": "object",
+      "description": "Правило вывода работы (CP-ADR-0063, TAI-ADR-0036): ровно тело POST /rules без key. Грамматику условий и шаблонов проверяет ядро (normalize_rule_spec). workspaceId — топология установки: только через ${ПЕРЕМЕННУЮ}, задаётся при создании и дальше не меняется.",
+      "required": ["trigger", "action"],
+      "additionalProperties": false,
+      "properties": {
+        "description": {"type": "string", "maxLength": 2000},
+        "workspaceId": {"type": "string", "pattern": "^\\$\\{[A-Z][A-Z0-9_]*\\}$"},
+        "trigger": {
+          "type": "object", "required": ["kind"],
+          "properties": {"kind": {"enum": ["observation", "event", "schedule"]}}
+        },
+        "condition": {"type": ["object", "boolean"]},
+        "interpretation": {
+          "type": "object", "required": ["skill"],
+          "properties": {
+            "skill": {"type": "string", "pattern": "^[^@\\s]+@[^@\\s]+$", "description": "name@version"},
+            "inputs": {"type": "object"}
+          }
+        },
+        "action": {
+          "type": "object", "required": ["kind"],
+          "properties": {"kind": {"enum": ["ensure_work", "update_work", "cancel_work", "complete_work", "request_decision"]}}
+        },
+        "status": {"enum": ["enabled", "disabled"], "description": "По умолчанию enabled"}
+      }
+    },
+
+    "capabilitySpec": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "description": {"type": "string"}
+      }
+    },
+
+    "skillContract": {
+      "type": "object",
+      "description": "Контракт Skill v1 (CP-ADR-0056 §1). Неизменяем в версии.",
+      "required": ["inputs", "outputs", "implementation"],
+      "additionalProperties": false,
+      "properties": {
+        "inputs": {"$ref": "#/$defs/jsonSchema"},
+        "outputs": {"$ref": "#/$defs/jsonSchema"},
+        "requiredPermissions": {"type": "array", "items": {"type": "string"}},
+        "preconditions": {"type": "array"},
+        "postconditions": {"type": "array"},
+        "timeoutSeconds": {"type": "integer", "minimum": 1, "maximum": 3600},
+        "retryPolicy": {
+          "type": "object", "additionalProperties": false,
+          "properties": {
+            "maxAttempts": {"type": "integer", "minimum": 1, "maximum": 10},
+            "backoffSeconds": {"type": "integer", "minimum": 0, "maximum": 3600}
+          }
+        },
+        "idempotency": {"enum": ["required", "natural", "none"]},
+        "costModel": {
+          "type": "object", "required": ["unit"], "additionalProperties": false,
+          "properties": {"unit": {"type": "string", "minLength": 1}, "estimate": {"type": "number", "minimum": 0}}
+        },
+        "implementation": {
+          "type": "object",
+          "required": ["protocol"],
+          "additionalProperties": false,
+          "properties": {
+            "protocol": {"enum": ["http", "local", "mcp"]},
+            "endpoint": {"type": "string", "description": "http: адрес; допускает ${ПЕРЕМЕННУЮ} окружения"},
+            "entrypoint": {"type": "string", "description": "local: module:function; mcp: имя инструмента"},
+            "auth": {"type": "object", "description": "audience или secretRef; никаких секретов"}
+          }
+        }
+      }
+    },
+    "skillSpec": {
+      "type": "object",
+      "required": ["version"],
+      "additionalProperties": false,
+      "properties": {
+        "version": {"type": "string", "minLength": 1, "maxLength": 50, "description": "Версию скилла задаёт пакет"},
+        "description": {"type": "string"},
+        "protocol": {"enum": ["mcp", "http", "local", "opencode", "custom"]},
+        "config": {"type": "object"},
+        "inputSchema": {"$ref": "#/$defs/jsonSchema"},
+        "outputSchema": {"$ref": "#/$defs/jsonSchema"},
+        "sideEffects": {"enum": ["none", "external_read", "external_write"]},
+        "riskLevel": {"enum": ["low", "medium", "high"]},
+        "contract": {"$ref": "#/$defs/skillContract"}
+      },
+      "dependentRequired": {"contract": ["sideEffects", "riskLevel"]}
+    }
+  }
+}

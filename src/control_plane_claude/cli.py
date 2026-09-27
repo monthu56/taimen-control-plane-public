@@ -89,6 +89,7 @@ class ClaudeCodeCLI:
     timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS
     mcp_config_path: Path | None = None
     disallowed_tools: Sequence[str] = ()
+    allowed_tools: Sequence[str] = ()
     log_dir: Path | None = None
     extra_args: Sequence[str] = field(default_factory=tuple)
 
@@ -112,6 +113,8 @@ class ClaudeCodeCLI:
             # strict: the agent gets exactly the servers we declare, not
             # whatever happens to be configured for the user running the runner.
             args += ["--mcp-config", str(self.mcp_config_path), "--strict-mcp-config"]
+        if self.allowed_tools:
+            args += ["--allowedTools", *self.allowed_tools]
         if self.disallowed_tools:
             args += ["--disallowedTools", *self.disallowed_tools]
         args += list(self.extra_args)

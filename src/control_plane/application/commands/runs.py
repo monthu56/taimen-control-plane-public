@@ -30,6 +30,7 @@ from control_plane import observability
 from control_plane.application.authorization import AuthContext, authorize
 from control_plane.application.commands._child_ceiling import enforce_run_ceiling
 from control_plane.application.commands._claim_release import release_claim_on_locked_task
+from control_plane.application.commands.agents import check_run_agent_revision
 from control_plane.application.commands.task_types import lifecycle_of
 from control_plane.application.commands.tasks import (
     enforce_claim_gate,
@@ -79,8 +80,8 @@ def _validate_handoff_data(value: Any) -> None:
     """Keep secrets, transcripts and machine-local paths out of handoff state.
 
     The prohibition list itself lives in ``domain/redaction.py`` so that every
-    durable harness payload (handoff state, harness manifest) is checked
-    against one list rather than against copies of it.
+    durable harness payload is checked against one list rather than against
+    copies of it.
     """
     reject_unsafe_durable_payload(
         value, code="unsafe_handoff_payload", subject="Handoff checkpoint"
@@ -98,12 +99,16 @@ async def start_run(
     metadata: dict[str, Any] | None = None,
     max_duration_seconds: int | None = None,
     max_actions: int | None = None,
+    agent_revision_id: uuid.UUID | None = None,
 ) -> Run:
     await authorize(ctx, Permission.TASKS_CLAIM)
     if max_duration_seconds is not None and max_duration_seconds <= 0:
         raise ValidationError("invalid_budget", "maxDurationSeconds must be positive")
     if max_actions is not None and max_actions <= 0:
         raise ValidationError("invalid_budget", "maxActions must be positive")
+    # A registered agent runs by a revision of its own spec, anyone else by
+    # none (CP-ADR-0073 §7); checked before any lock is taken.
+    agent_revision_id = await check_run_agent_revision(session, ctx, agent_revision_id)
     task = await resolve_task_for_update(session, ctx, task_ref)
 
     if task.system_status_category in TERMINAL_CATEGORIES:
@@ -169,6 +174,7 @@ async def start_run(
         metadata_json=metadata or {},
         instructions_hash=refs["hash"],
         instructions_refs=refs,
+        agent_revision_id=agent_revision_id,
         version=1,
         created_at=now,
         updated_at=now,
@@ -194,6 +200,7 @@ async def start_run(
             "fencingToken": run.fencing_token,
             "instructionsHash": refs["hash"],
             "instructionsRefs": refs["layers"],
+            "agentRevisionId": str(agent_revision_id) if agent_revision_id else None,
         },
     )
 
@@ -203,13 +210,6 @@ async def start_run(
     from control_plane.application.commands.child_runs import bind_child_run
 
     await bind_child_run(session, ctx, task=task, run=run)
-
-    # Every run gets its Effective Harness Manifest in the same transaction
-    # (HRS-2). Imported here rather than at module scope: the manifest command
-    # needs the task/claim helpers this module also uses.
-    from control_plane.application.commands.manifests import compile_for_run
-
-    await compile_for_run(session, ctx, run=run, task=task, reason="run_started")
     return run
 
 

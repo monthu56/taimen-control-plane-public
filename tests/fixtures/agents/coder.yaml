@@ -1,0 +1,60 @@
+# claude-code: an autonomous coder with a working copy and review.
+apiVersion: taimen.ai/v1
+kind: Agent
+key: coder
+spec:
+  displayName: Autonomous coder
+  identity:
+    kind: agent
+    roles:
+    - coder
+    permissions:
+    - tasks.read
+    - tasks.claim
+    - sessions.open
+    - artifacts.write
+  work:
+    workspace: ${SELFDEV_WORKSPACE_ID}
+    onlyAssigned: true
+    taskTypes:
+    - coding-task
+  executor:
+    kind: claude-code
+    params:
+      model: claude-opus-5-5
+      permissionMode: bypassPermissions
+      timeoutSeconds: 10800
+      tools:
+        deny:
+        - WebFetch
+    instructions: 'Соглашения репозитория: …'
+  workingCopy:
+    repository: https://git.example/org/control-plane.git
+    directory: control-plane
+    neighbours:
+      platform-auth-sdk: https://git.example/org/platform-auth-sdk.git
+    review:
+      mode: human
+      taskType: code-review-merge
+      reviewer: ${SELFDEV_REVIEWER_PRINCIPAL}
+  skills:
+    protocols:
+    - local
+    - http
+    local:
+    - taimen_selfdev.git_merge:run
+    httpOrigins:
+    - https://platform.example.com
+  placement:
+    requires:
+    - claude-subscription
+    - repos
+    secrets:
+    - claude-oauth-token
+    - github-token
+    resources:
+      cpus: 2
+      memoryMb: 4096
+    replicas: 1
+    drainSeconds: 14400
+  state: running

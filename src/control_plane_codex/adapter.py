@@ -46,7 +46,7 @@ from __future__ import annotations
 
 import logging
 import os
-from collections.abc import Awaitable, Sequence
+from collections.abc import Awaitable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -114,6 +114,9 @@ class CodexAdapter:
     # Repository conventions, the fourth instructions layer (CP-ADR-0066):
     # read at execute time, like the Claude Code adapter's file.
     prompt_file: Path | None = None
+    # Executor instructions of the agent's revision (CP-ADR-0073), instead of
+    # the file when set.
+    instructions: str | None = None
 
     async def execute(
         self,
@@ -277,7 +280,11 @@ class CodexAdapter:
             task,
             context,
             harness_note=SYSTEM_NOTE,
-            conventions=read_conventions(self.prompt_file),
+            conventions=(
+                self.instructions.strip()
+                if self.instructions is not None
+                else read_conventions(self.prompt_file)
+            ),
             inputs=inputs,
         )
 
@@ -402,25 +409,81 @@ async def with_suppressed(awaitable: Awaitable[Any]) -> None:
         logger.info("auxiliary write failed: %s", exc)
 
 
-def adapter_from_environment() -> CodexAdapter:
-    """Build the adapter the daemon will use, from the runner's environment."""
+def _host_cli(environ: Mapping[str, str]) -> CodexCLI:
+    """What belongs to the host, not to the agent: the binary and local logs."""
     log_dir: Path | None = None
-    if os.environ.get("CONTROL_PLANE_CODEX_LOGS", "1") == "1":
+    if environ.get("CONTROL_PLANE_CODEX_LOGS", "1") == "1":
         runtime_dir = Path(
-            os.environ.get("CONTROL_PLANE_CODEX_RUNTIME_DIR") or Path.home() / ".codex-runner"
+            environ.get("CONTROL_PLANE_CODEX_RUNTIME_DIR") or Path.home() / ".codex-runner"
         )
         log_dir = runtime_dir / "sessions"
-    cli = CodexCLI(
-        binary=os.environ.get("CONTROL_PLANE_CODEX_BINARY", "codex"),
-        model=os.environ.get("CONTROL_PLANE_CODEX_MODEL") or None,
-        sandbox=os.environ.get("CONTROL_PLANE_CODEX_SANDBOX", "workspace-write"),
-        timeout_seconds=float(os.environ.get("CONTROL_PLANE_CODEX_TIMEOUT", "3600")),
-        log_dir=log_dir,
-    )
+    return CodexCLI(binary=environ.get("CONTROL_PLANE_CODEX_BINARY", "codex"), log_dir=log_dir)
+
+
+def adapter_from_environment() -> CodexAdapter:
+    """Build the adapter the daemon will use, from the runner's environment."""
+    cli = _host_cli(os.environ)
+    cli.model = os.environ.get("CONTROL_PLANE_CODEX_MODEL") or None
+    cli.sandbox = os.environ.get("CONTROL_PLANE_CODEX_SANDBOX", "workspace-write")
+    cli.timeout_seconds = float(os.environ.get("CONTROL_PLANE_CODEX_TIMEOUT", "3600"))
     return CodexAdapter(
         cli,
         resume_sessions=os.environ.get("CONTROL_PLANE_CODEX_RESUME", "1") == "1",
         trace=TraceSettings.from_environment(),
         credential_class=os.environ.get("CONTROL_PLANE_CODEX_CREDENTIAL_CLASS") or None,
         prompt_file=prompt_file_from_environment("CONTROL_PLANE_CODEX_PROMPT_FILE"),
+    )
+
+
+#: ``executor.params`` of kind ``codex`` (``$defs.agentExecutors``).
+PARAMS = frozenset({"model", "sandbox", "timeoutSeconds", "resume", "credentialClass"})
+SANDBOXES = ("read-only", "workspace-write", "danger-full-access")
+CREDENTIAL_CLASSES = ("subscription", "api_key")
+
+
+def adapter_from_params(
+    params: Mapping[str, Any],
+    *,
+    instructions: str = "",
+    environ: Mapping[str, str] | None = None,
+) -> CodexAdapter:
+    """Build the adapter from the parameters of an agent revision (CP-ADR-0073).
+
+    Same split as the Claude Code adapter: the revision gives the model, the
+    sandbox, the turn timeout, resumption and the credential class, and its
+    ``instructions`` replace the conventions file; the host keeps the binary,
+    local logs and the trace switches. Unknown or malformed parameters are a
+    ``ValueError``.
+    """
+    environ = os.environ if environ is None else environ
+    unknown = sorted(set(params) - PARAMS)
+    if unknown:
+        raise ValueError(f"codex: unknown executor params {unknown}")
+    sandbox = params.get("sandbox", "workspace-write")
+    if sandbox not in SANDBOXES:
+        raise ValueError(f"codex: sandbox {sandbox!r} is not one of {SANDBOXES}")
+    credential_class = params.get("credentialClass")
+    if credential_class is not None and credential_class not in CREDENTIAL_CLASSES:
+        raise ValueError(
+            f"codex: credentialClass {credential_class!r} is not one of {CREDENTIAL_CLASSES}"
+        )
+    model = params.get("model")
+    if model is not None and (not isinstance(model, str) or not model):
+        raise ValueError("codex: model must be a non-empty string")
+    timeout = params.get("timeoutSeconds", 3600)
+    if not isinstance(timeout, int) or isinstance(timeout, bool) or timeout <= 0:
+        raise ValueError("codex: timeoutSeconds must be a positive integer")
+    resume = params.get("resume", True)
+    if not isinstance(resume, bool):
+        raise ValueError("codex: resume must be a boolean")
+    cli = _host_cli(environ)
+    cli.model = model
+    cli.sandbox = sandbox
+    cli.timeout_seconds = float(timeout)
+    return CodexAdapter(
+        cli,
+        resume_sessions=resume,
+        trace=TraceSettings.from_environment(environ),
+        credential_class=credential_class,
+        instructions=instructions,
     )

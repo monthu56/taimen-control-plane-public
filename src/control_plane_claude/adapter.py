@@ -31,7 +31,7 @@ from __future__ import annotations
 import logging
 import os
 import uuid
-from collections.abc import Awaitable, Sequence
+from collections.abc import Awaitable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -107,6 +107,11 @@ class ClaudeCodeAdapter:
     # description says WHAT; this file says HOW this repository works — the
     # kind of knowledge that otherwise costs a review round per branch.
     prompt_file: Path | None = None
+    # Executor instructions of the agent's revision (CP-ADR-0073): the same
+    # fourth layer, given as text instead of a file. When set, the file is
+    # not read.
+    instructions: str | None = None
+    _tools_narrowed: bool = field(default=False, init=False, repr=False)
 
     async def execute(
         self,
@@ -221,12 +226,19 @@ class ClaudeCodeAdapter:
 
         Resolved once per process and only when the MCP server is actually
         passed through: without it there is no Control Plane tool to withhold.
+        The tools a revision allows or denies (``tools.allow/deny``) are
+        applied on top: a deny is added to the withheld set, and an allow
+        never names a withheld command — the CLI lets a deny win anyway, but
+        the argv should not say otherwise.
         """
+        if self._tools_narrowed:
+            return
+        self._tools_narrowed = True
         if not self.withhold_authoritative_tools or self.cli.mcp_config_path is None:
             return
-        if self.cli.disallowed_tools:
-            return
-        self.cli.disallowed_tools = await withheld_tools()
+        withheld = await withheld_tools()
+        self.cli.disallowed_tools = list(dict.fromkeys([*withheld, *self.cli.disallowed_tools]))
+        self.cli.allowed_tools = [t for t in self.cli.allowed_tools if t not in frozenset(withheld)]
 
     async def _session_for(self, client: ControlPlaneClient, run_id: str) -> tuple[str, bool]:
         """Resume the session recorded on this run, or name a new one."""
@@ -267,7 +279,11 @@ class ClaudeCodeAdapter:
             task,
             context,
             harness_note=SYSTEM_NOTE,
-            conventions=read_conventions(self.prompt_file),
+            conventions=(
+                self.instructions.strip()
+                if self.instructions is not None
+                else read_conventions(self.prompt_file)
+            ),
             inputs=inputs,
         )
 
@@ -390,28 +406,95 @@ async def with_suppressed(awaitable: Awaitable[Any]) -> None:
         logger.info("auxiliary write failed: %s", exc)
 
 
-def adapter_from_environment() -> ClaudeCodeAdapter:
-    """Build the adapter the daemon will use, from the runner's environment."""
+def _host_cli(environ: Mapping[str, str]) -> ClaudeCodeCLI:
+    """What belongs to the host, not to the agent: binary, MCP, local logs."""
     runtime_dir = Path(
-        os.environ.get("CONTROL_PLANE_CLAUDE_RUNTIME_DIR") or Path.home() / ".claude-runner"
+        environ.get("CONTROL_PLANE_CLAUDE_RUNTIME_DIR") or Path.home() / ".claude-runner"
     )
     mcp_config: Path | None = None
-    if os.environ.get("CONTROL_PLANE_CLAUDE_MCP", "1") == "1":
+    if environ.get("CONTROL_PLANE_CLAUDE_MCP", "1") == "1":
         mcp_config = write_mcp_config(runtime_dir / "mcp.json")
     log_dir: Path | None = None
-    if os.environ.get("CONTROL_PLANE_CLAUDE_LOGS", "1") == "1":
+    if environ.get("CONTROL_PLANE_CLAUDE_LOGS", "1") == "1":
         log_dir = runtime_dir / "sessions"
-    cli = ClaudeCodeCLI(
-        binary=os.environ.get("CONTROL_PLANE_CLAUDE_BINARY", "claude"),
-        model=os.environ.get("CONTROL_PLANE_CLAUDE_MODEL") or None,
-        permission_mode=os.environ.get("CONTROL_PLANE_CLAUDE_PERMISSION_MODE", "acceptEdits"),
-        timeout_seconds=float(os.environ.get("CONTROL_PLANE_CLAUDE_TIMEOUT", "3600")),
+    return ClaudeCodeCLI(
+        binary=environ.get("CONTROL_PLANE_CLAUDE_BINARY", "claude"),
         mcp_config_path=mcp_config,
         log_dir=log_dir,
     )
+
+
+def adapter_from_environment() -> ClaudeCodeAdapter:
+    """Build the adapter the daemon will use, from the runner's environment."""
+    cli = _host_cli(os.environ)
+    cli.model = os.environ.get("CONTROL_PLANE_CLAUDE_MODEL") or None
+    cli.permission_mode = os.environ.get("CONTROL_PLANE_CLAUDE_PERMISSION_MODE", "acceptEdits")
+    cli.timeout_seconds = float(os.environ.get("CONTROL_PLANE_CLAUDE_TIMEOUT", "3600"))
     return ClaudeCodeAdapter(
         cli,
         resume_sessions=os.environ.get("CONTROL_PLANE_CLAUDE_RESUME", "1") == "1",
         trace=TraceSettings.from_environment(),
         prompt_file=prompt_file_from_environment("CONTROL_PLANE_CLAUDE_PROMPT_FILE"),
     )
+
+
+#: ``executor.params`` of kind ``claude-code`` (``$defs.agentExecutors``).
+PARAMS = frozenset({"model", "permissionMode", "timeoutSeconds", "resume", "tools"})
+PERMISSION_MODES = ("default", "acceptEdits", "plan", "bypassPermissions")
+
+
+def adapter_from_params(
+    params: Mapping[str, Any],
+    *,
+    instructions: str = "",
+    environ: Mapping[str, str] | None = None,
+) -> ClaudeCodeAdapter:
+    """Build the adapter from the parameters of an agent revision (CP-ADR-0073).
+
+    The revision says how the agent works — model, permission mode, turn
+    timeout, resumption, which tools it may use — and ``instructions`` replace
+    the conventions file. The host keeps what is its own: the binary, the MCP
+    passthrough, local logs and the trace switches. The core stores the
+    parameters without reading them, so they are checked here: an unknown
+    or malformed one is a ``ValueError``, not a default nobody asked for.
+    """
+    environ = os.environ if environ is None else environ
+    unknown = sorted(set(params) - PARAMS)
+    if unknown:
+        raise ValueError(f"claude-code: unknown executor params {unknown}")
+    mode = params.get("permissionMode", "acceptEdits")
+    if mode not in PERMISSION_MODES:
+        raise ValueError(f"claude-code: permissionMode {mode!r} is not one of {PERMISSION_MODES}")
+    model = params.get("model")
+    if model is not None and (not isinstance(model, str) or not model):
+        raise ValueError("claude-code: model must be a non-empty string")
+    timeout = params.get("timeoutSeconds", 3600)
+    if not isinstance(timeout, int) or isinstance(timeout, bool) or timeout <= 0:
+        raise ValueError("claude-code: timeoutSeconds must be a positive integer")
+    resume = params.get("resume", True)
+    if not isinstance(resume, bool):
+        raise ValueError("claude-code: resume must be a boolean")
+    tools = params.get("tools") or {}
+    if not isinstance(tools, Mapping) or set(tools) - {"allow", "deny"}:
+        raise ValueError("claude-code: tools takes only allow and deny")
+    allow, deny = (_tool_names(tools.get(side), side) for side in ("allow", "deny"))
+    cli = _host_cli(environ)
+    cli.model = model
+    cli.permission_mode = mode
+    cli.timeout_seconds = float(timeout)
+    cli.allowed_tools = allow
+    cli.disallowed_tools = deny
+    return ClaudeCodeAdapter(
+        cli,
+        resume_sessions=resume,
+        trace=TraceSettings.from_environment(environ),
+        instructions=instructions,
+    )
+
+
+def _tool_names(value: Any, side: str) -> list[str]:
+    if value is None:
+        return []
+    if not isinstance(value, list) or not all(isinstance(t, str) and t for t in value):
+        raise ValueError(f"claude-code: tools.{side} must be a list of tool names")
+    return list(dict.fromkeys(value))

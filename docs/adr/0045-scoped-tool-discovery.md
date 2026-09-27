@@ -128,8 +128,6 @@ durable journal не попадает.
 ```conformance
 - grep: {path: src/control_plane/domain/tool_discovery.py, pattern: '^def decide_visibility\('}
   repo: control-plane
-- grep: {path: src/control_plane/domain/harness_manifest.py, pattern: 'decide_visibility'}
-  repo: control-plane
 - grep: {path: src/control_plane/application/commands/execution.py, pattern: 'code="tool_not_authorized"'}
   repo: control-plane
 - grep: {path: src/control_plane/application/commands/execution.py, pattern: 'observability\.inc\("tool_invocation_denied_total"\)'}

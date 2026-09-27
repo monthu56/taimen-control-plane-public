@@ -815,8 +815,17 @@ class ControlPlaneClient:
         metadata: Json | None = None,
         max_duration_seconds: int | None = None,
         max_actions: int | None = None,
+        agent_revision_id: str | None = None,
     ) -> Json:
+        """Start a run under a live claim.
+
+        ``agent_revision_id`` — the revision of its own agent the caller runs
+        by (CP-ADR-0073 §7): required of a principal bound to an agent,
+        refused from one that is not.
+        """
         body: Json = {"claimId": claim_id, "fencingToken": fencing_token}
+        if agent_revision_id is not None:
+            body["agentRevisionId"] = agent_revision_id
         if input is not None:
             body["input"] = input
         if metadata:
@@ -834,10 +843,6 @@ class ControlPlaneClient:
 
     async def get_run_context(self, run_id: str) -> Json:
         return await self._request("GET", f"/runs/{run_id}/context")
-
-    async def get_harness_manifest(self, run_id: str, *, version: int | None = None) -> Json:
-        suffix = f"?version={version}" if version is not None else ""
-        return await self._request("GET", f"/runs/{run_id}/harness-manifest{suffix}")
 
     async def succeed_run(
         self,
@@ -2157,6 +2162,107 @@ class ControlPlaneClient:
 
     async def revoke_iam_binding(self, binding_id: str) -> Json:
         return await self._request("POST", f"/iam-bindings/{binding_id}:revoke", idempotent=True)
+
+    # -- agents (CP-ADR-0073) --------------------------------------------------
+
+    async def get_my_agent(self) -> Json:
+        """The agent the caller is, with its current revision (``AgentOut``).
+
+        ``NotFoundError`` when the caller's principal is not bound to an agent;
+        a retired agent is returned with ``status: retired``.
+        """
+        return await self._request("GET", "/agents/me")
+
+    async def get_agent(self, ref: str) -> Json:
+        """An agent by ``key`` (current revision) or ``key@revision``."""
+        return await self._request("GET", f"/agents/{ref}")
+
+    async def list_agents(
+        self,
+        *,
+        status: str | None = None,
+        state: str | None = None,
+        workspace_id: str | None = None,
+        limit: int | None = None,
+        cursor: str | None = None,
+    ) -> Json:
+        params: Json = {}
+        for key, value in (
+            ("status", status),
+            ("state", state),
+            ("workspaceId", workspace_id),
+            ("limit", limit),
+            ("cursor", cursor),
+        ):
+            if value is not None:
+                params[key] = value
+        return await self._request("GET", "/agents", params=params or None)
+
+    async def publish_agent(self, key: str, spec: Json) -> Json:
+        """Apply a spec: a new revision only when its canonical hash differs."""
+        return await self._request(
+            "POST", "/agents", json_body={"key": key, "spec": spec}, idempotent=True
+        )
+
+    async def validate_agent(self, key: str, spec: Json) -> Json:
+        """Every check of :meth:`publish_agent`, nothing saved."""
+        return await self._request("POST", "/agents:validate", json_body={"key": key, "spec": spec})
+
+    async def update_agent_state(
+        self, key: str, *, state: str | None = None, replicas: int | None = None
+    ) -> Json:
+        """Change the desired state or replicas; never a new revision."""
+        body: Json = {}
+        if state is not None:
+            body["state"] = state
+        if replicas is not None:
+            body["replicas"] = replicas
+        return await self._request("PATCH", f"/agents/{key}/state", json_body=body, idempotent=True)
+
+    async def retire_agent(self, key: str, *, reason: str) -> Json:
+        return await self._request(
+            "POST", f"/agents/{key}:retire", json_body={"reason": reason}, idempotent=True
+        )
+
+    async def link_agent_identity(
+        self, key: str, *, issuer: str, iam_tenant_id: str, iam_principal_id: str
+    ) -> Json:
+        """The placement service names the agent's IAM identity (§6); idempotent."""
+        return await self._request(
+            "PUT",
+            f"/agents/{key}/identity",
+            json_body={
+                "issuer": issuer,
+                "iamTenantId": iam_tenant_id,
+                "iamPrincipalId": iam_principal_id,
+            },
+            idempotent=True,
+        )
+
+    async def get_agent_status(self, key: str) -> Json:
+        return await self._request("GET", f"/agents/{key}/status")
+
+    async def report_agent_status(
+        self,
+        key: str,
+        *,
+        phase: str,
+        instances: Json,
+        observed_at: str,
+        observed_revision: int | None = None,
+        node: str | None = None,
+        reason: Json | None = None,
+    ) -> Json:
+        """What actually runs (§4); only the placement service may write it."""
+        body: Json = {"phase": phase, "instances": instances, "observedAt": observed_at}
+        for name, value in (
+            ("observedRevision", observed_revision),
+            ("node", node),
+            ("reason", reason),
+        ):
+            if value is not None:
+                body[name] = value
+        return await self._request("PUT", f"/agents/{key}/status", json_body=body, idempotent=True)
 
     # -- operator actions (v0.5) ----------------------------------------------
 

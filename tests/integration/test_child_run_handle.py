@@ -481,17 +481,18 @@ async def test_child_sees_and_uses_only_the_skills_its_handle_granted(
     ).json()["childHandle"]
     _, child_run = await claim_and_run(client, child_key, handle["childTaskId"])
 
-    manifest = (
+    view = (
         await client.get(
-            f"/api/v1/runs/{child_run['id']}/harness-manifest", headers=auth(child_key)
+            "/api/v1/tools", params={"runId": child_run["id"]}, headers=auth(child_key)
         )
-    ).json()["manifest"]
-    tools = {tool["name"]: tool for tool in manifest["base"]["toolPolicy"]["tools"]}
-    assert tools["review"]["allowedByChildGrant"] is True
-    assert tools["deploy"]["allowedByChildGrant"] is False
-    assert tools["deploy"]["visible"] is False
-    visibility = manifest["provenance"]["toolPolicy"]["visibility"]
-    assert visibility[withheld_skill["id"]]["reason"] == "not_granted_by_child_handle"
+    ).json()
+    assert [tool["name"] for tool in view["items"]] == ["review"]
+    withheld = await client.get(
+        f"/api/v1/tools/{withheld_skill['id']}",
+        params={"runId": child_run["id"]},
+        headers=auth(child_key),
+    )
+    assert withheld.status_code == 404, withheld.text
 
     allowed = await client.post(
         f"/api/v1/runs/{child_run['id']}/actions",
@@ -518,11 +519,10 @@ async def test_root_run_is_not_narrowed_by_any_grant(client: httpx.AsyncClient) 
     task = await create_task(client, admin_key)
     _, run = await claim_and_run(client, agent_key, task["id"])
 
-    manifest = (
-        await client.get(f"/api/v1/runs/{run['id']}/harness-manifest", headers=auth(agent_key))
-    ).json()["manifest"]
-    tools = {tool["name"]: tool for tool in manifest["base"]["toolPolicy"]["tools"]}
-    assert tools["review"]["allowedByChildGrant"] is True
+    view = (
+        await client.get("/api/v1/tools", params={"runId": run["id"]}, headers=auth(agent_key))
+    ).json()
+    assert [tool["name"] for tool in view["items"]] == ["review"]
 
     action = await client.post(
         f"/api/v1/runs/{run['id']}/actions",

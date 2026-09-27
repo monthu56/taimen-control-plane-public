@@ -102,6 +102,7 @@ def test_catalog_is_neutral() -> None:
     """Constitution art. II: the catalog names the core's own entities only."""
     entities = {entry.entity_type for entry in event_types()}
     assert entities <= {
+        "agent",
         "api_key",
         "approval",
         "artifact",

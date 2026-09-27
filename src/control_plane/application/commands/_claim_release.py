@@ -6,7 +6,7 @@ task row first, then claim row. Sessions are never locked after tasks.
 
 import uuid
 
-from sqlalchemy import select
+from sqlalchemy import ColumnElement, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from control_plane.application.commands.task_types import lifecycle_of
@@ -96,11 +96,62 @@ async def release_active_claims_for_session(
 
     Returns the released claim ids.
     """
+    return await _release_active_claims(
+        session,
+        tenant_id=tenant_id,
+        condition=TaskClaim.session_id == session_id,
+        actor_id=actor_id,
+        request_id=request_id,
+        correlation_id=correlation_id,
+        trace_run_id=trace_run_id,
+        reason=reason,
+    )
+
+
+async def release_active_claims_of_holder(
+    session: AsyncSession,
+    *,
+    tenant_id: uuid.UUID,
+    holder_id: uuid.UUID,
+    actor_id: uuid.UUID | None,
+    request_id: str,
+    correlation_id: str,
+    trace_run_id: str = "",
+    reason: str,
+) -> list[uuid.UUID]:
+    """Release every active claim held by a principal, whatever its session.
+
+    Used when the principal itself leaves (a retired agent, CP-ADR-0073 §9):
+    its work goes back to the queue under the ordinary release rules.
+    """
+    return await _release_active_claims(
+        session,
+        tenant_id=tenant_id,
+        condition=TaskClaim.holder_id == holder_id,
+        actor_id=actor_id,
+        request_id=request_id,
+        correlation_id=correlation_id,
+        trace_run_id=trace_run_id,
+        reason=reason,
+    )
+
+
+async def _release_active_claims(
+    session: AsyncSession,
+    *,
+    tenant_id: uuid.UUID,
+    condition: ColumnElement[bool],
+    actor_id: uuid.UUID | None,
+    request_id: str,
+    correlation_id: str,
+    trace_run_id: str,
+    reason: str,
+) -> list[uuid.UUID]:
     rows = (
         await session.execute(
             select(TaskClaim.id, TaskClaim.task_id)
             .where(
-                TaskClaim.session_id == session_id,
+                condition,
                 TaskClaim.tenant_id == tenant_id,
                 TaskClaim.status == ClaimStatus.ACTIVE,
             )
@@ -127,7 +178,7 @@ async def release_active_claims_for_session(
             entity_type="claim",
             entity_id=claim.id,
             actor_id=actor_id,
-            session_id=session_id,
+            session_id=claim.session_id,
             request_id=request_id,
             correlation_id=correlation_id,
             trace_run_id=trace_run_id,

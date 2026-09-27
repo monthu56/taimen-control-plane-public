@@ -20,6 +20,241 @@
     "payload": "Data of the event, by the schema of (type, schemaVersion)"
   },
   "types": {
+    "agent.retired": {
+      "entityType": "agent",
+      "description": "An agent was retired: stopped, binding revoked, history kept.",
+      "currentVersion": 1,
+      "versions": {
+        "1": {
+          "schema": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+            "properties": {
+              "key": {
+                "type": "string"
+              },
+              "revision": {
+                "type": "integer",
+                "description": "The last revision of the agent"
+              },
+              "principalId": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "format": "uuid"
+              },
+              "reason": {
+                "type": "string",
+                "maxLength": 1000,
+                "description": "Reason given; credential-shaped material redacted, cut to the limit"
+              },
+              "releasedClaims": {
+                "type": "integer",
+                "description": "Active claims of the agent released to the queue"
+              }
+            },
+            "additionalProperties": true,
+            "required": [
+              "key",
+              "principalId",
+              "reason",
+              "releasedClaims",
+              "revision"
+            ]
+          }
+        }
+      }
+    },
+    "agent.revision_published": {
+      "entityType": "agent",
+      "description": "A new immutable revision of an agent spec was published (CP-ADR-0073 §2).",
+      "currentVersion": 1,
+      "versions": {
+        "1": {
+          "schema": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+            "properties": {
+              "key": {
+                "type": "string"
+              },
+              "revision": {
+                "type": "integer"
+              },
+              "specHash": {
+                "type": "string",
+                "pattern": "^sha256:[0-9a-f]{64}$"
+              },
+              "previousRevision": {
+                "type": [
+                  "integer",
+                  "null"
+                ],
+                "description": "Null for the first revision of the key"
+              },
+              "executorKind": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "description": "Null for an identity without placement"
+              },
+              "placed": {
+                "type": "boolean",
+                "description": "False for placement none"
+              },
+              "permissionsChanged": {
+                "type": "boolean",
+                "description": "Identity (roles, permissions, capabilities) differs from the previous one"
+              }
+            },
+            "additionalProperties": true,
+            "required": [
+              "executorKind",
+              "key",
+              "permissionsChanged",
+              "placed",
+              "previousRevision",
+              "revision",
+              "specHash"
+            ]
+          }
+        }
+      }
+    },
+    "agent.state_changed": {
+      "entityType": "agent",
+      "description": "The desired state or replica count of an agent changed; no new revision.",
+      "currentVersion": 1,
+      "versions": {
+        "1": {
+          "schema": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+            "properties": {
+              "key": {
+                "type": "string"
+              },
+              "state": {
+                "type": "string",
+                "enum": [
+                  "running",
+                  "stopped"
+                ]
+              },
+              "replicas": {
+                "type": "integer"
+              },
+              "previousState": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "enum": [
+                  "running",
+                  "stopped",
+                  null
+                ],
+                "description": "Null when the agent is first published"
+              },
+              "previousReplicas": {
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              }
+            },
+            "additionalProperties": true,
+            "required": [
+              "key",
+              "previousReplicas",
+              "previousState",
+              "replicas",
+              "state"
+            ]
+          }
+        }
+      }
+    },
+    "agent.status_changed": {
+      "entityType": "agent",
+      "description": "The observed state of an agent changed: phase, reason, node or revision.",
+      "currentVersion": 1,
+      "versions": {
+        "1": {
+          "schema": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+            "properties": {
+              "key": {
+                "type": "string"
+              },
+              "phase": {
+                "type": "string",
+                "enum": [
+                  "pending",
+                  "running",
+                  "waiting_for_node",
+                  "crash_looping",
+                  "node_unavailable",
+                  "stopped"
+                ]
+              },
+              "previousPhase": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "enum": [
+                  "pending",
+                  "running",
+                  "waiting_for_node",
+                  "crash_looping",
+                  "node_unavailable",
+                  "stopped",
+                  null
+                ],
+                "description": "Null on the first report"
+              },
+              "reasonCode": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "description": "Why it is not running, e.g. no_matching_node"
+              },
+              "node": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "observedRevision": {
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "observedAt": {
+                "type": "string",
+                "format": "date-time"
+              }
+            },
+            "additionalProperties": true,
+            "required": [
+              "key",
+              "node",
+              "observedAt",
+              "observedRevision",
+              "phase",
+              "previousPhase",
+              "reasonCode"
+            ]
+          }
+        }
+      }
+    },
     "api_key.break_glass_issued": {
       "entityType": "api_key",
       "description": "A short-lived break-glass key was issued from the host shell (CP-ADR-0065).",
@@ -3101,7 +3336,7 @@
     },
     "run.manifest_compiled": {
       "entityType": "run",
-      "description": "The effective harness manifest of the run was compiled (ADR-0043).",
+      "description": "The effective harness manifest of the run was compiled (ADR-0043). No longer written since ADR-0073; kept for events already in the journal.",
       "currentVersion": 1,
       "versions": {
         "1": {
@@ -3141,7 +3376,7 @@
     },
     "run.manifest_ephemeral_recorded": {
       "entityType": "run",
-      "description": "An ephemeral manifest change was recorded.",
+      "description": "An ephemeral manifest change was recorded (ADR-0043). No longer written since ADR-0073; kept for events already in the journal.",
       "currentVersion": 1,
       "versions": {
         "1": {
@@ -3180,7 +3415,7 @@
     "run.started": {
       "entityType": "run",
       "description": "An execution attempt started under a claim.",
-      "currentVersion": 1,
+      "currentVersion": 2,
       "versions": {
         "1": {
           "schema": {
@@ -3206,6 +3441,49 @@
             },
             "additionalProperties": true,
             "required": [
+              "attempt",
+              "claimId",
+              "fencingToken",
+              "instructionsHash",
+              "instructionsRefs",
+              "taskId"
+            ]
+          }
+        },
+        "2": {
+          "changes": "agentRevisionId",
+          "schema": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+            "properties": {
+              "taskId": {
+                "type": "string",
+                "format": "uuid"
+              },
+              "claimId": {
+                "type": "string",
+                "format": "uuid"
+              },
+              "attempt": {
+                "type": "integer"
+              },
+              "fencingToken": {
+                "type": "integer"
+              },
+              "instructionsHash": {},
+              "instructionsRefs": {},
+              "agentRevisionId": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "format": "uuid",
+                "description": "Agent revision the run goes by (CP-ADR-0073 §7); null for executors that are not registered agents"
+              }
+            },
+            "additionalProperties": true,
+            "required": [
+              "agentRevisionId",
               "attempt",
               "claimId",
               "fencingToken",

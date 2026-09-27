@@ -431,34 +431,3 @@ async def test_denial_is_observable_without_inventing_a_domain_event(
     # The rolled-back attempt left no fact behind, and the tool name — which a
     # probe controls — never enters the durable journal.
     assert all("payments.refund" not in str(event["payload"]) for event in events["items"])
-
-
-# --- manifest provenance ------------------------------------------------------
-
-
-async def test_manifest_records_the_revisions_discovery_used(
-    client: httpx.AsyncClient,
-) -> None:
-    """T8: "why was this visible" stays answerable after the fact."""
-    boot = await do_bootstrap(client)
-    admin_key = boot["apiKey"]["key"]
-    agent, agent_key = await create_agent_with_key(
-        client, admin_key, permissions=ORG_AGENT_PERMISSIONS
-    )
-    skill = await register_skill(client, admin_key, "repo.search", protocol="mcp")
-    await assign_skill(client, admin_key, agent["id"], skill["id"])
-    task = await create_task(client, admin_key)
-    _, run = await _claim_and_run(client, agent_key, task["id"], session_extra=MCP_SESSION)
-
-    manifest = (
-        await client.get(f"/api/v1/runs/{run['id']}/harness-manifest", headers=auth(agent_key))
-    ).json()["manifest"]
-    tool_policy = manifest["base"]["toolPolicy"]
-    view, _ = await _search(client, agent_key, runId=run["id"])
-
-    assert tool_policy["catalogRevision"] == view["view"]["catalogRevision"]
-    assert tool_policy["policyRevision"] == view["view"]["policyRevision"]
-    assert manifest["provenance"]["toolPolicy"]["revisions"] == {
-        "catalogRevision": tool_policy["catalogRevision"],
-        "policyRevision": tool_policy["policyRevision"],
-    }

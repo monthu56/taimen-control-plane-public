@@ -5,7 +5,7 @@ from collections.abc import Sequence
 from datetime import datetime
 from typing import Annotated, Any, Literal
 
-from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, model_validator
+from pydantic import AfterValidator, AwareDatetime, BaseModel, ConfigDict, Field, model_validator
 from pydantic.alias_generators import to_camel
 
 from control_plane.domain.work_item import MAX_COMMENT_BODY_LENGTH
@@ -809,6 +809,9 @@ class RunStartRequest(ApiModel):
     metadata: dict[str, Any] = Field(default_factory=dict)
     max_duration_seconds: int | None = Field(default=None, gt=0)
     max_actions: int | None = Field(default=None, gt=0)
+    # CP-ADR-0073 §7: the agent revision the executor runs by. Required from a
+    # principal linked to an agent, refused from anyone else [plan D005].
+    agent_revision_id: uuid.UUID | None = None
 
 
 class RunSucceedRequest(ApiModel):
@@ -911,49 +914,6 @@ class RunActionFinishRequest(ApiModel):
     status: str
     external_reference: str | None = Field(default=None, max_length=2000)
     metadata: dict[str, Any] = Field(default_factory=dict)
-
-
-class ManifestCompileRequest(ApiModel):
-    """What a harness may DECLARE about its own runtime (HRS-2).
-
-    Identity, project policy, tool policy and budgets are absent by design:
-    they are computed by the server. Extra keys are ACCEPTED here and forwarded
-    to the domain validator on purpose — that way an attempt to supply
-    ``identity`` is answered with ``server_authoritative_section``, which says
-    what the rule is, instead of a generic "unexpected field".
-    """
-
-    model_config = ConfigDict(
-        alias_generator=to_camel,
-        populate_by_name=True,
-        from_attributes=True,
-        extra="allow",
-    )
-
-    reason: str = Field(default="recompile", pattern=r"^(recompile|provider_fallback)$")
-    worker_profile: dict[str, Any] | None = None
-    execution_backend: dict[str, Any] | None = None
-    model: dict[str, Any] | None = None
-    redaction: dict[str, Any] | None = None
-    memory: dict[str, Any] | None = None
-
-    def declared_sections(self) -> dict[str, Any]:
-        declared = {
-            "workerProfile": self.worker_profile,
-            "executionBackend": self.execution_backend,
-            "model": self.model,
-            "redaction": self.redaction,
-        }
-        return {
-            **(self.model_extra or {}),
-            **{key: value for key, value in declared.items() if value is not None},
-        }
-
-
-class ManifestEphemeralRequest(ApiModel):
-    kind: str = Field(pattern=r"^(steering|warning|budget_warning|note)$")
-    summary: str = Field(min_length=1, max_length=500)
-    data: dict[str, Any] = Field(default_factory=dict)
 
 
 class ArtifactCreateRequest(ApiModel):
@@ -1147,6 +1107,9 @@ class RunOut(ApiModel):
     # CP-ADR-0066: the executor instructions the run was started under.
     instructions_hash: str | None = None
     instructions_refs: dict[str, Any] | None = None
+    # CP-ADR-0073 §7: the agent revision the run went by; null for executors
+    # that are not registered agents.
+    agent_revision_id: uuid.UUID | None = None
     version: int
     created_at: datetime
     updated_at: datetime
@@ -1723,3 +1686,306 @@ class RuleEvaluationOut(ApiModel):
     next_check_at: datetime | None
     created_at: datetime
     updated_at: datetime
+
+
+# --- declarative agents: registry (CP-ADR-0073) ------------------------------
+#
+# The contract lands before the implementation (constitution art. V): the
+# routes answer 501 until declarative-agents D005. ``AgentSpec`` describes the
+# same object as ``$defs.agentSpec`` of the superproject catalog schema
+# (``packages/schema/v1/object.schema.json``); a contract test keeps the two
+# together. The core validates the shape of every section; the executor
+# parameters are data of the executor kind (``$defs.agentExecutors``) and pass
+# through uninterpreted.
+
+AGENT_KEY_PATTERN = r"^[a-z0-9][a-z0-9-]*$"
+_AGENT_KEY_FIELD = Field(min_length=1, max_length=63, pattern=AGENT_KEY_PATTERN)
+_AGENT_DIRECTORY = Annotated[str, Field(pattern=r"^[a-z0-9][a-z0-9._-]*$")]
+_AGENT_REF = Annotated[str, Field(min_length=1, max_length=500)]
+_AGENT_NODE_LABEL = Annotated[
+    str, Field(max_length=100, pattern=r"^[a-z0-9][a-z0-9.-]*(=[a-zA-Z0-9._-]+)?$")
+]
+_AGENT_SECRET_NAME = Annotated[str, Field(pattern=r"^[a-z0-9][a-z0-9-]{0,62}$")]
+# Id of the tenant's object, or ${VARIABLE} of the installation.
+_AGENT_TOPOLOGY = Annotated[str, Field(min_length=1, max_length=200)]
+_AGENT_ITEMS = 200
+AGENT_INSTRUCTIONS_MAX_CHARS = 65_536
+AGENT_MAX_REPLICAS = 20
+
+AgentStateValue = Literal["running", "stopped"]
+AgentPhaseValue = Literal[
+    "pending", "running", "waiting_for_node", "crash_looping", "node_unavailable", "stopped"
+]
+
+
+def _unique_items(items: list[str]) -> list[str]:
+    if len(set(items)) != len(items):
+        raise ValueError("items must be unique")
+    return items
+
+
+# An IAM scope: ``<audience>:<action>``, as ``control-plane:read`` or ``memory:write``.
+_AGENT_IAM_SCOPE = Annotated[
+    str, Field(max_length=200, pattern=r"^[a-z][a-z0-9-]*:[a-z][a-z0-9-]*$")
+]
+
+
+class AgentIamSpec(ApiModel):
+    """The IAM part of the identity: data for whoever issues the account, not the core."""
+
+    audiences: Annotated[
+        list[Annotated[str, Field(min_length=1, max_length=100)]],
+        Field(min_length=1, max_length=20),
+        AfterValidator(_unique_items),
+    ]
+    scope_ceiling: Annotated[
+        list[_AGENT_IAM_SCOPE],
+        Field(min_length=1, max_length=50),
+        AfterValidator(_unique_items),
+    ]
+
+
+class AgentIdentitySpec(ApiModel):
+    """Who the agent is: the core derives its principal and binding from this."""
+
+    kind: Literal["agent", "service"]
+    roles: list[Annotated[str, _SLUG_FIELD]] = Field(default_factory=list, max_length=_AGENT_ITEMS)
+    permissions: list[Annotated[str, Field(pattern=r"^[a-z_]+(\.[a-z_]+)+$")]] = Field(
+        min_length=1, max_length=_AGENT_ITEMS
+    )
+    capabilities: list[Annotated[str, Field(min_length=1, max_length=200)]] = Field(
+        default_factory=list, max_length=_AGENT_ITEMS
+    )
+    iam: AgentIamSpec | None = Field(
+        default=None,
+        description="Audiences and scope ceiling of the IAM account; stored, not interpreted",
+    )
+
+
+class AgentWorkSpec(ApiModel):
+    """Which work the agent takes: the same selection a runner does today."""
+
+    workspace: _AGENT_TOPOLOGY | None = None
+    project: _AGENT_TOPOLOGY | None = None
+    include_subprojects: bool = False
+    only_assigned: bool = True
+    task_types: list[Annotated[str, _TYPE_KEY_FIELD]] = Field(
+        default_factory=list,
+        max_length=_AGENT_ITEMS,
+        description="Task type keys; empty means any type",
+    )
+
+
+class AgentExecutorSpec(ApiModel):
+    """How the agent executes. ``kind`` is a string, never a vendor enum (art. II)."""
+
+    kind: str = Field(min_length=1, max_length=63, pattern=r"^[a-z][a-z0-9-]*$")
+    params: dict[str, Any] = Field(
+        default_factory=dict,
+        description="Parameters of the executor kind; checked by its schema, not by the core",
+    )
+    instructions: str = Field(default="", max_length=AGENT_INSTRUCTIONS_MAX_CHARS)
+
+
+class AgentReviewSpec(ApiModel):
+    """How the branch of a task goes to review."""
+
+    mode: Literal["human", "agent", "none"] | None = None
+    task_type: Annotated[str, _TYPE_KEY_FIELD] | None = None
+    task_types: list[Annotated[str, _TYPE_KEY_FIELD]] = Field(
+        default_factory=list,
+        max_length=_AGENT_ITEMS,
+        description="Task types whose branches get a review",
+    )
+    reviewer: _AGENT_TOPOLOGY | None = None
+    base: str | None = Field(default=None, min_length=1, max_length=200)
+
+
+class AgentWorkingCopySpec(ApiModel):
+    """The working copy of a task (TAI-ADR-0016 p.5): repository, neighbours, publishing."""
+
+    repository: _AGENT_REF
+    directory: _AGENT_DIRECTORY | None = None
+    base_ref: str | None = Field(default=None, min_length=1, max_length=200)
+    neighbours: dict[_AGENT_DIRECTORY, _AGENT_REF] = Field(
+        default_factory=dict,
+        description="Neighbour repositories at the revisions the superproject pins",
+    )
+    superproject: _AGENT_REF | None = None
+    publish: bool = True
+    review: AgentReviewSpec | None = None
+
+
+class AgentSkillsSpec(ApiModel):
+    """Which skills the agent executes itself (CP-ADR-0056) and where they may go."""
+
+    protocols: list[Literal["local", "http", "mcp"]] = Field(default_factory=list)
+    local: list[Annotated[str, Field(pattern=r"^[A-Za-z_][\w.]*(:[A-Za-z_]\w*)?$")]] = Field(
+        default_factory=list,
+        max_length=_AGENT_ITEMS,
+        description="Allowed entry points or packages",
+    )
+    http_origins: list[_AGENT_REF] = Field(default_factory=list, max_length=_AGENT_ITEMS)
+    mcp_origins: list[_AGENT_REF] = Field(default_factory=list, max_length=_AGENT_ITEMS)
+    audiences: list[Annotated[str, Field(min_length=1, max_length=100)]] = Field(
+        default_factory=list,
+        max_length=_AGENT_ITEMS,
+        description="IAM audiences the skills get a token for",
+    )
+    concurrency: int | None = Field(default=None, ge=1, le=32)
+
+
+class AgentResourcesSpec(ApiModel):
+    cpus: int | float | None = Field(default=None, gt=0, le=64)
+    memory_mb: int | None = Field(default=None, ge=64, le=262_144)
+
+
+class AgentPlacementSpec(ApiModel):
+    """Where the agent may run. The core stores it; the placement service reads it."""
+
+    requires: list[_AGENT_NODE_LABEL] = Field(
+        default_factory=list,
+        max_length=_AGENT_ITEMS,
+        description="Labels a node must carry: name or name=value",
+    )
+    secrets: list[_AGENT_SECRET_NAME] = Field(
+        default_factory=list,
+        max_length=_AGENT_ITEMS,
+        description="Names of node secrets; a value never reaches the core (FR-008)",
+    )
+    resources: AgentResourcesSpec | None = None
+    replicas: int = Field(
+        default=1, ge=0, le=AGENT_MAX_REPLICAS, description="Desired state, not revision"
+    )
+    drain_seconds: int = Field(default=14_400, ge=0, le=14_400)
+
+
+class AgentSpec(ApiModel):
+    """``spec`` of a catalog object of kind ``Agent`` (TAI-ADR-0052)."""
+
+    display_name: str = Field(min_length=1, max_length=200)
+    description: str | None = Field(default=None, max_length=2000)
+    identity: AgentIdentitySpec
+    work: AgentWorkSpec | None = Field(
+        default=None, description="Absent for identities that take no work (placement none)"
+    )
+    executor: AgentExecutorSpec | None = None
+    working_copy: AgentWorkingCopySpec | None = None
+    skills: AgentSkillsSpec | None = None
+    placement: AgentPlacementSpec | Literal["none"] | None = Field(
+        default=None, description="Absent means placed with the defaults; none means no process"
+    )
+    state: AgentStateValue = Field(default="running", description="Desired state, not revision")
+
+    @model_validator(mode="after")
+    def _placed_agent_executes(self) -> "AgentSpec":
+        if self.placement != "none" and self.executor is None:
+            raise ValueError("a placed agent needs an executor")
+        return self
+
+
+class AgentPublishRequest(ApiModel):
+    """``POST /agents`` and ``POST /agents:validate``: a catalog object without its envelope."""
+
+    key: str = _AGENT_KEY_FIELD
+    spec: AgentSpec
+
+
+class AgentStateUpdateRequest(ApiModel):
+    state: AgentStateValue | None = None
+    replicas: int | None = Field(default=None, ge=0, le=AGENT_MAX_REPLICAS)
+
+    @model_validator(mode="after")
+    def _something_to_change(self) -> "AgentStateUpdateRequest":
+        if self.state is None and self.replicas is None:
+            raise ValueError("state or replicas is required")
+        return self
+
+
+class AgentRetireRequest(ApiModel):
+    reason: str = Field(min_length=1, max_length=500)
+
+
+class AgentIdentityLinkRequest(IamIdentitySpec):
+    """The IAM identity the placement service created for the agent (§6)."""
+
+
+class AgentStatusReason(ApiModel):
+    code: str = Field(min_length=1, max_length=64, pattern=r"^[a-z][a-z0-9_]*$")
+    message: str = Field(default="", max_length=500)
+
+
+class AgentInstances(ApiModel):
+    desired: int = Field(ge=0)
+    ready: int = Field(ge=0)
+
+
+class AgentStatusReport(ApiModel):
+    """``PUT /agents/{key}/status``: what actually runs, as of ``observedAt``."""
+
+    phase: AgentPhaseValue
+    reason: AgentStatusReason | None = None
+    observed_revision: int | None = Field(default=None, ge=1)
+    node: str | None = Field(default=None, min_length=1, max_length=200)
+    instances: AgentInstances
+    observed_at: AwareDatetime
+
+
+class AgentRevisionOut(ApiModel):
+    id: uuid.UUID
+    agent_id: uuid.UUID
+    agent_key: str
+    revision: int
+    spec: dict[str, Any] = Field(
+        description="The published spec as applied, without state and placement.replicas"
+    )
+    spec_hash: str = Field(description="sha256:<hex> of the canonical JSON of spec")
+    created_by: uuid.UUID
+    created_at: datetime
+
+
+class AgentOut(ApiModel):
+    id: uuid.UUID
+    tenant_id: uuid.UUID
+    key: str
+    display_name: str
+    status: Literal["active", "retired"]
+    state: AgentStateValue
+    replicas: int
+    current_revision: int
+    revision: AgentRevisionOut = Field(
+        description="The current revision, or the one addressed by key@revision"
+    )
+    principal_id: uuid.UUID | None = Field(
+        description="Principal of the agent once its identity is linked (§6)"
+    )
+    workspace_id: uuid.UUID | None
+    retired_at: datetime | None
+    retired_by: uuid.UUID | None
+    version: int
+    created_at: datetime
+    updated_at: datetime
+
+
+class AgentValidationOut(ApiModel):
+    """``POST /agents:validate`` on success; a failure is the error ``POST /agents`` returns."""
+
+    key: str
+    spec_hash: str
+    current_revision: int | None
+    would_create_revision: bool
+    would_change_state: bool
+
+
+class AgentStatusOut(ApiModel):
+    agent_key: str
+    phase: AgentPhaseValue | Literal["unknown"] = Field(
+        description="unknown until the first report; stays so for placement none"
+    )
+    reason: AgentStatusReason | None
+    observed_revision: int | None
+    node: str | None
+    instances: AgentInstances | None
+    observed_at: datetime | None
+    reported_by: uuid.UUID | None
+    updated_at: datetime | None

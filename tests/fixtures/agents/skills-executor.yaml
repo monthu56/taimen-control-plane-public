@@ -1,0 +1,21 @@
+# skills: no coding agent, only the skills it executes itself.
+apiVersion: taimen.ai/v1
+kind: Agent
+key: skills-executor
+spec:
+  displayName: Skills executor
+  identity:
+    kind: agent
+    permissions:
+    - skills.execute
+  executor:
+    kind: skills
+  skills:
+    protocols:
+    - local
+    local:
+    - taimen_selfdev
+    concurrency: 2
+  placement:
+    replicas: 1
+  state: stopped

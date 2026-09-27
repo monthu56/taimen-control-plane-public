@@ -184,27 +184,12 @@ claim -> start-run -> (checkpoints / actions / artifacts)* -> succeed | fail | s
 несоответствие → `409 stale_claim`. **Получив `stale_claim`, harness обязан
 прекратить авторитетные записи** и пересобрать контекст.
 
-### Effective Harness Manifest (v0.7)
+### Конфигурация исполнителя
 
-Вместе с run сервер компилирует его манифест — immutable снимок effective
-runtime configuration (ADR-0043). Harness ничего для этого не делает: версия 1
-появляется в транзакции `start-run`.
-
-- `GET /runs/{id}/harness-manifest` (`?version=N`) — `base` (frozen, хеширован),
-  `provenance` (откуда каждая секция и почему виден каждый tool), `captured`
-  (operational cursor + **ссылка** на Memory Context Pack) и `ephemeral`.
-- `POST /runs/{id}/harness-manifest:compile` — пересборка. Harness может
-  задекларировать только `workerProfile`, `executionBackend`, `model`,
-  `redaction` и ссылку `memory`; `identity`, `run`, `projectPolicy`,
-  `toolPolicy`, `budgets` считает сервер, попытка их передать →
-  `422 server_authoritative_section`. Ответ `200` — конфигурация не менялась,
-  новая версия не создана; `201` — создана.
-- Provider fallback обязателен к записи: `reason=provider_fallback` и
-  `model.attempt` больше активного, иначе `422 invalid_fallback_attempt`.
-- `POST /runs/{id}/harness-manifest/ephemeral` — steering/warning marker.
-  Он не меняет frozen base и не участвует в хешах.
-- В декларациях запрещены secrets, transcript/prompt-подобные поля и абсолютные
-  локальные пути (`422 secret_material_rejected` / `unsafe_manifest_payload`).
+Манифесты харнесса (ADR-0043, v0.7) удалены: конфигурация исполнителя — ревизия
+агента в реестре ([ADR-0073](adr/0073-agent-registry.md)), прогон называет её
+в `agentRevisionId` при `start-run`. Маршрутов `/runs/{id}/harness-manifest*`
+больше нет.
 
 ## 6. Heartbeats
 

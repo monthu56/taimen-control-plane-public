@@ -1,0 +1,21 @@
+# codex: a reviewer, parameters of its own executor kind.
+apiVersion: taimen.ai/v1
+kind: Agent
+key: reviewer
+spec:
+  displayName: Code reviewer
+  identity:
+    kind: agent
+    permissions:
+    - tasks.read
+    - tasks.write
+  executor:
+    kind: codex
+    params:
+      sandbox: read-only
+      credentialClass: subscription
+  placement:
+    requires:
+    - codex
+    secrets:
+    - codex-auth

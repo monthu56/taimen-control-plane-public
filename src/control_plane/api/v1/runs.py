@@ -12,8 +12,6 @@ from control_plane.api.v1.schemas import (
     ERROR_RESPONSES,
     CheckpointCreateRequest,
     CheckpointOut,
-    ManifestCompileRequest,
-    ManifestEphemeralRequest,
     PageOut,
     RunActionCreateRequest,
     RunActionFinishRequest,
@@ -35,7 +33,6 @@ from control_plane.api.v1.schemas import (
 from control_plane.api.v1.task_bodies import task_body
 from control_plane.api.write_flow import execute_write
 from control_plane.application.commands import execution as execution_commands
-from control_plane.application.commands import manifests as manifest_commands
 from control_plane.application.commands import run_controls as control_commands
 from control_plane.application.commands import runs as commands
 from control_plane.application.queries import execution as queries
@@ -228,124 +225,6 @@ async def create_checkpoint(
             db, ctx, run_id=run_id, kind=payload.kind, data=payload.data
         )
         return 201, dump(CheckpointOut, checkpoint)
-
-    return await execute_write(
-        request,
-        ctx,
-        settings,
-        session_factory,
-        canonical_body=payload.model_dump_json(exclude_unset=True),
-        executor=executor,
-    )
-
-
-@router.get(
-    "/runs/{run_id}/harness-manifest",
-    responses=ERROR_RESPONSES,
-    summary="Effective Harness Manifest of a run (frozen base, provenance, captured state)",
-)
-async def get_harness_manifest(
-    run_id: uuid.UUID,
-    ctx: AuthDep,
-    db: DbDep,
-    version: int | None = Query(default=None, ge=1),
-) -> JSONResponse:
-    return JSONResponse(await queries.get_run_manifest(db, ctx, run_id, version=version))
-
-
-@router.get(
-    "/runs/{run_id}/harness-manifests",
-    response_model=PageOut,
-    responses=ERROR_RESPONSES,
-    summary="Manifest version history of a run (newest first)",
-)
-async def list_harness_manifests(run_id: uuid.UUID, ctx: AuthDep, db: DbDep) -> JSONResponse:
-    return JSONResponse(page_body(await queries.list_run_manifests(db, ctx, run_id), None))
-
-
-@router.post(
-    "/runs/{run_id}/harness-manifest:compile",
-    responses=ERROR_RESPONSES,
-    summary="Recompile the manifest; a new version appears only if the frozen base changed",
-)
-async def compile_harness_manifest(
-    run_id: uuid.UUID,
-    payload: ManifestCompileRequest,
-    request: Request,
-    ctx: AuthDep,
-    settings: SettingsDep,
-    session_factory: SessionFactoryDep,
-) -> JSONResponse:
-    async def executor(db: AsyncSession) -> tuple[int, dict[str, object]]:
-        result = await manifest_commands.compile_run_manifest(
-            db,
-            ctx,
-            run_id=run_id,
-            reason=payload.reason,
-            declared=payload.declared_sections(),
-            memory_reference=payload.memory,
-        )
-        manifest = result.manifest
-        # 201 only when a version was actually appended; an unchanged
-        # configuration is a successful no-op, not a new piece of evidence.
-        return (201 if result.created else 200), {
-            "created": result.created,
-            "manifest": {
-                "id": str(manifest.id),
-                "runId": str(manifest.run_id),
-                "version": manifest.version,
-                "baseHash": manifest.base_hash,
-                "snapshotHash": manifest.snapshot_hash,
-                "compileReason": manifest.compile_reason,
-                "modelAttempt": manifest.model_attempt,
-                "supersedesVersion": manifest.supersedes_version,
-                "createdAt": manifest.created_at.isoformat(),
-            },
-        }
-
-    return await execute_write(
-        request,
-        ctx,
-        settings,
-        session_factory,
-        canonical_body=payload.model_dump_json(exclude_unset=True),
-        executor=executor,
-    )
-
-
-@router.post(
-    "/runs/{run_id}/harness-manifest/ephemeral",
-    status_code=201,
-    responses=ERROR_RESPONSES,
-    summary="Record an ephemeral steering/warning marker (never changes the frozen base)",
-)
-async def record_manifest_ephemeral(
-    run_id: uuid.UUID,
-    payload: ManifestEphemeralRequest,
-    request: Request,
-    ctx: AuthDep,
-    settings: SettingsDep,
-    session_factory: SessionFactoryDep,
-) -> JSONResponse:
-    async def executor(db: AsyncSession) -> tuple[int, dict[str, object]]:
-        record = await manifest_commands.record_manifest_ephemeral(
-            db,
-            ctx,
-            run_id=run_id,
-            kind=payload.kind,
-            summary=payload.summary,
-            data=payload.data,
-        )
-        return 201, {
-            "id": str(record.id),
-            "runId": str(record.run_id),
-            "manifestId": str(record.manifest_id),
-            "seq": record.seq,
-            "kind": record.kind,
-            "summary": record.summary,
-            "data": record.data,
-            "createdAt": record.created_at.isoformat(),
-        }
 
     return await execute_write(
         request,

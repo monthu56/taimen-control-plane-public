@@ -1337,27 +1337,6 @@ async def cp_get_run_context(run_id: str | None = None) -> str:
 
 @mcp.tool(
     description=(
-        "Effective Harness Manifest of a run: the immutable snapshot of the "
-        "runtime configuration that was in force — identity, project policy, "
-        "which tools were visible and why, budgets, model and redaction policy, "
-        "each with its provenance. 'base' is frozen and hashed; 'captured' holds "
-        "the operational cursor and the memory pack reference; 'ephemeral' holds "
-        "temporary steering/warnings and never changes the frozen base."
-    ),
-    annotations=READ_ONLY,
-)
-async def cp_harness_manifest(run_id: str | None = None, version: int | None = None) -> str:
-    target = run_id or STATE.run_id
-    if target is None:
-        return _dump({"error": "no_run", "message": "No run in progress."})
-    try:
-        return _dump(await _client().get_harness_manifest(target, version=version))
-    except ControlPlaneError as exc:
-        return _error(exc)
-
-
-@mcp.tool(
-    description=(
         "Search the tools this principal may actually use, instead of loading a whole "
         "catalog into context. Returns a bounded page (name, version, protocol, one-line "
         "summary) plus the catalog/policy revisions it was computed from; an empty query "

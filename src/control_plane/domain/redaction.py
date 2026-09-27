@@ -1,8 +1,8 @@
 """What must never reach durable state, in one place.
 
-Handoff checkpoints, harness manifests and any future durable payload written
-by a harness share the same prohibition list: no credentials, no transcripts or
-raw prompts, no chain-of-thought, no machine-local absolute paths. Keeping the
+Handoff checkpoints and any future durable payload written by a harness share
+the same prohibition list: no credentials, no transcripts or raw prompts, no
+chain-of-thought, no machine-local absolute paths. Keeping the
 patterns in the domain layer means the list is defined once and every writer is
 guarded by the same rule rather than by a copy of it.
 
@@ -107,8 +107,8 @@ def reject_unsafe_durable_payload(
     """Raise if ``value`` carries a forbidden key or a local absolute path.
 
     ``code`` and ``subject`` keep each caller's error contract stable: the
-    handoff flow reports ``unsafe_handoff_payload`` with its own wording, the
-    manifest flow reports its own, and both are checking the same list.
+    handoff flow reports ``unsafe_handoff_payload`` with its own wording, other
+    writers report their own, and all of them check the same list.
     """
     if key and SENSITIVE_KEY_PATTERN.search(key):
         raise ValidationError(code, f"{subject} field '{key}' is not allowed")

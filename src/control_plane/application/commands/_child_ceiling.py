@@ -1,7 +1,7 @@
 """Enforcement of the child ceiling recorded on a handle (HRS-7).
 
 Kept in its own module for the same reason ``_claim_release`` is: the run,
-artifact, execution and manifest commands all need it, and none of them should
+artifact and execution commands all need it, and none of them should
 have to import each other to get it.
 
 The rule is one line of algebra — the effective permissions of work done under
@@ -10,8 +10,8 @@ holds is structural: the ceiling was written at launch from the *parent's*
 ceiling, so a child holding a stronger API key still cannot exceed its parent.
 
 Skills are NOT narrowed here: that dimension travels inside the effective tool
-policy (HRS-3), so search, describe, the manifest and the invocation gate all
-narrow through one decision instead of four.
+policy (HRS-3), so search, describe and the invocation gate all narrow
+through one decision instead of three.
 """
 
 import uuid
