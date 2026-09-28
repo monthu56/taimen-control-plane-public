@@ -1,5 +1,5 @@
 {
-  "$comment": "Pinned contract of the Memory Service graph reads the core makes (CP-ADR-0064). paths/schemas are copied from memory-service app.openapi(); typedRequest is hand-extracted from context/typed.py; packages/namespaceKinds are answers produced by memory-service code (parse_pack(...).to_payload(), KindCatalog.build(...).to_payload()) for the superproject's integrations/selfdev software-delivery pack. Regenerate when memory-service changes these endpoints or the pack changes.",
+  "$comment": "Pinned contract of the Memory Service graph reads the core makes (CP-ADR-0064). paths/schemas are copied from memory-service app.openapi(); typedRequest is hand-extracted from context/typed.py; packages/namespaceKinds are answers produced by memory-service code (parse_pack(...).to_payload(), KindCatalog.build(...).to_payload()) for the superproject's integrations/selfdev software-delivery pack. Regenerate when memory-service changes these endpoints or the pack changes. paths /api/memory/entities:query, schemas.EntitiesQueryIn (WhereClause in $defs, refs rewritten to #/$defs/) and entitiesQuery.EntitiesQueryResult (EntityItem in $defs) are copied from memory-service feature/company-knowledge 7492f04 app.openapi() (K030, MEM-ADR-020 amendment: the entity list); the value rules of its where conditions are those of typedRequest.properties.where (the same context/where.parse_where).",
   "memoryService": {
     "repository": "monthu56/taimen-memory-service",
     "branch": "master",
@@ -29,6 +29,15 @@
           "version"
         ]
       }
+    },
+    "/api/memory/entities:query": {
+      "post": {
+        "requestBody": "EntitiesQueryIn",
+        "responses": [
+          "200",
+          "422"
+        ]
+      }
     }
   },
   "schemas": {
@@ -51,10 +60,139 @@
       "type": "object",
       "title": "ContextIn",
       "description": "ContextRequest + scope чтения (namespace(s) — как у /api/brain)."
+    },
+    "EntitiesQueryIn": {
+      "properties": {
+        "kinds": {
+          "items": {
+            "type": "string",
+            "pattern": "^[A-Za-z][A-Za-z0-9_]{0,62}$"
+          },
+          "type": "array",
+          "maxItems": 20,
+          "minItems": 1,
+          "title": "Kinds",
+          "description": "Виды сущностей; неизвестный вид — пусто."
+        },
+        "where": {
+          "anyOf": [
+            {
+              "items": {
+                "$ref": "#/$defs/WhereClause"
+              },
+              "type": "array",
+              "maxItems": 20
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Where",
+          "description": "Условия на атрибуты версии на as_of (по «И»)."
+        },
+        "asOf": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Asof",
+          "description": "Момент ISO 8601; пусто — открытые сейчас."
+        },
+        "limit": {
+          "type": "integer",
+          "maximum": 500.0,
+          "minimum": 1.0,
+          "title": "Limit",
+          "default": 100
+        },
+        "cursor": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Cursor",
+          "description": "nextCursor предыдущей страницы."
+        },
+        "namespaces": {
+          "anyOf": [
+            {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Namespaces",
+          "description": "Namespaces чтения (то же, что scope.namespaces)."
+        },
+        "scope": {
+          "anyOf": [
+            {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Scope"
+        }
+      },
+      "additionalProperties": true,
+      "type": "object",
+      "required": [
+        "kinds"
+      ],
+      "title": "EntitiesQueryIn",
+      "description": "Перечень сущностей видов с фильтрами на as_of (журнал сверки снимков).",
+      "$defs": {
+        "WhereClause": {
+          "properties": {
+            "attr": {
+              "type": "string",
+              "pattern": "^[A-Za-z_][A-Za-z0-9_]{0,63}$",
+              "title": "Attr"
+            },
+            "op": {
+              "type": "string",
+              "enum": [
+                "eq",
+                "in",
+                "prefix",
+                "lte",
+                "gte",
+                "exists"
+              ],
+              "title": "Op"
+            },
+            "value": {
+              "title": "Value"
+            }
+          },
+          "type": "object",
+          "required": [
+            "attr",
+            "op"
+          ],
+          "title": "WhereClause",
+          "description": "Условие на атрибут сущности (версия на as_of); условия списка — по «И».\n\n``prefix`` — по сегментам через точку: ``62.01`` совпадает с ``62.01.11``, но не с\n``62.011``. ``lte``/``gte`` — число или дата ISO 8601, включительно. ``exists`` —\n``value: bool`` (по умолчанию true). Атрибут-список выполняет условие, если его\nвыполняет хоть один элемент."
+        }
+      }
     }
   },
   "typedRequest": {
-    "$comment": "Hand-extracted from platform_memory.context.typed.TypedContextRequest.from_payload (the rules the typed route applies to the body); the route also reads scope (ContextIn), allowedNamespaces/allowedScopes (server/app.visibility).",
+    "$comment": "Hand-extracted from platform_memory.context.typed.TypedContextRequest.from_payload (the rules the typed route applies to the body); the route also reads scope (ContextIn), allowedNamespaces/allowedScopes (server/app.visibility). where is hand-extracted from memory-service feature/company-knowledge 6841148 (K006, MEM-ADR-020 amendment 2026-09-28 §3): server/domain_schemas.TypedContextIn.where (WhereClause, at most 20) and the value rules of context/where.parse_where; additionalProperties is false on a condition, as a misspelled field would be dropped there.",
     "type": "object",
     "required": [
       "anchors",
@@ -161,6 +299,179 @@
         "type": "array",
         "items": {
           "type": "string"
+        }
+      },
+      "where": {
+        "type": "array",
+        "maxItems": 20,
+        "items": {
+          "type": "object",
+          "required": [
+            "attr",
+            "op"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "attr": {
+              "type": "string",
+              "pattern": "^[A-Za-z_][A-Za-z0-9_]{0,63}$"
+            },
+            "op": {
+              "enum": [
+                "eq",
+                "in",
+                "prefix",
+                "lte",
+                "gte",
+                "exists"
+              ]
+            },
+            "value": {}
+          },
+          "allOf": [
+            {
+              "if": {
+                "properties": {
+                  "op": {
+                    "not": {
+                      "const": "exists"
+                    }
+                  }
+                }
+              },
+              "then": {
+                "required": [
+                  "value"
+                ]
+              }
+            },
+            {
+              "if": {
+                "properties": {
+                  "op": {
+                    "const": "eq"
+                  }
+                }
+              },
+              "then": {
+                "properties": {
+                  "value": {
+                    "type": [
+                      "string",
+                      "number",
+                      "boolean"
+                    ]
+                  }
+                }
+              }
+            },
+            {
+              "if": {
+                "properties": {
+                  "op": {
+                    "const": "in"
+                  }
+                }
+              },
+              "then": {
+                "properties": {
+                  "value": {
+                    "type": "array",
+                    "minItems": 1,
+                    "maxItems": 100,
+                    "items": {
+                      "type": [
+                        "string",
+                        "number",
+                        "boolean"
+                      ]
+                    }
+                  }
+                }
+              }
+            },
+            {
+              "if": {
+                "properties": {
+                  "op": {
+                    "const": "prefix"
+                  }
+                }
+              },
+              "then": {
+                "properties": {
+                  "value": {
+                    "type": "string",
+                    "pattern": "^[^.]+(\\.[^.]+)*$"
+                  }
+                }
+              }
+            },
+            {
+              "if": {
+                "properties": {
+                  "op": {
+                    "const": "lte"
+                  }
+                }
+              },
+              "then": {
+                "properties": {
+                  "value": {
+                    "anyOf": [
+                      {
+                        "type": "number"
+                      },
+                      {
+                        "type": "string",
+                        "pattern": "^\\d{4}-\\d{2}-\\d{2}"
+                      }
+                    ]
+                  }
+                }
+              }
+            },
+            {
+              "if": {
+                "properties": {
+                  "op": {
+                    "const": "gte"
+                  }
+                }
+              },
+              "then": {
+                "properties": {
+                  "value": {
+                    "anyOf": [
+                      {
+                        "type": "number"
+                      },
+                      {
+                        "type": "string",
+                        "pattern": "^\\d{4}-\\d{2}-\\d{2}"
+                      }
+                    ]
+                  }
+                }
+              }
+            },
+            {
+              "if": {
+                "properties": {
+                  "op": {
+                    "const": "exists"
+                  }
+                }
+              },
+              "then": {
+                "properties": {
+                  "value": {
+                    "type": "boolean"
+                  }
+                }
+              }
+            }
+          ]
         }
       }
     }
@@ -323,6 +634,156 @@
         "part_of"
       ],
       "conflicts": []
+    }
+  },
+  "entitiesQuery": {
+    "memoryService": {
+      "branch": "feature/company-knowledge",
+      "commit": "7492f04"
+    },
+    "EntitiesQueryResult": {
+      "properties": {
+        "items": {
+          "items": {
+            "$ref": "#/$defs/EntityItem"
+          },
+          "type": "array",
+          "title": "Items"
+        },
+        "nextCursor": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Nextcursor"
+        },
+        "as_of": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "As Of"
+        },
+        "namespaces": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array",
+          "title": "Namespaces",
+          "default": []
+        },
+        "stats": {
+          "anyOf": [
+            {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Stats"
+        }
+      },
+      "additionalProperties": true,
+      "type": "object",
+      "required": [
+        "items",
+        "nextCursor"
+      ],
+      "title": "EntitiesQueryResult",
+      "description": "Страница перечня в порядке (kind, key, namespace); конец — nextCursor: null.",
+      "$defs": {
+        "EntityItem": {
+          "properties": {
+            "kind": {
+              "type": "string",
+              "title": "Kind"
+            },
+            "key": {
+              "type": "string",
+              "title": "Key"
+            },
+            "namespace": {
+              "type": "string",
+              "title": "Namespace"
+            },
+            "title": {
+              "type": "string",
+              "title": "Title"
+            },
+            "attributes": {
+              "additionalProperties": true,
+              "type": "object",
+              "title": "Attributes"
+            },
+            "source": {
+              "type": "string",
+              "title": "Source",
+              "description": "Источник снимка, держащий версию."
+            },
+            "scope": {
+              "type": "string",
+              "title": "Scope",
+              "description": "Scope источника снимка."
+            },
+            "snapshot_id": {
+              "type": "string",
+              "title": "Snapshot Id"
+            },
+            "source_path": {
+              "type": "string",
+              "title": "Source Path",
+              "description": "Цитата: путь/ссылка на источник версии."
+            },
+            "valid_from": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Valid From"
+            },
+            "valid_to": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Valid To"
+            }
+          },
+          "additionalProperties": true,
+          "type": "object",
+          "required": [
+            "kind",
+            "key",
+            "namespace",
+            "title",
+            "attributes",
+            "source",
+            "scope",
+            "snapshot_id",
+            "source_path"
+          ],
+          "title": "EntityItem",
+          "description": "Сущность перечня — версия, действующая на as_of."
+        }
+      }
     }
   }
 }

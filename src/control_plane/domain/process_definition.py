@@ -1018,6 +1018,7 @@ class _Checker:
             result = RECALL_RESULT
             self.anchors(here + "/anchors", body["anchors"], place)
             self.expr(here + "/query", body.get("query"), place, STRING)
+            self.where(here + "/where", body.get("where"), place)
             self.blocks(here + "/onTimeout", body.get("onTimeout"), place, step_id)
         elif kind == "remember":
             self.remember(here, body, place)
@@ -1186,6 +1187,19 @@ class _Checker:
                     "an anchor on the case node needs spec.memory: the process projects no case",
                 )
             self.expr(here + "/key", anchor.get("key"), place, KEY)
+
+    def where(self, path: str, conditions: Any, place: _Place) -> None:
+        """``recall.where``: each value is CEL (a list of CEL for ``in``); literals stay."""
+        for index, condition in enumerate(conditions or ()):
+            here = f"{path}/{index}/value"
+            value = condition.get("value")
+            if isinstance(value, list):
+                for item, text in enumerate(value):
+                    self.expr(f"{here}/{item}", text, place)
+                continue
+            op = condition["op"]
+            expect = {"in": LIST, "prefix": STRING, "exists": BOOL}.get(op)
+            self.expr(here, value, place, expect)
 
     def remember(self, path: str, body: Mapping[str, Any], place: _Place) -> None:
         entity = body.get("entity")

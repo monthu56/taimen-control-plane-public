@@ -1986,10 +1986,62 @@
         }
       }
     },
+    "knowledge.document_stored": {
+      "entityType": "workspace",
+      "description": "A knowledge base document was stored in the memory service (CP-ADR-0060, amendment 2026-09-28); its text stays out of the journal.",
+      "currentVersion": 1,
+      "versions": {
+        "1": {
+          "schema": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+            "properties": {
+              "naturalKey": {
+                "type": "string"
+              },
+              "title": {
+                "type": "string"
+              },
+              "type": {
+                "type": "string"
+              },
+              "workspaceId": {
+                "type": "string",
+                "format": "uuid"
+              },
+              "rootWorkspaceId": {
+                "type": "string",
+                "format": "uuid"
+              },
+              "namespace": {
+                "type": "string"
+              },
+              "chunkCount": {
+                "type": "integer"
+              },
+              "linkCount": {
+                "type": "integer"
+              }
+            },
+            "additionalProperties": true,
+            "required": [
+              "chunkCount",
+              "linkCount",
+              "namespace",
+              "naturalKey",
+              "rootWorkspaceId",
+              "title",
+              "type",
+              "workspaceId"
+            ]
+          }
+        }
+      }
+    },
     "knowledge.pack_registered": {
       "entityType": "knowledge_pack",
       "description": "A domain knowledge pack version was registered.",
-      "currentVersion": 1,
+      "currentVersion": 2,
       "versions": {
         "1": {
           "schema": {
@@ -2010,6 +2062,40 @@
             "additionalProperties": true,
             "required": [
               "name",
+              "status",
+              "version"
+            ]
+          }
+        },
+        "2": {
+          "changes": "scope (CP-ADR-0060, amendment 2026-09-28)",
+          "schema": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+            "properties": {
+              "name": {
+                "type": "string"
+              },
+              "version": {},
+              "status": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "scope": {
+                "type": "string",
+                "enum": [
+                  "common",
+                  "tenant"
+                ],
+                "description": "common: a shared pack; tenant: a pack of the event's tenant"
+              }
+            },
+            "additionalProperties": true,
+            "required": [
+              "name",
+              "scope",
               "status",
               "version"
             ]

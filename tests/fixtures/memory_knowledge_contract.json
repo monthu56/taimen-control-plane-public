@@ -1,5 +1,5 @@
 {
-  "$comment": "Pinned request contract of the Memory Service knowledge endpoints (CP-ADR-0060). paths/schemas are copied from memory-service app.openapi(); snapshotDocument is hand-extracted from domain/reconcile.py. Regenerate when memory-service changes these endpoints. responses.reconcile is the answer part the core reads (knowledge.changed, CP-ADR-0076 §7): ReconcileChanges of platform_memory_client.models and the example of docs/INTEGRATION.md, memory-service feature/process-packages 966dd5c (P003, MEM-ADR-020 amendment).",
+  "$comment": "Pinned request contract of the Memory Service knowledge endpoints (CP-ADR-0060). paths/schemas are copied from memory-service app.openapi(); snapshotDocument is hand-extracted from domain/reconcile.py. Regenerate when memory-service changes these endpoints. responses.reconcile is the answer part the core reads (knowledge.changed, CP-ADR-0076 §7): ReconcileChanges of platform_memory_client.models and the example of docs/INTEGRATION.md, memory-service feature/process-packages 966dd5c (P003, MEM-ADR-020 amendment). schemas.ReconcileIn (dryRun, expectedState), paths reconcile 409 and responses.reconcileState (the plan fields the preview relies on and the 409 of a moved state) are from memory-service feature/company-knowledge c534146 (K004, MEM-ADR-020 amendment 2026-09-28). schemas.PackIn (with its $defs, refs rewritten to #/$defs/) and responses.packages (the 409 body of a tenant pack name clash) are from memory-service feature/company-knowledge 038496d (K007, tenant packs).",
   "memoryService": {
     "repository": "monthu56/taimen-memory-service",
     "branch": "master",
@@ -11,6 +11,7 @@
         "requestBody": "ReconcileIn",
         "responses": [
           "200",
+          "409",
           "422"
         ]
       }
@@ -20,6 +21,9 @@
         "requestBody": "PackIn",
         "responses": [
           "201",
+          "200",
+          "409",
+          "501",
           "422"
         ]
       }
@@ -61,12 +65,31 @@
             }
           ],
           "title": "Scopes"
+        },
+        "dryRun": {
+          "type": "boolean",
+          "title": "Dryrun",
+          "description": "Построить план сверки без записи: счётчики, changes, conflicts, stateToken.",
+          "default": false
+        },
+        "expectedState": {
+          "anyOf": [
+            {
+              "type": "string",
+              "maxLength": 128
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Expectedstate",
+          "description": "stateToken плана: применить, только если состояние пары (source, scope) с тех пор не менялось; иначе 409 snapshot_stale."
         }
       },
       "additionalProperties": true,
       "type": "object",
       "title": "ReconcileIn",
-      "description": "Документ снимка как есть (формат SNAPSHOT.md пакета) + namespace и scopes записи.\n\nПоля снимка (``pack, source, scope, snapshotId, observedAt, entities, relations``)\nвалидирует ``domain.reconcile.parse_snapshot``. ``scope`` здесь — строка снимка\n(часть источника), а не scope namespace: namespace передаётся полем ``namespace``\nили query-параметром ``?namespace=``. ``scopes`` — scopes видимости (MEM-ADR-019),\nкоторые ядро выводит из задачи."
+      "description": "Документ снимка как есть (формат SNAPSHOT.md пакета) + namespace и scopes записи.\n\nПоля снимка (``pack, source, scope, snapshotId, observedAt, entities, relations``)\nвалидирует ``domain.reconcile.parse_snapshot``. ``scope`` здесь — строка снимка\n(часть источника), а не scope namespace: namespace передаётся полем ``namespace``\nили query-параметром ``?namespace=``. ``scopes`` — scopes видимости (MEM-ADR-019),\nкоторые ядро выводит из задачи. ``dryRun`` и ``expectedState`` — предпросмотр и\nприменение по состоянию (амендмент 2026-09-28); в документ снимка не входят."
     },
     "PackIn": {
       "properties": {
@@ -87,6 +110,73 @@
             }
           ],
           "title": "Version"
+        },
+        "description": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Description"
+        },
+        "kinds": {
+          "anyOf": [
+            {
+              "items": {
+                "$ref": "#/$defs/KindSpecIn"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Kinds"
+        },
+        "relations": {
+          "anyOf": [
+            {
+              "items": {
+                "$ref": "#/$defs/RelationSpecIn"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Relations"
+        },
+        "scope": {
+          "anyOf": [
+            {
+              "type": "string",
+              "enum": [
+                "common",
+                "tenant"
+              ]
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Scope",
+          "description": "common (по умолчанию) — общий пакет (service scope); tenant — пакет арендатора (право записи в namespace-владелец)."
+        },
+        "namespace": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Namespace",
+          "description": "Namespace-владелец пакета арендатора: пакет виден в нём и в namespace с префиксом '<владелец>:'."
         }
       },
       "additionalProperties": true,
@@ -96,7 +186,189 @@
         "version"
       ],
       "title": "PackIn",
-      "description": "Доменный пакет: {name, version, kinds[], relations[]} (валидирует core.kinds).\n\n``version`` — строка или число (``version: 1`` из YAML пакета приводится к ``\"1\"``)."
+      "description": "Доменный пакет: {name, version, kinds[], relations[]} (валидирует core.kinds).\n\n``version`` — строка или число (``version: 1`` из YAML пакета приводится к ``\"1\"``).\n``scope: tenant`` + ``namespace`` — пакет арендатора, видимый только в namespace\nвладельца и под ним (амендмент 2026-09-28); без ``scope`` — общий пакет.",
+      "$defs": {
+        "KindSpecIn": {
+          "properties": {
+            "kind": {
+              "type": "string",
+              "pattern": "^[a-z][a-z0-9_]{0,62}$",
+              "title": "Kind"
+            },
+            "naturalKey": {
+              "anyOf": [
+                {
+                  "additionalProperties": true,
+                  "type": "object"
+                },
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Naturalkey",
+              "description": "JSON Schema строки ключа или шаблон с плейсхолдерами <name> / {name}."
+            },
+            "aliases": {
+              "anyOf": [
+                {
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": "array"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Aliases",
+              "description": "Шаблоны форм ключа."
+            },
+            "kindAliases": {
+              "anyOf": [
+                {
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": "array"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Kindaliases",
+              "description": "Синонимы имени вида."
+            },
+            "idPatterns": {
+              "anyOf": [
+                {
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": "array"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Idpatterns",
+              "description": "Регулярные выражения идентификаторов."
+            },
+            "attributes": {
+              "anyOf": [
+                {
+                  "additionalProperties": true,
+                  "type": "object"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Attributes",
+              "description": "JSON Schema атрибутов (подмножество)."
+            },
+            "searchable": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/SearchableSpec"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Индексировать сущности вида для поиска по смыслу (амендмент 2026-09-28)."
+            }
+          },
+          "additionalProperties": true,
+          "type": "object",
+          "required": [
+            "kind"
+          ],
+          "title": "KindSpecIn",
+          "description": "Вид сущности пакета."
+        },
+        "RelationSpecIn": {
+          "properties": {
+            "relation": {
+              "type": "string",
+              "pattern": "^[a-z][a-z0-9_]{0,62}$",
+              "title": "Relation"
+            },
+            "fromKinds": {
+              "anyOf": [
+                {
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": "array"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Fromkinds"
+            },
+            "toKinds": {
+              "anyOf": [
+                {
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": "array"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Tokinds"
+            },
+            "temporal": {
+              "type": "boolean",
+              "title": "Temporal",
+              "default": true
+            },
+            "cardinality": {
+              "type": "string",
+              "enum": [
+                "one",
+                "many"
+              ],
+              "title": "Cardinality",
+              "default": "many"
+            }
+          },
+          "additionalProperties": true,
+          "type": "object",
+          "required": [
+            "relation"
+          ],
+          "title": "RelationSpecIn",
+          "description": "Связь пакета."
+        },
+        "SearchableSpec": {
+          "properties": {
+            "fields": {
+              "items": {
+                "type": "string",
+                "pattern": "^[A-Za-z_][A-Za-z0-9_]{0,63}$"
+              },
+              "type": "array",
+              "maxItems": 20,
+              "minItems": 1,
+              "title": "Fields",
+              "description": "Имена атрибутов, чьи значения входят в текст эмбеддинга сущности."
+            }
+          },
+          "type": "object",
+          "required": [
+            "fields"
+          ],
+          "title": "SearchableSpec",
+          "description": "Поиск по смыслу по сущностям вида (K005): текст — title и эти атрибуты."
+        }
+      }
     },
     "NamespaceKindsIn": {
       "properties": {
@@ -279,6 +551,148 @@
           "truncated": false
         },
         "duplicate": false
+      }
+    },
+    "reconcileState": {
+      "memoryService": {
+        "branch": "feature/company-knowledge",
+        "commit": "c534146"
+      },
+      "planFields": {
+        "dryRun": {
+          "type": "boolean",
+          "title": "Dryrun",
+          "default": false
+        },
+        "stateToken": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Statetoken",
+          "description": "Отпечаток открытых версий пары (source, scope): после записи — новое состояние, у dryRun — состояние, на котором построен план."
+        }
+      },
+      "SnapshotStaleError": {
+        "type": "object",
+        "required": [
+          "detail"
+        ],
+        "properties": {
+          "detail": {
+            "properties": {
+              "code": {
+                "type": "string",
+                "const": "snapshot_stale",
+                "title": "Code"
+              },
+              "message": {
+                "type": "string",
+                "title": "Message"
+              },
+              "expectedState": {
+                "type": "string",
+                "title": "Expectedstate"
+              },
+              "stateToken": {
+                "type": "string",
+                "title": "Statetoken",
+                "description": "Текущее состояние пары."
+              }
+            },
+            "type": "object",
+            "required": [
+              "code",
+              "message",
+              "expectedState",
+              "stateToken"
+            ],
+            "title": "SnapshotStaleDetail"
+          }
+        },
+        "title": "SnapshotStaleError"
+      },
+      "example": {
+        "dryRun": true,
+        "stateToken": "st1-0000000000000000000000000000000000000000000000000000000000000000",
+        "duplicate": false,
+        "changes": {
+          "opened": [
+            {
+              "kind": "module",
+              "key": "cp"
+            }
+          ],
+          "changed": [],
+          "closed": [],
+          "limit": 200,
+          "truncated": false
+        }
+      },
+      "staleExample": {
+        "detail": {
+          "code": "snapshot_stale",
+          "message": "state changed",
+          "expectedState": "st1-0000000000000000000000000000000000000000000000000000000000000000",
+          "stateToken": "st1-1111111111111111111111111111111111111111111111111111111111111111"
+        }
+      }
+    },
+    "packages": {
+      "memoryService": {
+        "branch": "feature/company-knowledge",
+        "commit": "038496d"
+      },
+      "conflictStatus": 409,
+      "PackScopeConflict": {
+        "properties": {
+          "detail": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/PackScopeConflictDetail"
+              },
+              {
+                "type": "string"
+              }
+            ],
+            "title": "Detail"
+          }
+        },
+        "type": "object",
+        "required": [
+          "detail"
+        ],
+        "title": "PackScopeConflict",
+        "description": "409: имя пакета арендатора, его вида или связи совпало с общим пакетом (K007).\n\n409 иммутабельности версии по-прежнему несёт ``detail``-строку.",
+        "$defs": {
+          "PackScopeConflictDetail": {
+            "properties": {
+              "code": {
+                "type": "string",
+                "enum": [
+                  "pack_name_conflict",
+                  "kind_conflict",
+                  "relation_conflict"
+                ],
+                "title": "Code"
+              },
+              "message": {
+                "type": "string",
+                "title": "Message"
+              }
+            },
+            "type": "object",
+            "required": [
+              "code",
+              "message"
+            ],
+            "title": "PackScopeConflictDetail"
+          }
+        }
       }
     }
   }

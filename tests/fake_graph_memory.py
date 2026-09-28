@@ -8,6 +8,8 @@ anchors by key or alias, as written or with ``{name}`` normalized
 (``resolve_candidates``), traversal only over edges valid at ``as_of``,
 sections by kind, ``used`` with entities, facts and snapshot ids. The pack
 registry answers are memory-service's own (``packages``/``namespaceKinds``).
+The entity list (``entities:query``, K030) pages the nodes of the kinds in
+``(kind, key)`` order with a keyset cursor, as ``context/entities`` does.
 """
 
 from __future__ import annotations
@@ -26,6 +28,9 @@ from control_plane.infrastructure.context_provider.base import ContextProviderEr
 
 CONTRACT = json.loads(
     (Path(__file__).parent / "fixtures" / "memory_graph_contract.json").read_text()
+)
+DOCUMENT_CONTRACT = json.loads(
+    (Path(__file__).parent / "fixtures" / "memory_document_contract.json").read_text()
 )
 PACK_REF = "software-delivery@1"
 # platform_memory.context.resolve: stored keys carry template parameters unnamed.
@@ -122,17 +127,20 @@ def software_delivery_graph() -> tuple[list[Node], list[Edge]]:
 
 
 class FakeGraphMemory:
-    """Memory's ``/context``, ``/context/typed`` and pack registry, in process."""
+    """Memory's ``/context``, ``/context/typed``, document ingest and pack
+    registry, in process."""
 
     def __init__(self, *, fail: str | None = None) -> None:
         nodes, edges = software_delivery_graph()
         self.nodes = {n.key: n for n in nodes}
         self.edges = edges
-        self.fail = fail  # None | "typed" | "kinds"
+        self.fail = fail  # None | "typed" | "kinds" | "entities"
         self.typed_requests: list[dict[str, Any]] = []
         self.context_requests: list[dict[str, Any]] = []
         self.kind_requests: list[str] = []
         self.package_requests: list[tuple[str, str]] = []
+        self.document_requests: list[dict[str, Any]] = []
+        self.entities_requests: list[dict[str, Any]] = []
         self._request_schema = Draft202012Validator(CONTRACT["typedRequest"])
         self._context_in = Draft202012Validator(CONTRACT["schemas"]["ContextIn"])
 
@@ -157,6 +165,44 @@ class FakeGraphMemory:
 
     async def aclose(self) -> None:
         return None
+
+    # --- knowledge base documents ---------------------------------------------
+
+    async def store_document(
+        self,
+        *,
+        namespace: str,
+        scopes: list[str],
+        document: dict[str, Any],
+        trace_run_id: str | None = None,
+    ) -> dict[str, Any]:
+        """``POST /api/brain/documents`` as ``retain_document`` writes it: a node
+        of the document's type, visible to ``properties.scopes``, and a
+        ``LINKS_TO`` edge to each linked key that already is a node (typed
+        traversal names that edge label ``links_to``)."""
+        properties = {**(document.get("properties") or {}), "scopes": scopes}
+        body = {**document, "namespace": namespace, "properties": properties}
+        Draft202012Validator(DOCUMENT_CONTRACT["schemas"]["DocumentIngestRequest"]).validate(body)
+        self.document_requests.append(body)
+        key = body["natural_key"]
+        self.nodes[key] = Node(
+            key,
+            body.get("type", "document"),
+            body["title"],
+            attributes={"links": properties.get("links", [])},
+            scopes=tuple(properties["scopes"]),
+        )
+        self.edges = [e for e in self.edges if not (e.subject == key and e.relation == "links_to")]
+        for target in body.get("links") or []:
+            if target in self.nodes:
+                self.edges.append(Edge(key, "links_to", target, fact_id=f"f-{key}-{target}"))
+        return {
+            "natural_key": key,
+            "namespace": namespace,
+            "type": self.nodes[key].kind,
+            "chunks": len(body.get("chunks", [])),
+            "replaced": body.get("replace", True),
+        }
 
     # --- pack registry ----------------------------------------------------------
 
@@ -350,4 +396,90 @@ class FakeGraphMemory:
             },
             "sources": [],
             "trace_id": f"ctx-{uuid.uuid4().hex[:16]}",
+        }
+
+    # --- entity list (K030) ----------------------------------------------------
+
+    @staticmethod
+    def _holds(value: Any, clause: dict[str, Any]) -> bool:
+        """One ``where`` condition on one attribute value, as ``context/where`` reads it."""
+        op, wanted = clause["op"], clause.get("value")
+        if op == "exists":
+            return (value is not None) == (wanted is not False)
+        if value is None:
+            return False
+        if isinstance(value, list):
+            return any(FakeGraphMemory._holds(v, clause) for v in value)
+        if op == "eq":
+            return bool(value == wanted)
+        if op == "in":
+            return value in wanted
+        if op == "prefix":
+            return str(value) == wanted or str(value).startswith(f"{wanted}.")
+        if isinstance(value, str) != isinstance(wanted, str):
+            return False
+        return bool(value <= wanted) if op == "lte" else bool(value >= wanted)
+
+    async def query_entities(
+        self,
+        *,
+        namespaces: list[str],
+        request: dict[str, Any],
+        trace_run_id: str | None = None,
+    ) -> dict[str, Any]:
+        body = {**request, "namespaces": list(namespaces)}
+        # What HttpContextProvider would put on the wire, checked against the pin.
+        Draft202012Validator(CONTRACT["schemas"]["EntitiesQueryIn"]).validate(body)
+        Draft202012Validator(CONTRACT["typedRequest"]["properties"]["where"]).validate(
+            body.get("where", [])
+        )
+        self.entities_requests.append(body)
+        if self.fail == "entities":
+            raise ContextProviderError("boom", retryable=True, status=503)
+        after: tuple[str, str] | None = None
+        if body.get("cursor") is not None:
+            kind, sep, key = str(body["cursor"]).partition("|")
+            if not sep:
+                raise ContextProviderError("cursor: not a list cursor", retryable=False, status=400)
+            after = (kind, key)
+        graph_ns = next((ns for ns in namespaces if ":ws:" in ns), None)
+        allowed = body.get("allowedScopes")
+        matching = sorted(
+            (
+                (node.kind, node.key)
+                for node in self.nodes.values()
+                if graph_ns is not None
+                and node.kind in body["kinds"]
+                and self._visible(node, allowed)
+                and all(
+                    self._holds(node.attributes.get(c["attr"]), c) for c in body.get("where") or ()
+                )
+            ),
+        )
+        rest = [position for position in matching if after is None or position > after]
+        limit = body.get("limit", 100)
+        page = rest[:limit]
+        items = [
+            {
+                "kind": kind,
+                "key": key,
+                "namespace": graph_ns,
+                "title": self.nodes[key].title or key,
+                "attributes": dict(self.nodes[key].attributes),
+                "source": "git:control-plane",
+                "scope": "",
+                "snapshot_id": "s1",
+                "source_path": self.nodes[key].source_path,
+                "valid_from": "2026-01-01T00:00:00+00:00",
+                "valid_to": None,
+            }
+            for kind, key in page
+        ]
+        more = len(rest) > limit
+        return {
+            "items": items,
+            "nextCursor": f"{page[-1][0]}|{page[-1][1]}" if more else None,
+            "as_of": body.get("asOf"),
+            "namespaces": list(namespaces),
+            "stats": {"scanned": len(page)},
         }

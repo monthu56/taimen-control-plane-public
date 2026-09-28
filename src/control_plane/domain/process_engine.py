@@ -1450,6 +1450,7 @@ class _Engine:
             traverse=list(body.get("traverse") or ()),
             kinds=list(body.get("kinds") or ()),
             query=query,
+            **self.where(here + "/where", body.get("where"), values, entry.id),
             limit=body.get("limit"),
             timeout=timeout or _iso(DEFAULT_RECALL_TIMEOUT),
             asOf=_rfc3339(self.now),
@@ -1612,6 +1613,34 @@ class _Engine:
                 found["via"] = anchor["via"]
             out.append(found)
         return out
+
+    def where(
+        self, path: str, conditions: Any, values: dict[str, Any], element: str
+    ) -> dict[str, Any]:
+        """``recall.where`` with its values computed: ``{where: [...]}``, or nothing without it.
+
+        The core does not read the conditions (CP-ADR-0076, amendment 2026-09-28):
+        a CEL value becomes the JSON literal it gives, a list of CEL a list of
+        them, a number or a bool stays; memory gets them as they are.
+        """
+        if not conditions:
+            return {}
+        out: list[dict[str, Any]] = []
+        for index, condition in enumerate(conditions):
+            here = f"{path}/{index}/value"
+            computed = {"attr": condition["attr"], "op": condition["op"]}
+            value = condition.get("value")
+            if isinstance(value, list):
+                computed["value"] = [
+                    _jsonable(self.evaluate(f"{here}/{item}", values, element))
+                    for item in range(len(value))
+                ]
+            elif isinstance(value, str):
+                computed["value"] = _jsonable(self.evaluate(here, values, element))
+            elif "value" in condition:
+                computed["value"] = value
+            out.append(computed)
+        return {"where": out}
 
     # --- answers to activities --------------------------------------------------------
 

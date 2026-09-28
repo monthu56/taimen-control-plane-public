@@ -1,25 +1,37 @@
-"""Knowledge snapshots and domain packs, proxied to Memory (CP-ADR-0060).
+"""Knowledge snapshots, documents and domain packs, proxied to Memory (CP-ADR-0060).
 
 Like ``/context``, every database transaction here closes BEFORE the Memory
 Service is called, so a slow memory never holds a pooled connection. Unlike
 ``/context`` there is no degraded answer: the caller asked for a write into
 memory, so a Memory failure is the caller's failure (502).
+
+The company-knowledge amendment of CP-ADR-0060 is implemented: the snapshot
+preview and ``expectedState`` (K008), knowledge base documents (K009) and tenant
+packs (K010). ``POST /knowledge/entities:query`` (K031) is the one read here:
+the entities of a workspace's knowledge, with the caller's visibility.
 """
 
 import uuid
 from typing import Any, cast
 
-from fastapi import APIRouter, Body, Request
+from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
 
 from control_plane.api.dependencies import AuthDep, SessionFactoryDep, SettingsDep
 from control_plane.api.v1.schemas import (
     ERROR_RESPONSES,
     ErrorEnvelope,
+    KnowledgeDocumentRequest,
+    KnowledgeEntitiesPageOut,
+    KnowledgeEntitiesQueryRequest,
+    KnowledgePackRegisterRequest,
+    KnowledgeSnapshotPreviewOut,
+    KnowledgeSnapshotPreviewRequest,
     KnowledgeSnapshotRequest,
     WorkspaceKnowledgePacksRequest,
 )
 from control_plane.application.commands import knowledge as commands
+from control_plane.application.queries import knowledge_entities, recall
 from control_plane.infrastructure.context_provider import KnowledgeProvider
 from control_plane.infrastructure.db.engine import transaction
 
@@ -29,6 +41,14 @@ _MEMORY_RESPONSES: dict[int | str, dict[str, Any]] = {
     **ERROR_RESPONSES,
     502: {"model": ErrorEnvelope, "description": "Memory service failed (memory_unavailable)"},
     503: {"model": ErrorEnvelope, "description": "Memory provider not configured"},
+}
+_SNAPSHOT_RESPONSES: dict[int | str, dict[str, Any]] = {
+    **_MEMORY_RESPONSES,
+    409: {
+        "model": ErrorEnvelope,
+        "description": "The source's state moved on since the plan, or the snapshot is older "
+        "than the applied one (snapshot_stale)",
+    },
 }
 
 
@@ -42,7 +62,7 @@ def _trace(request: Request) -> str | None:
     return getattr(request.state, "trace_run_id", "") or None
 
 
-@router.post("/knowledge/snapshots", responses=_MEMORY_RESPONSES)
+@router.post("/knowledge/snapshots", responses=_SNAPSHOT_RESPONSES)
 async def submit_snapshot(
     payload: KnowledgeSnapshotRequest,
     request: Request,
@@ -57,23 +77,115 @@ async def submit_snapshot(
     provider = _provider(request)
     snapshot = payload.snapshot_document()
     answer = await commands.reconcile_snapshot(
-        provider, target, snapshot, trace_run_id=_trace(request)
+        provider,
+        target,
+        snapshot,
+        expected_state=payload.expected_state,
+        trace_run_id=_trace(request),
     )
     async with transaction(session_factory) as db:
         await commands.record_snapshot_reconciled(db, ctx, target, snapshot, answer)
     return JSONResponse(answer)
 
 
-@router.post("/knowledge/packs", responses=_MEMORY_RESPONSES)
-async def register_pack(
+@router.post(
+    "/knowledge/snapshots:preview",
+    response_model=KnowledgeSnapshotPreviewOut,
+    responses=_SNAPSHOT_RESPONSES,
+)
+async def preview_snapshot(
+    payload: KnowledgeSnapshotPreviewRequest,
     request: Request,
     ctx: AuthDep,
     settings: SettingsDep,
     session_factory: SessionFactoryDep,
-    payload: dict[str, Any] = Body(...),
 ) -> JSONResponse:
-    commands.authorize_pack_registration(ctx, settings)
-    commands.require_pack_identity(payload)
+    """What applying the snapshot would change, and the state it was computed
+    on (``stateToken``). Nothing is written, no event either."""
+    async with transaction(session_factory) as db:
+        target = await commands.prepare_snapshot(
+            db, ctx, settings, workspace_id=payload.workspace_id
+        )
+    answer = await commands.preview_snapshot(
+        _provider(request), target, payload.snapshot_document(), trace_run_id=_trace(request)
+    )
+    return JSONResponse(answer)
+
+
+@router.post("/knowledge/documents", responses=_MEMORY_RESPONSES)
+async def submit_document(
+    payload: KnowledgeDocumentRequest,
+    request: Request,
+    ctx: AuthDep,
+    settings: SettingsDep,
+    session_factory: SessionFactoryDep,
+) -> JSONResponse:
+    """A knowledge base document outside any case: text the caller already
+    cut into chunks, stored where a snapshot of the workspace would land."""
+    async with transaction(session_factory) as db:
+        target = await commands.prepare_snapshot(
+            db, ctx, settings, workspace_id=payload.workspace_id
+        )
+    document = payload.memory_document()
+    answer = await commands.store_document(
+        _provider(request), target, document, trace_run_id=_trace(request)
+    )
+    async with transaction(session_factory) as db:
+        await commands.record_document_stored(db, ctx, target, document)
+    return JSONResponse(answer)
+
+
+@router.post(
+    "/knowledge/entities:query",
+    response_model=KnowledgeEntitiesPageOut,
+    responses={
+        **_MEMORY_RESPONSES,
+        503: {
+            "model": ErrorEnvelope,
+            "description": "Memory provider not configured or not answering in time",
+        },
+    },
+)
+async def query_entities(
+    payload: KnowledgeEntitiesQueryRequest,
+    request: Request,
+    ctx: AuthDep,
+    settings: SettingsDep,
+    session_factory: SessionFactoryDep,
+) -> JSONResponse:
+    """The entities of ``kinds`` valid at ``asOf`` that satisfy ``where``, a
+    page at a time, from the namespace of the workspace tree root with the
+    caller's visibility (the right to read the workspace's context)."""
+    provider = recall.require_graph(getattr(request.app.state, "context_provider", None))
+    async with transaction(session_factory) as db:
+        call = await knowledge_entities.prepare_entities_query(
+            db,
+            ctx,
+            settings,
+            workspace_id=payload.workspace_id,
+            kinds=payload.kinds,
+            where=[c.to_memory() for c in payload.where],
+            as_of=payload.as_of,
+            limit=payload.limit,
+            cursor=payload.cursor,
+        )
+    page = await knowledge_entities.fetch_entities(
+        call, provider, settings, trace_run_id=_trace(request) or ""
+    )
+    return JSONResponse(page)
+
+
+@router.post("/knowledge/packs", responses=_MEMORY_RESPONSES)
+async def register_pack(
+    body: KnowledgePackRegisterRequest,
+    request: Request,
+    ctx: AuthDep,
+    settings: SettingsDep,
+    session_factory: SessionFactoryDep,
+) -> JSONResponse:
+    """A shared pack (platform administrators) or, with ``scope: tenant``, a
+    pack of the caller's tenant (``knowledge.packs.manage``)."""
+    payload = await commands.prepare_pack(ctx, settings, body.model_dump(exclude_unset=True))
     answer = await commands.register_pack(_provider(request), payload, trace_run_id=_trace(request))
     async with transaction(session_factory) as db:
         await commands.record_pack_registered(db, ctx, payload, answer)

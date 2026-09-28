@@ -22,12 +22,24 @@ class ContextProviderError(Exception):
     and retry the same delivery unit) from permanent rejections (4xx
     validation): permanent failures must never be skipped silently — the
     adapter stops at the poison unit and surfaces diagnostics.
+
+    ``code`` is the provider's machine-readable reason when its error body
+    carries one (``{"detail": {"code": ...}}``), e.g. which name of a tenant
+    pack clashes with a shared pack.
     """
 
-    def __init__(self, message: str, *, retryable: bool, status: int | None = None) -> None:
+    def __init__(
+        self,
+        message: str,
+        *,
+        retryable: bool,
+        status: int | None = None,
+        code: str | None = None,
+    ) -> None:
         super().__init__(message)
         self.retryable = retryable
         self.status = status
+        self.code = code
 
 
 @dataclass(frozen=True)
@@ -108,6 +120,8 @@ class KnowledgeProvider(Protocol):
         namespace: str,
         scopes: list[str],
         snapshot: dict[str, Any],
+        dry_run: bool = False,
+        expected_state: str | None = None,
         trace_run_id: str | None = None,
     ) -> dict[str, Any]: ...
 
@@ -123,6 +137,17 @@ class KnowledgeProvider(Protocol):
         strict: bool,
         trace_run_id: str | None = None,
     ) -> dict[str, Any]: ...
+
+    async def store_document(
+        self,
+        *,
+        namespace: str,
+        scopes: list[str],
+        document: dict[str, Any],
+        trace_run_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Write a knowledge base document (node and chunks) visible to ``scopes``."""
+        ...
 
 
 class GraphProvider(Protocol):
@@ -148,4 +173,12 @@ class GraphProvider(Protocol):
 
     async def get_package(
         self, *, name: str, version: str = "", trace_run_id: str | None = None
+    ) -> dict[str, Any]: ...
+
+    async def query_entities(
+        self,
+        *,
+        namespaces: list[str],
+        request: dict[str, Any],
+        trace_run_id: str | None = None,
     ) -> dict[str, Any]: ...

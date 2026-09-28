@@ -115,6 +115,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         max_body_bytes=settings.max_body_bytes,
         path_limits={
             "/api/v1/knowledge/snapshots": settings.knowledge_snapshot_max_body_bytes,
+            # The preview takes the snapshot's body; a document -- its chunks.
+            "/api/v1/knowledge/snapshots:preview": settings.knowledge_snapshot_max_body_bytes,
+            "/api/v1/knowledge/documents": settings.knowledge_snapshot_max_body_bytes,
             # Uploaded files stream to disk, never into memory (CP-ADR-0072 §2).
             "/api/v1/artifact-contents": settings.artifact_max_bytes,
         },

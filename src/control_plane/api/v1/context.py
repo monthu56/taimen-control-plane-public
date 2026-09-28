@@ -109,6 +109,7 @@ async def recall_graph(
             task_ref=payload.task,
             workspace_id=payload.workspace_id,
             budget_tokens=payload.budget_tokens,
+            where=[c.to_memory() for c in payload.where],
         )
     body = await recall.fetch_recall(
         call, provider, settings, trace_run_id=getattr(request.state, "trace_run_id", "")

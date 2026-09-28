@@ -124,6 +124,11 @@ actions:
     resource: tenant
   calendars.write:
     resource: tenant
+  # --- база знаний (CP-ADR-0060, амендмент 2026-09-28): регистрация пакета
+  # онтологии арендатора (scope: tenant); общие пакеты — только
+  # администраторы платформы, это право их не касается ---
+  knowledge.packs.manage:
+    resource: tenant
   project_templates.read:
     resource: tenant
   project_templates.manage:

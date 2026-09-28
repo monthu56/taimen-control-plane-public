@@ -71,7 +71,8 @@ N+1 без изменений и игнорирует незнакомые по�
 | [`iam_binding.revoked`](#iam_bindingrevoked) | `iam_binding` | 1 | An IAM binding was revoked; the identity no longer enters. |
 | [`iam_binding.updated`](#iam_bindingupdated) | `iam_binding` | 1 | The permissions of an IAM binding changed. |
 | [`knowledge.changed`](#knowledgechanged) | `workspace` | 1 | A knowledge snapshot opened, changed or closed documents in memory (CP-ADR-0076 §6); an empty reconciliation writes no event. |
-| [`knowledge.pack_registered`](#knowledgepack_registered) | `knowledge_pack` | 1 | A domain knowledge pack version was registered. |
+| [`knowledge.document_stored`](#knowledgedocument_stored) | `workspace` | 1 | A knowledge base document was stored in the memory service (CP-ADR-0060, amendment 2026-09-28); its text stays out of the journal. |
+| [`knowledge.pack_registered`](#knowledgepack_registered) | `knowledge_pack` | 2 | A domain knowledge pack version was registered. |
 | [`knowledge.packs_configured`](#knowledgepacks_configured) | `workspace` | 1 | The knowledge packs of a workspace tree were configured. |
 | [`knowledge.snapshot_reconciled`](#knowledgesnapshot_reconciled) | `workspace` | 1 | A knowledge snapshot was reconciled into the memory service (CP-ADR-0060). |
 | [`observation.recorded`](#observationrecorded) | `observation` | 1 | An observation was recorded (ADR-0057). |
@@ -837,11 +838,39 @@ A knowledge snapshot opened, changed or closed documents in memory (CP-ADR-0076 
 | `truncated` | boolean | да | The memory service cut the list; the counters stay complete |
 | `counters` | object | да |  |
 
+### knowledge.document_stored
+
+A knowledge base document was stored in the memory service (CP-ADR-0060, amendment 2026-09-28); its text stays out of the journal.
+
+Сущность: `workspace`.
+
+Версия 1:
+
+| Поле | Тип | Всегда | Описание |
+|---|---|---|---|
+| `naturalKey` | string | да |  |
+| `title` | string | да |  |
+| `type` | string | да |  |
+| `workspaceId` | string (uuid) | да |  |
+| `rootWorkspaceId` | string (uuid) | да |  |
+| `namespace` | string | да |  |
+| `chunkCount` | integer | да |  |
+| `linkCount` | integer | да |  |
+
 ### knowledge.pack_registered
 
 A domain knowledge pack version was registered.
 
 Сущность: `knowledge_pack`.
+
+Версия 2 (добавлено: scope (CP-ADR-0060, amendment 2026-09-28)):
+
+| Поле | Тип | Всегда | Описание |
+|---|---|---|---|
+| `name` | string | да |  |
+| `version` | any | да |  |
+| `status` | string \| null | да |  |
+| `scope` | string | да | common: a shared pack; tenant: a pack of the event's tenant |
 
 Версия 1:
 

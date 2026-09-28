@@ -1,6 +1,12 @@
 # ADR-0060: Снимки знаний и доменные пакеты через Control Plane
 
-Статус: Accepted (2026-09-23; правки по ревью TASK-000306 — 2026-09-23)
+Статус: Accepted (2026-09-23; правки по ревью TASK-000306 — 2026-09-23);
+амендмент 2026-09-28 (company-knowledge, K003): предпросмотр снимка,
+`expectedState`, документы базы знаний, пакеты арендатора; К1 и К2
+реализованы в K008 (TASK-000768), документы (п. К3) — в K009 (TASK-000769),
+пакеты арендатора (п. К4) — в K010 (TASK-000770); амендмент 2026-09-28
+(company-knowledge, K031, TASK-000796): перечень сущностей
+`POST /knowledge/entities:query`
 
 Контекст: амендмент 2026-09-23 к TAI-ADR-0042 суперпроекта («память — только
 через Control Plane») и TAI-ADR-0031 п.6: никто, кроме ядра, не ходит в
@@ -168,6 +174,7 @@ memory-service; разрешения применяет ядро. Продолж
 | `404` (`PackNotFoundError`) | kinds | `422 pack_not_found` |
 | `409` (`StaleSnapshotError`) | reconcile | `409 snapshot_stale` |
 | `409` (`PackConflictError`) | packages | `409 pack_version_conflict` |
+| `400` (`ValueError` ингеста) | documents (амендмент, п. К3) | `422 document_invalid` |
 | `401`/`403`, иной `4xx` | все | `502 memory_unavailable`, `details.retryable = false` — ошибка конфигурации ядра (credential, scope сервис-аккаунта) или wire-контракта, а не клиента |
 | `5xx`, транспорт, таймаут, IAM недоступен | все | `502 memory_unavailable`, `details.retryable = true` |
 
@@ -177,6 +184,7 @@ memory-service; разрешения применяет ядро. Продолж
 ### Клиенты
 
 `control-plane-client`: `submit_knowledge_snapshot(workspace_id=, snapshot=)`,
+`submit_knowledge_document(workspace_id=, document=)` (амендмент, п. К3),
 `register_knowledge_pack(pack)`,
 `set_workspace_knowledge_packs(workspace_id, packs=, strict=)`. MCP-инструментов
 нет: это машинный путь коннектора, а не инструмент агента.
@@ -214,6 +222,342 @@ memory-service; разрешения применяет ядро. Продолж
 - Путь `/api/v1/knowledge/*` при включённом entitlement — отдельная фича
   `knowledge` (`feature_for_path`).
 
+## Амендмент 2026-09-28 (company-knowledge): предпросмотр снимка, применение по состоянию, документы, пакеты арендатора
+
+Основание — фича `company-knowledge`: spec, plan и документ задач лежат в
+`specs/company-knowledge/` суперпроекта. Дизайн — TASK-000748, ворота одобрены
+владельцем 2026-09-28. Требования FR-005, FR-006, FR-007, FR-027, конституция
+ст. V, VI, IX. Опора: TAI-ADR-0056 (K001) и амендмент MEM-ADR-020 (K002).
+Амендмент записан в K003 (TASK-000763). Реализуют его K008 (п. К1, К2), K009
+(п. К3) и K010 (п. К4).
+
+До реализации маршруты и поля опубликованы в OpenAPI. После проверки права
+они отвечают `501 not_implemented` с `details: {adr: "CP-ADR-0060",
+implementedBy: "company-knowledge K00x"}`. Память при этом не вызывается, и
+события не пишутся. Прежние клиенты изменений не замечают: новые поля
+необязательны, прежние тела принимаются как раньше.
+
+**Проблема.** Загрузка таблицы должна показать план изменений до записи и
+применить ровно показанный план (FR-005, FR-006). Сейчас снимок применяется
+сразу, а второй загрузчик молча перезаписывает первого. Документы базы знаний
+вне дела ядро не принимает (FR-007). Собственные виды компании регистрирует
+только администратор платформы (FR-027).
+
+### К1. `POST /api/v1/knowledge/snapshots:preview`
+
+Предпросмотр сверки — план изменений снимка без записи.
+
+- **Тело** — то же, что у `POST /knowledge/snapshots`, без `expectedState`
+  (`KnowledgeSnapshotPreviewRequest`). Границы полей, `400` на лишнее поле и
+  лимит тела `CP_KNOWLEDGE_SNAPSHOT_MAX_BODY_BYTES` (8 МиБ) — как у снимка.
+- **Право** — `observations.write` на `workspace:<workspaceId>`, как у снимка.
+  Право на запись, а не на чтение: предпросмотр раскрывает, что лежит в памяти
+  по источнику, и нужен только тому, кто будет применять. Workspace
+  разрешается как у снимка: чужой — `404`, архивный — `422
+  workspace_archived`.
+- **Передача** — `POST /api/memory/reconcile` тем же клиентом и identity,
+  что снимок. Тело то же (`ReconcileIn`: плоский снимок, `namespace`,
+  `scopes`) плюс `dryRun: true` (амендмент MEM-ADR-020, K002). Имена полей
+  берутся из контракта памяти K002. K008 закрепляет их в фикстуре
+  `tests/fixtures/memory_knowledge_contract.json`.
+- **Ответ** — ответ памяти как есть, `200`: изменения (`changes`), счётчики,
+  конфликты естественных ключей с элементами других источников и `stateToken`.
+  `stateToken` — отпечаток последнего принятого снимка пары `(source, scope)`.
+  В OpenAPI ответ описан моделью `KnowledgeSnapshotPreviewOut`: ядро называет
+  в нём только `stateToken`, остальное — поля памяти.
+- **Ничего не пишет.** Ни строки в БД ядра, ни события:
+  `knowledge.snapshot_reconciled` и `knowledge.changed` пишет только
+  применение.
+- **Ошибки** — по таблице «Ошибки памяти»: `400` памяти — `422
+  snapshot_invalid`, недоступность — `502`, провайдер выключен — `503`.
+
+Отдельный маршрут, а не флаг в теле снимка. Причина: запрос предпросмотра не
+должен применить снимок из-за забытого поля, а периметр и аудит различают
+чтение плана и запись по пути.
+
+### К2. `expectedState` у `POST /api/v1/knowledge/snapshots`
+
+- Необязательная строка (1..128) — `stateToken` из предпросмотра. Для ядра
+  значение непрозрачно. Граница — как у памяти (`ReconcileIn.expectedState`,
+  `maxLength` 128; уточнено в K008, в K003 было 1..256): длиннее память
+  отвергла бы своим `422`, и клиент получил бы `502` вместо `400`.
+- Передаётся в память полем `expectedState` рядом со снимком. В документ
+  снимка оно не входит (`snapshot_document()` его исключает).
+- Память сверяет состояние пары `(source, scope)`. Если оно изменилось после
+  предпросмотра, память отвечает `409`. Ядро отдаёт `409 snapshot_stale` —
+  тот же код, что для снимка старее применённого: в обоих случаях план
+  построен не на текущем состоянии. Клиент строит план заново.
+- Без `expectedState` снимок применяется как раньше: коннектору, который
+  снимает весь источник, план не нужен.
+- Событие `knowledge.snapshot_reconciled` не меняется.
+
+### Реализация К1 и К2 (K008)
+
+Маршрут и поле работают, `501` у них снят.
+
+- **Провайдер.** `KnowledgeProvider.reconcile_snapshot` принимает `dry_run` и
+  `expected_state`. `HttpContextProvider` кладёт их в тело `ReconcileIn`
+  полями `dryRun: true` и `expectedState` рядом со снимком, и только когда
+  они заданы: тело обычной сверки не меняется. Имена и границы полей взяты
+  из модели памяти `ReconcileIn` (memory-service K004, c534146) и закреплены
+  в `tests/fixtures/memory_knowledge_contract.json`: `schemas.ReconcileIn` и
+  `responses.reconcileState` (поля плана `dryRun`, `stateToken`; `409` с
+  `detail.code = snapshot_stale`).
+- **Ответ предпросмотра — план.** Ядро проверяет, что память ответила планом:
+  `dryRun: true` и непустой `stateToken`. Память без предпросмотра поле
+  `dryRun` не знает и применила бы снимок. Такой ответ — ошибка развёртывания
+  зависимости, а не план: `502 memory_unavailable` с `details: {memoryStatus:
+  200, retryable: false}`, в лог — `error`. Отменить такую запись ядро не
+  может. Поэтому память с K004 разворачивается раньше ядра с K008.
+- **`409` предпросмотра.** Снимок старше принятого память отвергает `409` и в
+  предпросмотре. Ядро отдаёт `409 snapshot_stale`, как у применения.
+- **`409` применения.** Два случая дают один код `409 snapshot_stale` с
+  `details: {memoryStatus: 409}`: память отвергла `expectedState`, или снимок
+  старше принятого. Текущий `stateToken` из ответа памяти клиенту не
+  передаётся: план всё равно строится заново предпросмотром.
+- **Клиент.** `control-plane-client`:
+  `preview_knowledge_snapshot(workspace_id=, snapshot=)` и параметр
+  `expected_state` у `submit_knowledge_snapshot`.
+
+### К3. `POST /api/v1/knowledge/documents`
+
+Документ базы знаний вне дела: лицензия, выписка, сертификат.
+
+- **Тело** (`KnowledgeDocumentRequest`):
+
+  | Поле | Смысл |
+  |---|---|
+  | `workspaceId` | Workspace, от имени которого пишется документ. Обязателен. |
+  | `naturalKey` | Естественный ключ документа (1..512). Повторная запись с тем же ключом заменяет фрагменты. |
+  | `title` | Заголовок (1..500). |
+  | `type` | Тип узла, по умолчанию `document`. |
+  | `chunks[]` | Фрагменты текста `{text, heading, order}`, 1..500 — предел одного вызова памяти (`MAX_CHUNKS_PER_REQUEST`). |
+  | `links[]` | Сущности базы знаний, о которых документ: `{kind, key, rel}`, до 200. |
+  | `meta` | Теги фрагментов (объект), необязателен. |
+
+  Файлы ядро не разбирает. Текст извлекает и режет вызывающий, например
+  скилл `knowledge.document_extract@1`. Лишнее поле (`namespace`, `scopes`) —
+  `400`. Лимит тела — 8 МиБ, как у снимка.
+- **Право** — `observations.write` на `workspace:<workspaceId>`. Разрешение
+  workspace, namespace корня дерева и scope видимости `workspace:<id>` — как
+  у снимка (п.2, 3 решения).
+- **Передача** — `POST /api/brain/documents` (модель памяти
+  `DocumentIngestRequest`):
+  - `natural_key`, `title`, `type`, `chunks`, `meta` и `namespace` — прямо
+    из тела;
+  - scope видимости — в `properties.scopes`: видимость узла память читает
+    оттуда же;
+  - `links` памяти сейчас — список естественных ключей, из которых
+    получаются рёбра `LINKS_TO` к существующим узлам без вида связи. Ядро
+    передаёт в `links` ключи `key`, а связи целиком `{kind, key, rel}` — в
+    `properties.links`;
+  - типизированная связь документа с сущностью (`evidenced_by`) попадает в
+    граф снимком источника `document:<ключ>` (K019), а не этим маршрутом.
+    Если память даст типизированные связи документа, K009 передаст их ими.
+
+  Wire-формат K009 закрепляет contract-тестом против модели памяти.
+  Весь документ — один вызов с `replace: true`: повторная запись с тем же
+  ключом заменяет фрагменты, продолжений (`replace: false`) ядро не шлёт.
+  Одинаковые ключи в `links` памяти передаются один раз, в
+  `properties.links` — все связи как есть. Таймаут вызова — таймаут
+  сверки (`CP_CONTEXT_RECONCILE_TIMEOUT_SECONDS`): память считает эмбеддинги
+  до 500 фрагментов за вызов.
+- **Ответ** — ответ памяти как есть, `200` (память отвечает `201`). Ошибки —
+  по таблице «Ошибки памяти». `400` памяти — `422 document_invalid`. `422`
+  строгого режима видов памяти (тип документа не из включённых пакетов)
+  отображается как иной `4xx` — `502`, как у снимка.
+- **Журнал** — событие `knowledge.document_stored`, entity — workspace.
+  Payload: `naturalKey`, `title`, `type`, `workspaceId`, `rootWorkspaceId`,
+  `namespace`, `chunkCount`, `linkCount`. Текст в журнал не попадает. Событие
+  не входит в whitelist context mapping. Регистрирует его K009.
+
+### К4. Пакеты онтологии арендатора: `scope: tenant`
+
+Решение «регистрация — только администраторы платформы» закрывало риск общего
+реестра: tenant A выпускает версию, которая ломает strict-проверку у tenant B.
+Пакет арендатора этот риск не открывает. Такой пакет виден и включается только
+в namespace своего арендатора. Имена его видов не совпадают с видами общих
+пакетов — память отказывает при регистрации (K002, K007).
+
+- **Тело** `POST /api/v1/knowledge/packs` — манифест как есть
+  (`KnowledgePackRegisterRequest`: остальные поля проходят без изменений).
+  Ядро читает в нём только `name`, `version` и `scope`:
+  - `scope` отсутствует — общий пакет. Правило то же: только
+    `CP_KNOWLEDGE_PACK_ADMINS`, иначе `403` с `details.required =
+    "knowledge_pack_admin"`. Права `knowledge.packs.manage` для общего пакета
+    недостаточно;
+  - `scope: tenant` — пакет арендатора вызывающего. Нужно право
+    **`knowledge.packs.manage`** уровня tenant (`authz/catalog.yaml`, в режиме
+    `local` — плоское право ключа). Список администраторов платформы для
+    этого не нужен;
+  - иное значение `scope` — `400 invalid_request`.
+- **Передача** — `POST /api/memory/packages`: манифест со `scope: tenant` и
+  принадлежностью арендатору. Принадлежность вычисляет ядро: tenant
+  вызывающего, namespace-префикс `tenant:<tenant>`. Клиент передать её не
+  может. Поле берётся из контракта памяти K002, K010 закрепляет его в фикстуре
+  контракта.
+
+  Реализация K010. Контракт памяти K007 (`PackIn` memory-service
+  `feature/company-knowledge` 038496d) — поля `scope: "tenant"` и `namespace`
+  (namespace-владелец). Ядро передаёт `namespace = tenant:<tenantId>`
+  (`CP_CONTEXT_NAMESPACE_PREFIX` + id tenant'а вызывающего), то есть namespace
+  над всеми деревьями workspace арендатора (`tenant:<t>:ws:<root>`). Память
+  показывает пакет владельца в нём и в namespace с префиксом `<владелец>:`.
+  Право записи в namespace-владелец память проверяет у учётной записи ядра.
+  Поле `namespace` в манифесте клиента — `400 invalid_request`: принадлежность
+  не подменить. Запрос отвергается до вызова памяти.
+- **Ссылка** на пакет арендатора — `tenant:<name>@<version>` (K002).
+  `PUT /workspaces/{id}/knowledge-packs` принимает её как закреплённую
+  ссылку: K010 расширяет грамматику `PACK_REF_RE` префиксом `tenant:`. Пакет
+  другого арендатора память не находит — `422 pack_not_found`.
+- **Ошибки** — как у общих пакетов. Коллизия имени вида с общим пакетом — это
+  `400` памяти, ядро отдаёт `422 pack_invalid`.
+
+  Уточнение K010 по контракту памяти K007. Коллизию память отвечает не `400`,
+  а `409` с `detail`-объектом `{code, message}`. Код — `pack_name_conflict`,
+  `kind_conflict` или `relation_conflict`. Ядро отличает такой ответ от `409`
+  иммутабельности версии (`detail` — строка) по `detail.code`. Коллизия — это
+  `422 pack_invalid` с `details: {memoryStatus: 409, conflict: <code>}`. Иной
+  `409` — по-прежнему `409 pack_version_conflict`.
+- **Аудит** — `knowledge.pack_registered`, новая версия схемы события с
+  полем `scope` (ADR-0068: версии только добавляют поля). Устойчивый id
+  entity пакета арендатора — `uuid5(NAMESPACE_URL,
+  "knowledge-pack:tenant:<tenantId>:<name>@<version>")`: имена пакетов разных
+  арендаторов могут совпадать. Payload версии 2 — `name`, `version`,
+  `status`, `scope` (`common` | `tenant`); у общего пакета `scope: common`, id
+  entity прежний.
+
+### Права и клиенты
+
+- `knowledge.packs.manage` — новое право уровня tenant: enum `Permission`,
+  `authz/catalog.yaml`, `docs/api.md`.
+- `control-plane-client` получает методы в шагах реализации (K008–K010).
+  SDK скиллов (`ctx.knowledge`, K013) ходит этими маршрутами с учётной
+  записью исполнителя. MCP-инструментов нет, как и раньше.
+
+### Conformance амендмента
+
+- `tests/unit/test_knowledge_contract.py` (K003): OpenAPI валиден (схемы —
+  JSON Schema 2020-12, все `$ref` разрешаются); маршруты, тела и `501`;
+  `expectedState` не попадает в документ снимка; `knowledge.packs.manage` в
+  enum и каталоге.
+- `tests/integration/test_company_knowledge_contract.py` (K003): право
+  проверяется до `501`, память не вызывается, событий нет. Для пакета
+  арендатора не нужен список администраторов, общему пакету права tenant'а
+  мало.
+- `tests/unit/test_knowledge_memory_contract.py` (K010): тело пакета
+  арендатора (`scope`, `namespace` владельца) валидно по закреплённому `PackIn`
+  K007 (`tests/fixtures/memory_knowledge_contract.json`). `409` коллизии по
+  закреплённой схеме `PackScopeConflict` — `422 pack_invalid`, `409` со
+  строкой — `409 pack_version_conflict`.
+- `tests/integration/test_knowledge_tenant_packs.py` (K010): арендатор
+  регистрирует свой пакет по `knowledge.packs.manage` без
+  `CP_KNOWLEDGE_PACK_ADMINS`. Ядро передаёт namespace-владельца. Событие v2
+  несёт `scope: tenant` и id entity с tenant'ом. Общий пакет без прав
+  администратора платформы — `403` даже с правом tenant'а. `namespace` в
+  манифесте — `400`. `tenant:name@version` включается в
+  `PUT …/knowledge-packs`, ссылка без версии — `422`.
+- `tests/unit/test_document_memory_contract.py` (K009): тело
+  `POST /api/brain/documents`, построенное схемой запроса и провайдером,
+  валидно по закреплённой модели памяти `DocumentIngestRequest`
+  (`tests/fixtures/memory_document_contract.json`): `namespace` в корне,
+  `properties.scopes`, ключи в `links`, связи целиком в `properties.links`.
+- `tests/integration/test_knowledge_documents.py` (K009): без
+  `observations.write` — `403`, память не вызывается; документ дочернего
+  workspace уходит в namespace корня со scope дочернего; событие
+  `knowledge.document_stored` без текста; лишнее поле и пустые фрагменты —
+  `400`; отображение ошибок памяти; лимит тела снимка; `recall` находит
+  документ от связанной сущности и сущность от документа по `links_to`.
+- `tests/integration/test_knowledge_preview.py` (K008): предпросмотр идёт в
+  память с `dryRun`, ответ как есть, событий нет; право, workspace, лимит
+  тела и `400` на `expectedState` в теле предпросмотра; применение по
+  `stateToken`; изменившееся состояние — `409 snapshot_stale`; ответ без
+  плана — `502`. `tests/unit/test_knowledge_memory_contract.py` проверяет
+  тела с `dryRun` и `expectedState` по `ReconcileIn` памяти, `tests/contract`
+  проверяет их против живой памяти.
+
+## Амендмент 2026-09-28 (company-knowledge, K031): перечень сущностей
+
+Основание — фича `company-knowledge` (`specs/company-knowledge/` суперпроекта),
+требования FR-022 и FR-012. Опора — перечень сущностей памяти
+`POST /api/memory/entities:query` (K030, амендмент MEM-ADR-020;
+memory-service `feature/company-knowledge` 7492f04). Записан и реализован в
+K031 (TASK-000796).
+
+**Проблема.** Вопросы вида «все лицензии, действующие до конца года» или «все
+предложения внутри ОКПД2 62.01» не начинаются с якоря. `cp_recall` (CP-ADR-0064)
+идёт от якоря по связям и такой перечень не даёт. Память умеет отдавать
+перечень постранично (K030), но ходить в неё напрямую может только ядро
+(TAI-ADR-0031 п.6).
+
+### П1. `POST /api/v1/knowledge/entities:query`
+
+Тело (строгое, лишнее поле — `400 invalid_request`):
+
+| Поле | Смысл |
+|---|---|
+| `workspaceId` | Workspace, знания которого читаются. Обязателен. |
+| `kinds` | Виды сущностей, 1..20, имя `^[A-Za-z][A-Za-z0-9_]{0,62}$` (как у памяти). Неизвестный вид даёт пустой ответ, а не ошибку. |
+| `where` | До 20 условий `{attr, op, value}` на атрибуты версии (все должны выполняться). Схема и правила значений — те же, что у `where` в `/context/recall` (`MemoryWhereCondition`). Только литералы: CEL ядро здесь не вычисляет. |
+| `asOf` | Момент с часовым поясом. Без него — версии, действующие сейчас. |
+| `limit` | 1..500, по умолчанию 100. |
+| `cursor` | `nextCursor` предыдущей страницы (1..4096 символов). Ядро его не читает. Остальные поля запроса те же. |
+
+1. **Право** — `events.read` на ресурс `ResourceRef("workspace", workspaceId)`:
+   право читать контекст workspace, как у `/context/recall` (в режиме `local` —
+   плоское право ключа). Без права — `403`, память не вызывается.
+   Неизвестный или чужой workspace — `404`.
+2. **Где читается** — namespace корня дерева workspace
+   (`tenant:<t>:ws:<root>`, как в п. 2 основного решения), и только он.
+   Namespace tenant'а снимков не держит. Namespace и видимость вычисляет
+   `graph_scope` — та же функция, что у `/context/recall`.
+3. **Видимость вызывающего.** В режиме `policy` в память уходят
+   `allowedNamespaces`/`allowedScopes`, вычисленные PDP (`memory_visibility`).
+   Если namespace корня вне видимого набора — `403`, память не вызывается. В
+   режиме `local` — `allowedScopes`: workspace, его предки и principal. Знания
+   соседнего поддерева того же корня не видны.
+4. **Передача.** `POST /api/memory/entities:query` identity ядра, с
+   `X-Run-Id`. Тело — модель памяти `EntitiesQueryIn`: `kinds`, `limit`, при
+   наличии — `where`, `asOf`, `cursor`, а также `namespaces: [<root ns>]` и
+   поля видимости. `scope` не передаётся: память принимает `namespaces` или
+   `scope`, но не оба сразу.
+5. **Ответ** — `200 {items, nextCursor, asOf}`. `items` — сущности памяти как
+   есть (`EntityItem`: `kind`, `key`, `namespace`, `title`, `attributes`,
+   `source`, `scope`, `snapshot_id`, `source_path`, `valid_from`, `valid_to`) в
+   порядке `(kind, key, namespace)`. Конец перечня — только `nextCursor: null`:
+   при редком фильтре страница бывает короче `limit` и до конца. Курсор
+   keyset, страницы не повторяются. Журнал не пишется: это чтение.
+6. **Ошибки памяти.** `400` (запрос, который память не читает, например чужой
+   курсор) → `422 entities_query_invalid`. Остальное — как в «Ошибках памяти»:
+   `502 memory_unavailable`. Провайдер не настроен — `503 memory_disabled`, нет
+   ответа за `CP_CONTEXT_TIMEOUT_SECONDS` — `503 memory_timeout`. В отличие от
+   `/context`, деградированного ответа нет.
+
+Транзакция БД (право, workspace, видимость) закрывается до вызова памяти.
+
+### П2. Клиенты
+
+`control-plane-client`: `query_knowledge_entities(workspace_id=, kinds=, where=,
+as_of=, limit=, cursor=)` — одна страница. MCP-инструмента нет.
+
+### Conformance амендмента K031
+
+- `tests/unit/test_graph_memory_contract.py`: тело, которое строит ядро,
+  валидно по закреплённой `EntitiesQueryIn` памяти
+  (`tests/fixtures/memory_graph_contract.json`, 7492f04), условия `where` — по
+  правилам `typedRequest.where`. Границы `kinds`/`limit`/`where` запроса ядра
+  совпадают с границами памяти. Страница по закреплённой `EntitiesQueryResult`
+  отдаётся как `{items, nextCursor, asOf}`. Отказы памяти отображаются по
+  смыслу.
+- `tests/integration/test_knowledge_entities.py`: без `events.read` — `403`,
+  память не вызывается. Перечень дочернего workspace читается в namespace
+  корня с `allowedScopes` поддерева, чужое скрыто. Страницы проходят весь
+  перечень ровно один раз. В режиме `policy` невидимый namespace — `403`,
+  видимость PDP уходит в память. Лишние поля и нарушения границ — `400`,
+  чужой курсор — `422`, сбой памяти — `502`, без провайдера — `503`.
+- `tests/client/test_sdk.py`: `query_knowledge_entities` проходит перечень по
+  `nextCursor`.
+
 ## Conformance
 
 ```conformance
@@ -230,5 +574,35 @@ memory-service; разрешения применяет ядро. Продолж
 - grep: {path: "src/control_plane/application/commands/knowledge.py", pattern: "settings.knowledge_pack_admins"}
   repo: control-plane
 - grep: {path: "src/control_plane/application/commands/knowledge.py", pattern: '"pack_version_required"'}
+  repo: control-plane
+- grep: {path: "src/control_plane/api/v1/knowledge.py", pattern: '"/knowledge/snapshots:preview"'}
+  repo: control-plane
+- grep: {path: "src/control_plane/infrastructure/context_provider/http.py", pattern: 'body\["dryRun"\] = True'}
+  repo: control-plane
+- grep: {path: "src/control_plane/infrastructure/context_provider/http.py", pattern: 'body\["expectedState"\] = expected_state'}
+  repo: control-plane
+- grep: {path: "src/control_plane/api/v1/knowledge.py", pattern: '"/knowledge/documents"'}
+  repo: control-plane
+- grep: {path: "src/control_plane/application/commands/knowledge.py", pattern: '"knowledge.document_stored"'}
+  repo: control-plane
+- grep: {path: "src/control_plane/infrastructure/context_provider/http.py", pattern: '"namespace": namespace, "properties": properties'}
+  repo: control-plane
+- grep: {path: "client/src/control_plane_client/client.py", pattern: "def submit_knowledge_document"}
+  repo: control-plane
+- grep: {path: "src/control_plane/application/commands/knowledge.py", pattern: 'await authorize\(ctx, Permission.KNOWLEDGE_PACKS_MANAGE\)'}
+  repo: control-plane
+- grep: {path: "src/control_plane/application/commands/knowledge.py", pattern: '"namespace": tenant_namespace\(settings, ctx.tenant_id\)'}
+  repo: control-plane
+- grep: {path: "src/control_plane/domain/enums.py", pattern: 'KNOWLEDGE_PACKS_MANAGE = "knowledge.packs.manage"'}
+  repo: control-plane
+- grep: {path: "authz/catalog.yaml", pattern: 'knowledge\.packs\.manage:'}
+  repo: control-plane
+- grep: {path: "src/control_plane/api/v1/knowledge.py", pattern: '"/knowledge/entities:query"'}
+  repo: control-plane
+- grep: {path: "src/control_plane/infrastructure/context_provider/http.py", pattern: '"/api/memory/entities:query"'}
+  repo: control-plane
+- grep: {path: "src/control_plane/application/queries/knowledge_entities.py", pattern: 'Permission.EVENTS_READ, resource=ResourceRef\("workspace"'}
+  repo: control-plane
+- grep: {path: "client/src/control_plane_client/client.py", pattern: "def query_knowledge_entities"}
   repo: control-plane
 ```

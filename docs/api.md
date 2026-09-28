@@ -19,7 +19,7 @@ Permissions ключа: `principals.read|write`, `delegations.manage`,
 `artifact_types.read|manage` (CP-ADR-0072),
 `agents.read|manage|status.write` (CP-ADR-0073),
 `processes.read|write|operate`, `packages.test|plan`, `calendars.write`
-(CP-ADR-0074), `admin`
+(CP-ADR-0074), `knowledge.packs.manage` (CP-ADR-0060), `admin`
 (подразумевает все). Права v0.5 не выдаются старым ключам неявно —
 их нужно назначить явно (см. [migration-v0.5](migration-v0.5.md)). Проверка выполняется и в route-слое, и в командах
 application-слоя.
@@ -579,7 +579,9 @@ GET  /api/v1/artifacts/{id}               artifacts.read  (CP-ADR-0072: на з�
                                           без задачи — на его воркспейсе, без обоих — tenant;
                                           ?forTask=<ref> — как вход задачи-получателя:
                                           tasks.read на ней и артефакт — её разрешённый
-                                          вход, иначе обычная проверка)
+                                          вход, иначе обычная проверка; исполнитель
+                                          скилла — skills.execute и artifacts.read на
+                                          workspace задачи артефакта, K012)
 
 Содержимое артефактов (CP-ADR-0072):
 PUT  /api/v1/artifact-contents            artifacts.write (тело — байты файла, Content-Type —
@@ -592,7 +594,9 @@ PUT  /api/v1/artifact-contents            artifacts.write (тело — байт
                                           выключено или недоступно — 503
                                           content_store_unavailable)
 GET  /api/v1/artifacts/{id}/content       artifacts.read на задаче артефакта |
-                                          ?forTask=<ref> с tasks.read на задаче-получателе
+                                          ?forTask=<ref> с tasks.read на задаче-получателе |
+                                          skills.execute и artifacts.read на workspace
+                                          задачи артефакта (исполнитель скилла, K012)
                                           (поток байтов;
                                           Content-Type = mediaType, ETag "sha256:<hex>",
                                           X-Content-Type-Options: nosniff, Cache-Control:
@@ -912,7 +916,13 @@ POST /api/v1/context/recall               events.read (+ tasks.read при task)
                                           in|out|both (both), depth 1..5 (1), limit 1..200
                                           (20), asOf, task | workspaceId — namespaces и
                                           видимость выводит ядро, budgetTokens 1..32000
-                                          (3000); query без идентификаторов —
+                                          (3000); where[≤20] — {attr, op
+                                          eq|in|prefix|lte|gte|exists, value} как
+                                          $defs/memoryWhere, значения — литералы (CEL
+                                          не вычисляется), уходят в typed памяти как
+                                          есть и отбирают якоря; неверное условие —
+                                          400 invalid_request;
+                                          query без идентификаторов —
                                           семантический добор (semantic: true); ответ
                                           {anchors, semantic, asOf, namespaces, warnings,
                                           pack (урезан до budgetTokens, omitted)}; 503
@@ -949,19 +959,64 @@ POST /api/v1/knowledge/snapshots         observations.write на workspace:<work
                                           409 snapshot_stale — память держит более новый
                                           снимок; 502 memory_unavailable; 503
                                           memory_disabled; событие
-                                          knowledge.snapshot_reconciled без содержимого)
+                                          knowledge.snapshot_reconciled без содержимого;
+                                          expectedState (≤128, stateToken предпросмотра) —
+                                          в память рядом со снимком: применить, только
+                                          если состояние источника не изменилось, иначе
+                                          409 snapshot_stale)
+POST /api/v1/knowledge/snapshots:preview observations.write на workspace:<workspaceId>
+                                          (ADR-0060 амендмент 2026-09-28: тело снимка без
+                                          expectedState → память reconcile с dryRun: true;
+                                          ответ памяти как есть: changes, счётчики,
+                                          conflicts, stateToken; ничего не пишет, событий
+                                          нет; 422 snapshot_invalid, 409 snapshot_stale —
+                                          снимок старше принятого; ответ без плана
+                                          (память без предпросмотра) — 502
+                                          memory_unavailable, retryable false)
+POST /api/v1/knowledge/documents         observations.write на workspace:<workspaceId>
+                                          (ADR-0060 амендмент 2026-09-28: {workspaceId,
+                                          naturalKey, title, type, chunks[1..500]{text,
+                                          heading, order}, links[≤200]{kind, key, rel},
+                                          meta}; файлы ядро не разбирает; namespace корня
+                                          дерева, scope workspace:<id>; тело до 8 МиБ →
+                                          память POST /api/brain/documents; ответ памяти
+                                          как есть; 422 document_invalid; событие
+                                          knowledge.document_stored без текста)
+POST /api/v1/knowledge/entities:query    events.read на workspace:<workspaceId>
+                                          (ADR-0060 амендмент K031: {workspaceId,
+                                          kinds[1..20], where[≤20]{attr, op, value} —
+                                          как у /context/recall, asOf, limit 1..500
+                                          (100), cursor}; namespace корня дерева и
+                                          видимость вызывающего выводит ядро
+                                          (namespaces/scope в теле → 400); память POST
+                                          /api/memory/entities:query; ответ {items
+                                          (EntityItem памяти как есть), nextCursor
+                                          (null — конец перечня), asOf}; namespace
+                                          корня вне видимости policy → 403; 422
+                                          entities_query_invalid — чужой курсор; 502
+                                          memory_unavailable; 503 memory_disabled /
+                                          memory_timeout; событий нет)
 POST /api/v1/knowledge/packs             администратор платформы: principal из
                                           CP_KNOWLEDGE_PACK_ADMINS, пусто → 403 (ADR-0060:
                                           манифест доменного пакета как есть → память POST
                                           /api/memory/packages; ответ памяти как есть;
                                           без name/version → 422 pack_invalid (ядро);
                                           422 pack_invalid, 409 pack_version_conflict;
-                                          событие knowledge.pack_registered)
+                                          событие knowledge.pack_registered);
+                                          scope: tenant — пакет арендатора по
+                                          knowledge.packs.manage без списка администраторов
+                                          (амендмент 2026-09-28, K010): ядро добавляет
+                                          namespace-владельца tenant:<tenantId>; namespace
+                                          в манифесте → 400; имя пакета, вида или связи
+                                          занято общим пакетом → 422 pack_invalid с
+                                          details.conflict; scope: common — то же, что без
+                                          scope (общий пакет); иное значение scope → 400
 PUT  /api/v1/workspaces/{id}/knowledge-packs
                                           workspaces.manage на workspace:<id>  (ADR-0060:
                                           {packs[], strict} → память PUT
                                           /api/memory/namespaces/{ns}/kinds; только ссылки
-                                          name@version, иначе 422 pack_version_required;
+                                          name@version или tenant:name@version (пакет
+                                          арендатора), иначе 422 pack_version_required;
                                           неизвестный пакет — 422 pack_not_found; только
                                           корень дерева, иначе 422 workspace_not_root;
                                           событие knowledge.packs_configured)
@@ -1251,11 +1306,11 @@ bootstrap-admin они входят автоматически (как все п
 | 409 | `project_exists`, `workspace_type_exists`, `external_reference_conflict`, `retention_blocked_by_consumer`, `task_already_claimed`, `version_conflict`, `stale_claim`, `task_claimed`, `session_expired`, `session_not_active`, `claim_expired`, `claim_not_active`, `claim_not_expired`, `idempotency_key_reused`, `idempotency_in_flight`, `already_bootstrapped`, `task_already_completed`, `task_not_ready`, `run_already_active`, `run_not_active`, `run_in_progress`, `workspace_slug_conflict`, `role_slug_conflict`, `capability_exists`, `skill_exists`, `relation_exists`, `approval_already_decided`, `approval_required` (v0.3 gate), `verification_pending` (ADR-0067), `budget_exceeded`, `action_already_finished`, `child_handle_revoked`, `child_handle_expired`, `child_run_already_bound`, `skill_not_invocable`, `skill_version_immutable`, `invalid_status_transition`, `idempotency_key_reuse`, `stale_invocation_lease`, `approval_already_used`, `task_terminal`, `outcome_not_replayable`, `approval_precondition_failed`, `snapshot_stale`, `pack_version_conflict`, `input_missing` (CP-ADR-0072), `content_not_stored` (CP-ADR-0072) |
 | 410 | `content_purged` (содержимое удалено `:purge-content`, CP-ADR-0072) |
 | 413 | `request_too_large` (в т.ч. загрузка сверх `CP_ARTIFACT_MAX_BYTES`) |
-| 422 | `invalid_*` (доменная валидация), `task_not_claimable`, `task_cancelled`, `empty_update`, `unknown_requirement`, `dependency_cycle`, `workspace_cycle`, `workspace_archived`, `workspace_has_active_children`, `task_not_runnable`, `artifact_mismatch`, `invalid_approval`, `skill_disabled`, `unsupported_protocol_version`, `invalid_harness`, `invalid_budget`, `invalid_checkpoint`, `invalid_action`, `invalid_tool_query`, `invalid_correlation_id`, `invalid_child_grant`, `invalid_child_result`, `invalid_child_handle_ref`, `invalid_child_handle_token`, `invalid_entity_type`, `invalid_entity_reference`, `invalid_external_lookup`, `status_not_in_lifecycle`, `invalid_transition`, `invalid_lifecycle_schema`, `invalid_status_category`, `system_task_type_required`, `child_grant_exceeds_parent`, `child_depth_exceeded`, `child_result_too_large`, `invalid_skill_contract`, `unsupported_skill_condition`, `secret_material_rejected`, `invalid_approval_schema`, `workspace_not_root`, `pack_invalid`, `pack_not_found`, `pack_version_required`, `snapshot_invalid`, `invalid_context_schema`, `invalid_recall_request`; CP-ADR-0072: `invalid_artifact_content`, `content_ref_not_found`, `invalid_artifact_metadata`, `media_type_not_allowed`, `artifact_too_large`, `invalid_artifact_type`, `invalid_artifact_schema`, `unknown_artifact_type` |
+| 422 | `invalid_*` (доменная валидация), `task_not_claimable`, `task_cancelled`, `empty_update`, `unknown_requirement`, `dependency_cycle`, `workspace_cycle`, `workspace_archived`, `workspace_has_active_children`, `task_not_runnable`, `artifact_mismatch`, `invalid_approval`, `skill_disabled`, `unsupported_protocol_version`, `invalid_harness`, `invalid_budget`, `invalid_checkpoint`, `invalid_action`, `invalid_tool_query`, `invalid_correlation_id`, `invalid_child_grant`, `invalid_child_result`, `invalid_child_handle_ref`, `invalid_child_handle_token`, `invalid_entity_type`, `invalid_entity_reference`, `invalid_external_lookup`, `status_not_in_lifecycle`, `invalid_transition`, `invalid_lifecycle_schema`, `invalid_status_category`, `system_task_type_required`, `child_grant_exceeds_parent`, `child_depth_exceeded`, `child_result_too_large`, `invalid_skill_contract`, `unsupported_skill_condition`, `secret_material_rejected`, `invalid_approval_schema`, `workspace_not_root`, `pack_invalid`, `pack_not_found`, `pack_version_required`, `snapshot_invalid`, `invalid_context_schema`, `invalid_recall_request`, `entities_query_invalid` (`/knowledge/entities:query`, CP-ADR-0060 K031); CP-ADR-0072: `invalid_artifact_content`, `content_ref_not_found`, `invalid_artifact_metadata`, `media_type_not_allowed`, `artifact_too_large`, `invalid_artifact_type`, `invalid_artifact_schema`, `unknown_artifact_type` |
 | 428 | `if_match_required` |
 | 500 | `internal_error` (без стектрейса) |
 | 502 | `memory_unavailable` (память не обработала проксируемый запрос, в т.ч. отвергла credential ядра — `403`; `details.memoryStatus`, `details.retryable`; текст ответа памяти клиенту не отдаётся) |
-| 503 | readiness: БД недоступна или миграции не применены; `decision_unavailable`; `memory_disabled`; `memory_timeout` (`/context/recall`, `:replay`); `content_store_unavailable` (хранилище содержимого выключено или недоступно, CP-ADR-0072) |
+| 503 | readiness: БД недоступна или миграции не применены; `decision_unavailable`; `memory_disabled`; `memory_timeout` (`/context/recall`, `:replay`, `/knowledge/entities:query`); `content_store_unavailable` (хранилище содержимого выключено или недоступно, CP-ADR-0072) |
 
 ## События
 
@@ -1279,8 +1334,10 @@ bootstrap-admin они входят автоматически (как все п
 `knowledge.snapshot_reconciled` (ADR-0060: snapshotId, pack, source, observedAt,
 namespace, число сущностей/связей, `duplicate` и числовые счётчики ответа памяти —
 без содержимого снимка), `knowledge.pack_registered` (entity `knowledge_pack`;
-name, version, status — без манифеста), `knowledge.packs_configured` (entity
-`workspace`; namespace, закреплённые packs, strict), `knowledge.changed`
+name, version, status, с v2 — scope `common|tenant`; без манифеста), `knowledge.packs_configured` (entity
+`workspace`; namespace, закреплённые packs, strict), `knowledge.document_stored`
+(ADR-0060 амендмент, п. К3, entity `workspace`: naturalKey, title, type, namespace,
+число фрагментов и связей — без текста), `knowledge.changed`
 (CP-ADR-0076 п.7, entity `workspace`: `changes[{kind, key, change opened|changed|
 closed}]`, `truncated` — после сверки снимка, пустая сверка события не даёт).
 

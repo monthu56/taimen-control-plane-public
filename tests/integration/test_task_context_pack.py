@@ -639,6 +639,56 @@ async def test_recall_from_a_query_extracts_identifiers_and_honours_as_of(
     assert memory.typed_requests[-1]["allow_semantic"] is True
 
 
+async def test_recall_passes_where_to_memory_as_it_is(
+    client: httpx.AsyncClient, memory: FakeGraphMemory, app
+) -> None:
+    # CP-ADR-0064, amendment 2026-09-28: literals only, no CEL; memory filters.
+    s = await _setup(client)
+    where = [
+        {"attr": "okpd2", "op": "prefix", "value": "62.01"},
+        {"attr": "validUntil", "op": "lte", "value": "2026-10-28T00:00:00Z"},
+        {"attr": "blocked", "op": "exists"},
+    ]
+    response = await client.post(
+        "/api/v1/context/recall",
+        json={"anchor": "POST /tasks/{task_id}:claim", "where": where, "task": s["task"]["id"]},
+        headers=auth(s["agent_key"]),
+    )
+    assert response.status_code == 200, response.text
+    assert memory.typed_requests[-1]["where"] == where
+    plain = await client.post(
+        "/api/v1/context/recall", json={"anchor": "x"}, headers=auth(s["agent_key"])
+    )
+    assert plain.status_code == 200
+    assert "where" not in memory.typed_requests[-1]
+    sent = len(memory.typed_requests)
+    for bad in (
+        [{"attr": "okpd2", "op": "prefix", "value": ".62"}],
+        [{"attr": "validUntil", "op": "gte", "value": "self.now"}],
+        [{"attr": "a.b", "op": "eq", "value": 1}],
+        [{"attr": "status", "op": "in"}],
+        [{"attr": "okpd2", "op": "exists"}] * 21,
+    ):
+        refused = await client.post(
+            "/api/v1/context/recall",
+            json={"anchor": "x", "where": bad},
+            headers=auth(s["agent_key"]),
+        )
+        assert refused.status_code == 400, refused.text
+        assert refused.json()["error"]["code"] == "invalid_request"
+    assert len(memory.typed_requests) == sent
+    schema = app.openapi()["components"]["schemas"]
+    assert schema["RecallRequest"]["properties"]["where"]["maxItems"] == 20
+    assert set(schema["MemoryWhereCondition"]["properties"]["op"]["enum"]) == {
+        "eq",
+        "in",
+        "prefix",
+        "lte",
+        "gte",
+        "exists",
+    }
+
+
 async def test_recall_contract_errors(client: httpx.AsyncClient, app) -> None:
     s = await _setup(client)
     both = {"anchor": "x", "query": "y"}

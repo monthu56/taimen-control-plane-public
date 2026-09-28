@@ -1396,6 +1396,65 @@ def test_recall_asks_memory_through_an_intent_and_takes_the_answer_as_input() ->
     assert run.status == "completed"
 
 
+RECALL_WHERE = """
+memory:
+  case: {key: "'case:' + data.number"}
+stages:
+  - id: s
+    steps:
+      - id: code
+        set: {value: "'62.01'"}
+      - id: offers
+        recall:
+          anchors: [{kind: company, key: data.author}]
+          query: "'software for ' + data.number"
+          where:
+            - {attr: okpd2, op: prefix, value: data.value}
+            - {attr: validUntil, op: gte, value: data.deadline}
+            - {attr: status, op: in, value: ["'active'", "'draft'"]}
+            - {attr: price, op: lte, value: data.amount * 2.0}
+            - {attr: blocked, op: exists, value: false}
+            - {attr: okpd2, op: exists}
+        output: {as: {history: step.result.nodes}}
+"""
+
+
+def test_recall_where_is_computed_from_the_data_into_the_intent() -> None:
+    # CP-ADR-0076, amendment 2026-09-28: CEL values become JSON literals.
+    run = Run(RECALL_WHERE)
+    run.start()
+    (asked,) = run.intents("recall")
+    assert asked["where"] == [
+        {"attr": "okpd2", "op": "prefix", "value": "62.01"},
+        {"attr": "validUntil", "op": "gte", "value": "2026-05-04T09:00:00Z"},
+        {"attr": "status", "op": "in", "value": ["active", "draft"]},
+        {"attr": "price", "op": "lte", "value": 200},
+        {"attr": "blocked", "op": "exists", "value": False},
+        {"attr": "okpd2", "op": "exists"},
+    ]
+    assert list(asked).index("where") == list(asked).index("query") + 1
+    # The intent is recorded whole: another deadline is another where.
+    later = Run(RECALL_WHERE)
+    later.start(deadline="2026-06-01T00:00:00Z")
+    (other,) = later.intents("recall")
+    assert other["where"][1]["value"] == "2026-06-01T00:00:00Z"
+    assert (asked["anchors"], asked["query"]) == (other["anchors"], other["query"])
+
+
+def test_recall_without_where_asks_as_before() -> None:
+    run = Run(RECALL)
+    run.start()
+    (asked,) = run.intents("recall")
+    assert "where" not in asked
+
+
+def test_an_error_in_a_where_value_fails_the_step_like_an_anchor() -> None:
+    run = Run(RECALL_WHERE.replace("value: data.value}", "value: string(int(data.number))}"))
+    run.start()
+    assert run.intents("recall") == []
+    assert run.status == "failed"
+
+
 def test_recall_without_an_answer_in_time_goes_the_timeout_way() -> None:
     run = Run(RECALL)
     run.start()

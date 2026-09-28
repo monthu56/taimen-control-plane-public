@@ -15,11 +15,15 @@ Wire contract (the Memory Service's public ``/api/memory/*`` API):
   namespace (CP-ADR-0060). The body is the FLAT snapshot document (``pack``,
   ``source``, ``scope`` -- a string of the source --, ``snapshotId``,
   ``observedAt``, ``entities``, ``relations``) plus top-level ``namespace`` and
-  ``scopes`` (Memory's ``ReconcileIn``). Answer: counters and ``duplicate``;
-  400 for an invalid snapshot, 409 for one older than the one already applied.
+  ``scopes`` (Memory's ``ReconcileIn``), and ``dryRun: true`` for a preview or
+  ``expectedState`` for an apply by state when asked (MEM-ADR-020 amendment
+  2026-09-28). Answer: counters, ``duplicate``, ``changes`` and ``stateToken``;
+  400 for an invalid snapshot, 409 for one older than the one already applied
+  or for a state that is no longer ``expectedState``.
 * ``POST /api/memory/packages`` → register a domain knowledge pack (the
   manifest as is; 201 created, 200 unchanged, 409 version exists with other
-  content); ``PUT /api/memory/namespaces/{ns}/kinds`` with
+  content or -- ``detail.code`` -- a tenant pack's name clashes with a shared
+  pack); ``PUT /api/memory/namespaces/{ns}/kinds`` with
   ``{"strict", "packages"}`` → enabled packs and strict mode of a namespace
   (404 for an unknown pack reference).
 * ``POST /api/memory/context/typed`` → typed traversal of the knowledge graph
@@ -28,6 +32,12 @@ Wire contract (the Memory Service's public ``/api/memory/*`` API):
   same ``scope`` and visibility fields as ``/context``. Answer: sections of
   entities by kind, ``facts``, ``used{entities, facts, snapshots}``,
   ``anchors``/``unresolved`` and ``trace_id``.
+* ``POST /api/memory/entities:query`` → the entities of ``kinds`` valid at
+  ``asOf`` whose attributes satisfy ``where``, a page of ``limit`` from
+  ``cursor`` (MEM-ADR-020, K030): ``namespaces`` plus the same visibility
+  fields as ``/context``. Answer: ``items`` in ``(kind, key, namespace)``
+  order and ``nextCursor`` (``null`` at the end); 400 for a request it
+  cannot read (a foreign cursor).
 * ``GET /api/memory/namespaces/{ns}/kinds`` → the kind catalog of a namespace
   (``catalog.packages`` — the enabled packs as ``name@version``);
   ``GET /api/memory/packages/{name}?version=`` → one pack version with the
@@ -52,6 +62,17 @@ import httpx
 from control_plane.infrastructure.context_provider.base import ContextProviderError, IngestResult
 
 TokenProvider = Callable[[], Awaitable[str]]
+
+
+def _error_code(response: httpx.Response) -> str | None:
+    """``detail.code`` of an error body (``{"detail": {"code", "message"}}``), if any."""
+    try:
+        body = response.json()
+    except ValueError:
+        return None
+    detail = body.get("detail") if isinstance(body, dict) else None
+    code = detail.get("code") if isinstance(detail, dict) else None
+    return code[:64] if isinstance(code, str) and code else None
 
 
 class HttpContextProvider:
@@ -165,6 +186,7 @@ class HttpContextProvider:
                 f"{response.text[:500]}",
                 retryable=False,
                 status=response.status_code,
+                code=_error_code(response),
             )
         return response
 
@@ -280,11 +302,19 @@ class HttpContextProvider:
         namespace: str,
         scopes: list[str],
         snapshot: dict[str, Any],
+        dry_run: bool = False,
+        expected_state: str | None = None,
         trace_run_id: str | None = None,
     ) -> dict[str, Any]:
+        body: dict[str, Any] = {**snapshot, "namespace": namespace, "scopes": scopes}
+        # Sent only when set: the body of a plain reconciliation stays as before.
+        if dry_run:
+            body["dryRun"] = True
+        if expected_state is not None:
+            body["expectedState"] = expected_state
         response = await self._post(
             "/api/memory/reconcile",
-            {**snapshot, "namespace": namespace, "scopes": scopes},
+            body,
             request_timeout=self._reconcile_timeout,
             trace_run_id=trace_run_id,
         )
@@ -317,6 +347,26 @@ class HttpContextProvider:
             trace_run_id=trace_run_id,
         )
         return await self._json_object(response, "namespace kinds")
+
+    async def store_document(
+        self,
+        *,
+        namespace: str,
+        scopes: list[str],
+        document: dict[str, Any],
+        trace_run_id: str | None = None,
+    ) -> dict[str, Any]:
+        # Memory reads a node's visibility from ``properties.scopes``. Up to 500
+        # chunks are embedded in one call: the knowledge timeout, not the
+        # observation one.
+        properties = {**(document.get("properties") or {}), "scopes": scopes}
+        response = await self._post(
+            "/api/brain/documents",
+            {**document, "namespace": namespace, "properties": properties},
+            request_timeout=self._reconcile_timeout,
+            trace_run_id=trace_run_id,
+        )
+        return await self._json_object(response, "document")
 
     async def typed_context(
         self,
@@ -366,6 +416,21 @@ class HttpContextProvider:
             params={"version": version} if version else None,
         )
         return await self._json_object(response, "package")
+
+    async def query_entities(
+        self,
+        *,
+        namespaces: list[str],
+        request: dict[str, Any],
+        trace_run_id: str | None = None,
+    ) -> dict[str, Any]:
+        response = await self._post(
+            "/api/memory/entities:query",
+            {**request, "namespaces": list(namespaces)},
+            request_timeout=self._timeout,
+            trace_run_id=trace_run_id,
+        )
+        return await self._json_object(response, "entities page")
 
     async def healthy(self) -> bool:
         try:

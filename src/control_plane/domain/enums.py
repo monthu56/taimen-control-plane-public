@@ -132,6 +132,10 @@ class Permission(StrEnum):
     PACKAGES_TEST = "packages.test"
     PACKAGES_PLAN = "packages.plan"
     CALENDARS_WRITE = "calendars.write"
+    # company-knowledge (CP-ADR-0060 amendment 2026-09-28). A tenant registers
+    # the ontology packs of its own kinds; the shared registry stays with the
+    # platform administrators, so this right never reaches a shared pack.
+    KNOWLEDGE_PACKS_MANAGE = "knowledge.packs.manage"
     ADMIN = "admin"
 
 

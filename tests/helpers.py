@@ -311,14 +311,27 @@ class FakeKnowledge:
         self,
         *,
         fail_status: int | None = None,
+        fail_code: str | None = None,
         retryable: bool = False,
         changes: dict[str, Any] | None = None,
+        preview: bool = True,
     ) -> None:
         self.fail_status = fail_status
+        # ``detail.code`` of Memory's error body, when it names one.
+        self.fail_code = fail_code
         self.retryable = retryable
         # ``changes`` of Memory's reconcile answer (MEM-ADR-020), when given.
         self.changes = changes
+        # False: a Memory before the preview, which ignores ``dryRun`` and applies.
+        self.preview = preview
+        # ``stateToken`` of the one (source, scope) the fake keeps: bumped by
+        # every applied snapshot, checked against ``expected_state``.
+        self.applied = 0
         self.calls: list[tuple[str, dict[str, Any]]] = []
+
+    @property
+    def state_token(self) -> str:
+        return f"st1-{self.applied}"
 
     def _maybe_fail(self) -> None:
         if self.fail_status is not None:
@@ -326,17 +339,26 @@ class FakeKnowledge:
                 f"memory said {self.fail_status}",
                 retryable=self.retryable,
                 status=self.fail_status,
+                code=self.fail_code,
             )
 
     async def reconcile_snapshot(self, **kwargs: Any) -> dict[str, Any]:
         self.calls.append(("reconcile", kwargs))
         self._maybe_fail()
+        dry_run = bool(kwargs.get("dry_run")) and self.preview
+        expected = kwargs.get("expected_state")
+        if expected is not None and self.preview and expected != self.state_token:
+            raise ContextProviderError("memory said 409", retryable=False, status=409)
+        if not dry_run:
+            self.applied += 1
         answer: dict[str, Any] = {
             "snapshotId": kwargs["snapshot"]["snapshotId"],
             "duplicate": False,
             "entities": {"created": 1, "updated": 0, "deleted": 0},
             "relations": {"created": 1, "deleted": 0},
         }
+        if self.preview:
+            answer |= {"dryRun": dry_run, "stateToken": self.state_token}
         if self.changes is not None:
             answer["changes"] = self.changes
         return answer
@@ -354,6 +376,19 @@ class FakeKnowledge:
         self.calls.append(("kinds", kwargs))
         self._maybe_fail()
         return {"namespace": kwargs["namespace"], "packages": kwargs["packages"]}
+
+    async def store_document(self, **kwargs: Any) -> dict[str, Any]:
+        self.calls.append(("document", kwargs))
+        self._maybe_fail()
+        document = kwargs["document"]
+        # Memory's retain_document summary.
+        return {
+            "natural_key": document["natural_key"],
+            "namespace": kwargs["namespace"],
+            "type": document["type"],
+            "chunks": len(document["chunks"]),
+            "replaced": document["replace"],
+        }
 
     async def aclose(self) -> None:
         pass

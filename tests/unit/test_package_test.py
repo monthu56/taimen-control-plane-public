@@ -214,6 +214,65 @@ stages:
     assert bad.status == "failed" and "not a memory answer" in bad.failures[0].message
 
 
+def test_a_recall_mock_answers_by_the_computed_where() -> None:
+    # CP-ADR-0076, amendment 2026-09-28 (K011): the mock's input is the intent,
+    # its where computed from the data, so a test answers each filter its own way.
+    body = """
+stages:
+  - id: s
+    steps:
+      - id: code
+        set: {value: "data.amount > 500.0 ? '62.01' : '58.29'"}
+      - id: offers
+        recall:
+          anchors: [{kind: company, key: data.author}]
+          where:
+            - {attr: okpd2, op: prefix, value: data.value}
+            - {attr: validUntil, op: gte, value: data.deadline}
+        output: {as: {history: step.result.nodes}}
+"""
+    software = {"nodes": [{"kind": "product", "key": "p-62"}]}
+    books = {"nodes": [{"kind": "product", "key": "p-58"}]}
+    mocks = {
+        "recall": [
+            {
+                "step": "offers",
+                "when": "input.where.exists(c, c.attr == 'okpd2' && c.value == '62.01')"
+                " && input.where.exists(c, c.attr == 'validUntil'"
+                " && c.op == 'gte' && c.value == '2026-05-04T09:00:00Z')",
+                "output": software,
+            },
+            {"step": "offers", "when": "input.where[0].value == '58.29'", "output": books},
+        ]
+    }
+    for amount, key in ((1000, "p-62"), (100, "p-58")):
+        result = run(
+            body,
+            [
+                opened(amount=amount),
+                {
+                    "expect": {
+                        "memory": {"recalled": ["offers"]},
+                        "data": {"history": [{"kind": "product", "key": key}]},
+                        "status": "completed",
+                    }
+                },
+            ],
+            mocks=mocks,
+        )
+        assert result.status == "passed", result.failures
+    # Another deadline is another filter: no mock answers it, the step waits.
+    missed = run(
+        body,
+        [
+            opened(amount=1000, deadline="2026-06-01T00:00:00Z"),
+            {"expect": {"memory": {"recalled": []}, "status": "running"}},
+        ],
+        mocks=mocks,
+    )
+    assert missed.status == "passed", missed.failures
+
+
 APPROVE = """
 stages:
   - id: s

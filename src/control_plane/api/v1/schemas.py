@@ -1,5 +1,6 @@
 """HTTP contract: request/response schemas (camelCase over the wire)."""
 
+import re
 import uuid
 from collections.abc import Sequence
 from datetime import date, datetime
@@ -276,6 +277,60 @@ class ContextQueryRequest(ApiModel):
 
 
 _GRAPH_NAME = r"^[a-z][a-z0-9_]{0,62}$"
+_WHERE_SCALAR = (str, int, float, bool)
+_PREFIX_CODE = re.compile(r"^[^.]+(\.[^.]+)*$")
+_DATE_START = re.compile(r"^\d{4}-\d{2}-\d{2}")
+
+
+def _is_number(value: Any) -> bool:
+    return isinstance(value, int | float) and not isinstance(value, bool)
+
+
+class MemoryWhereCondition(ApiModel):
+    """One ``recall.where`` condition (``$defs/memoryWhere``, MEM-ADR-020).
+
+    The value is a literal the caller already computed: the core evaluates no
+    CEL here and sends the condition to memory unchanged. The value rules are
+    memory's (``context/where.parse_where``): ``eq`` a scalar, ``in`` 1..100
+    scalars, ``prefix`` a dotted code, ``lte``/``gte`` a number or an RFC 3339
+    date, ``exists`` a bool (true when omitted).
+    """
+
+    attr: str = Field(pattern=r"^[A-Za-z_][A-Za-z0-9_]{0,63}$")
+    op: Literal["eq", "in", "prefix", "lte", "gte", "exists"]
+    value: Any = Field(
+        default=None,
+        description="eq: string|number|boolean; in: array of 1..100 of them; "
+        "prefix: dotted code; lte/gte: number or RFC 3339 date; exists: boolean",
+    )
+
+    @model_validator(mode="after")
+    def _value_fits_op(self) -> "MemoryWhereCondition":
+        given = "value" in self.model_fields_set
+        value = self.value
+        if self.op == "exists":
+            ok = not given or isinstance(value, bool)
+        elif not given:
+            ok = False
+        elif self.op == "eq":
+            ok = isinstance(value, _WHERE_SCALAR)
+        elif self.op == "in":
+            ok = (
+                isinstance(value, list)
+                and 1 <= len(value) <= 100
+                and all(isinstance(v, _WHERE_SCALAR) for v in value)
+            )
+        elif self.op == "prefix":
+            ok = isinstance(value, str) and bool(_PREFIX_CODE.match(value))
+        else:
+            ok = _is_number(value) or (isinstance(value, str) and bool(_DATE_START.match(value)))
+        if not ok:
+            raise ValueError(f"value does not fit op {self.op!r}")
+        return self
+
+    def to_memory(self) -> dict[str, Any]:
+        """The condition as memory's typed traversal takes it."""
+        return self.model_dump(mode="json", exclude_unset=True)
 
 
 class RecallRequest(ApiModel):
@@ -287,6 +342,8 @@ class RecallRequest(ApiModel):
     ``direction``, at most ``limit`` new entities per step. The namespaces come
     from ``task``/``workspaceId``, never from the client. The pack in the
     answer is cut to ``budgetTokens`` (``omitted`` counts the rest).
+    ``where`` filters the nodes by their attributes (all conditions hold);
+    it goes to memory as it is.
     """
 
     anchor: str | None = Field(default=None, min_length=1, max_length=300)
@@ -305,6 +362,7 @@ class RecallRequest(ApiModel):
     task: str | None = None
     workspace_id: uuid.UUID | None = None
     budget_tokens: int = Field(default=3_000, ge=1, le=32_000)
+    where: list[MemoryWhereCondition] = Field(default_factory=list, max_length=20)
 
 
 class ObservationExternalRef(ApiModel):
@@ -353,7 +411,7 @@ KNOWLEDGE_SNAPSHOT_ID_MAX = 200
 KNOWLEDGE_MAX_ITEMS = 20_000
 
 
-class KnowledgeSnapshotRequest(ApiModel):
+class KnowledgeSnapshotPreviewRequest(ApiModel):
     """A connector's snapshot of one source (CP-ADR-0060), forwarded as-is.
 
     Namespace and visibility scopes are computed by the core from
@@ -375,7 +433,7 @@ class KnowledgeSnapshotRequest(ApiModel):
     relations: list[dict[str, Any]] = Field(default_factory=list, max_length=KNOWLEDGE_MAX_ITEMS)
 
     @model_validator(mode="after")
-    def _bounded_items(self) -> "KnowledgeSnapshotRequest":
+    def _bounded_items(self) -> "KnowledgeSnapshotPreviewRequest":
         if len(self.entities) + len(self.relations) > KNOWLEDGE_MAX_ITEMS:
             raise ValueError(
                 f"entities and relations together must not exceed {KNOWLEDGE_MAX_ITEMS} items"
@@ -386,8 +444,171 @@ class KnowledgeSnapshotRequest(ApiModel):
         """The snapshot as Memory reads it: camelCase fields, no ``workspaceId``,
         ``null`` fields omitted."""
         return self.model_dump(
-            mode="json", by_alias=True, exclude={"workspace_id"}, exclude_none=True
+            mode="json",
+            by_alias=True,
+            exclude={"workspace_id", "expected_state"},
+            exclude_none=True,
         )
+
+
+# The state fingerprint Memory answers a reconciliation with (``stateToken``,
+# amendment MEM-ADR-020): opaque to the core, passed back as ``expectedState``.
+# The bound is Memory's (``ReconcileIn.expectedState``): a longer token would be
+# its 422, i.e. a 502 here instead of the caller's 400.
+KNOWLEDGE_STATE_TOKEN_MAX = 128
+
+
+class KnowledgeSnapshotRequest(KnowledgeSnapshotPreviewRequest):
+    """A snapshot to apply. ``expectedState`` (CP-ADR-0060 amendment
+    2026-09-28) applies it only while the knowledge of its source is still in
+    the state a preview showed: otherwise ``409 snapshot_stale``."""
+
+    expected_state: str | None = Field(
+        default=None, min_length=1, max_length=KNOWLEDGE_STATE_TOKEN_MAX
+    )
+
+
+class KnowledgeSnapshotPreviewOut(BaseModel):
+    """Memory's plan of a reconciliation, returned as-is: what would open,
+    change and close, and the state it was computed on. Only ``stateToken`` is
+    the core's to name; the rest is Memory's (MEM-ADR-020)."""
+
+    model_config = ConfigDict(extra="allow")
+
+    state_token: str = Field(alias="stateToken")
+
+
+# Memory's document ingest bound (``retrieval.documents.MAX_CHUNKS_PER_REQUEST``).
+KNOWLEDGE_DOCUMENT_MAX_CHUNKS = 500
+
+
+class KnowledgeDocumentChunk(ApiModel):
+    text: str = Field(min_length=1)
+    heading: str = Field(default="", max_length=500)
+    order: int | None = Field(default=None, ge=0)
+
+
+class KnowledgeDocumentLink(ApiModel):
+    """An entity of the knowledge base the document is about: ``{kind, key}``
+    as a snapshot names it, and the relation from the document to it."""
+
+    kind: str = Field(min_length=1, max_length=128)
+    key: str = Field(min_length=1, max_length=512)
+    rel: str = Field(min_length=1, max_length=128)
+
+
+class KnowledgeDocumentRequest(ApiModel):
+    """A document of the knowledge base (CP-ADR-0060 amendment 2026-09-28):
+    text already cut into chunks by the caller -- the core parses no files --
+    stored in the namespace of the workspace tree root, like a snapshot."""
+
+    workspace_id: uuid.UUID
+    natural_key: str = Field(min_length=1, max_length=512)
+    title: str = Field(min_length=1, max_length=500)
+    type: str = Field(default="document", min_length=1, max_length=128)
+    chunks: list[KnowledgeDocumentChunk] = Field(
+        min_length=1, max_length=KNOWLEDGE_DOCUMENT_MAX_CHUNKS
+    )
+    links: list[KnowledgeDocumentLink] = Field(default_factory=list, max_length=200)
+    meta: dict[str, Any] | None = None
+
+    def memory_document(self) -> dict[str, Any]:
+        """The document as Memory's ``DocumentIngestRequest`` reads it, without
+        namespace and scopes (the core adds them).
+
+        Memory's ``links`` are natural keys that become untyped ``LINKS_TO``
+        edges to existing nodes, so they carry the keys; the typed links
+        ``{kind, key, rel}`` travel whole in ``properties.links``. One call
+        holds the whole document: ``replace`` swaps the chunks of an earlier
+        write with the same key."""
+        document: dict[str, Any] = {
+            "natural_key": self.natural_key,
+            "title": self.title,
+            "type": self.type,
+            "chunks": [chunk.model_dump(exclude_none=True) for chunk in self.chunks],
+            "replace": True,
+        }
+        if self.links:
+            document["links"] = list(dict.fromkeys(link.key for link in self.links))
+            document["properties"] = {"links": [link.model_dump() for link in self.links]}
+        if self.meta is not None:
+            document["meta"] = self.meta
+        return document
+
+
+# Memory's entity list bounds (``context/entities``: MAX_KINDS, MAX_LIMIT, KIND_RE).
+KNOWLEDGE_ENTITY_KIND = r"^[A-Za-z][A-Za-z0-9_]{0,62}$"
+KNOWLEDGE_ENTITIES_MAX_LIMIT = 500
+
+
+class KnowledgeEntitiesQueryRequest(ApiModel):
+    """The entities of ``kinds`` in a workspace's knowledge (CP-ADR-0060, K031).
+
+    Every entity of the kinds valid at ``asOf`` (now when omitted) whose
+    attributes satisfy all ``where`` conditions, ``limit`` per page; ``cursor``
+    is the ``nextCursor`` of the previous page, the other fields unchanged.
+    The namespace (the workspace tree root) and the visibility come from
+    ``workspaceId`` and the caller, never from the client."""
+
+    workspace_id: uuid.UUID
+    kinds: list[Annotated[str, Field(pattern=KNOWLEDGE_ENTITY_KIND)]] = Field(
+        min_length=1, max_length=20
+    )
+    where: list[MemoryWhereCondition] = Field(default_factory=list, max_length=20)
+    as_of: AwareDatetime | None = None
+    limit: int = Field(default=100, ge=1, le=KNOWLEDGE_ENTITIES_MAX_LIMIT)
+    cursor: str | None = Field(default=None, min_length=1, max_length=4096)
+
+
+class KnowledgeEntityOut(BaseModel):
+    """An entity of the list: the version valid at ``asOf``, as Memory gives it
+    (``EntityItem``: kind, key, namespace, title, attributes, source, scope,
+    snapshot_id, source_path, valid_from, valid_to)."""
+
+    model_config = ConfigDict(extra="allow")
+
+    kind: str
+    key: str
+    title: str = ""
+    attributes: dict[str, Any] = Field(default_factory=dict)
+
+
+class KnowledgeEntitiesPageOut(BaseModel):
+    """One page in ``(kind, key, namespace)`` order. The list ends only at
+    ``nextCursor: null``: a page may hold fewer than ``limit`` items before it."""
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    items: list[KnowledgeEntityOut]
+    next_cursor: str | None = Field(alias="nextCursor")
+    as_of: str | None = Field(default=None, alias="asOf")
+
+
+class KnowledgePackRegisterRequest(BaseModel):
+    """A domain pack manifest, forwarded to Memory as-is (CP-ADR-0060).
+
+    Only ``scope`` is the core's to read: absent -- a shared pack, registered
+    by platform administrators; ``tenant`` -- a pack of the caller's tenant,
+    registered under ``knowledge.packs.manage`` (amendment 2026-09-28).
+    ``name`` and ``version`` are checked by the core with ``422 pack_invalid``,
+    the rest of the manifest by Memory. The owner of a tenant pack is the
+    core's to name: a ``namespace`` in the manifest is refused."""
+
+    model_config = ConfigDict(extra="allow")
+
+    name: Any = Field(default=None, description="Pack name (Memory's grammar).")
+    version: Any = Field(default=None, description="Pack version: a string or a number.")
+    scope: Literal["common", "tenant"] | None = Field(
+        default=None,
+        description="Absent or common: a shared pack (Memory's default scope). "
+        "tenant: a pack of the caller's tenant.",
+    )
+
+    @model_validator(mode="after")
+    def _no_owner(self) -> "KnowledgePackRegisterRequest":
+        if self.model_extra and "namespace" in self.model_extra:
+            raise ValueError("namespace is set by the core, not by the caller")
+        return self
 
 
 class WorkspaceKnowledgePacksRequest(ApiModel):

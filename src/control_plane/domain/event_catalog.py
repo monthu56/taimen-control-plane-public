@@ -590,12 +590,44 @@ _register(
     "knowledge_pack",
     "A domain knowledge pack version was registered.",
     data({"name": STR, "version": ANY, "status": STR_N}),
+    (
+        data(
+            {
+                "name": STR,
+                "version": ANY,
+                "status": STR_N,
+                "scope": described(
+                    {"type": "string", "enum": ["common", "tenant"]},
+                    "common: a shared pack; tenant: a pack of the event's tenant",
+                ),
+            }
+        ),
+        "scope (CP-ADR-0060, amendment 2026-09-28)",
+    ),
 )
 _register(
     "knowledge.packs_configured",
     "workspace",
     "The knowledge packs of a workspace tree were configured.",
     data({"workspaceId": UUID, "namespace": STR, "packs": ARR, "strict": BOOL}),
+)
+_register(
+    "knowledge.document_stored",
+    "workspace",
+    "A knowledge base document was stored in the memory service"
+    " (CP-ADR-0060, amendment 2026-09-28); its text stays out of the journal.",
+    data(
+        {
+            "naturalKey": STR,
+            "title": STR,
+            "type": STR,
+            "workspaceId": UUID,
+            "rootWorkspaceId": UUID,
+            "namespace": STR,
+            "chunkCount": INT,
+            "linkCount": INT,
+        }
+    ),
 )
 _KNOWLEDGE_CHANGE: JsonSchema = {
     "type": "object",

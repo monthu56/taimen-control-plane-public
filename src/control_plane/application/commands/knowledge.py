@@ -1,4 +1,4 @@
-"""Knowledge snapshots and domain packs through the core (CP-ADR-0060).
+"""Knowledge snapshots, documents and domain packs through the core (CP-ADR-0060).
 
 Nobody but the core talks to the Memory Service (TAI-ADR-0031 p.6): a
 connector hands the core a snapshot of what it sees, the core authorizes the
@@ -9,14 +9,17 @@ document with its own identity. The client never names a namespace or scope.
 Each operation is split so that no database transaction is open while the
 Memory Service is awaited: ``prepare_*`` runs in one transaction (authorization
 and resolution), the provider call runs outside, and the journal event (a
-reconciled snapshot, a registered pack, a namespace's enabled packs) is
-appended in a second transaction.
+reconciled snapshot, a stored document, a registered pack, a namespace's
+enabled packs) is appended in a second transaction.
 
 A snapshot that opened, changed or closed nodes is also journaled as
 ``knowledge.changed`` with their natural keys (CP-ADR-0076 §7): the event a
 rule reacts to when a regulation changes. The keys come from Memory's answer
 (``changes``, amendment MEM-ADR-020); an empty reconciliation, a repeated
 snapshot and an answer without ``changes`` write no such event.
+
+A preview (``dryRun``) is Memory's plan of the same reconciliation: it is
+returned as is and journals nothing -- only an applied snapshot is a fact.
 """
 
 import logging
@@ -49,6 +52,7 @@ from control_plane.domain.errors import (
 from control_plane.infrastructure.context_provider import (
     ContextProviderError,
     KnowledgeProvider,
+    tenant_namespace,
     workspace_namespace,
 )
 
@@ -138,7 +142,9 @@ def memory_failure(
 
 
 _CONFLICT_MESSAGES = {
-    "snapshot_stale": "Memory already holds a newer snapshot of this source",
+    "snapshot_stale": (
+        "Memory holds a newer state of this source than the snapshot or its plan was built on"
+    ),
     "pack_version_conflict": "This pack version is already registered with other content",
 }
 
@@ -179,19 +185,69 @@ async def reconcile_snapshot(
     target: KnowledgeTarget,
     snapshot: dict[str, Any],
     *,
+    expected_state: str | None = None,
     trace_run_id: str | None = None,
 ) -> dict[str, Any]:
+    """Apply a snapshot; with ``expected_state`` only while the state of its
+    ``(source, scope)`` is still the one a preview showed. Memory's 409 -- the
+    state moved on, or the snapshot is older than the applied one -- is
+    ``409 snapshot_stale`` either way: the plan was not built on the current
+    state."""
     try:
         return await provider.reconcile_snapshot(
             namespace=target.namespace,
             scopes=target.scopes,
             snapshot=snapshot,
+            expected_state=expected_state,
             trace_run_id=trace_run_id,
         )
     except ContextProviderError as exc:
         raise memory_failure(
             exc, invalid={400: "snapshot_invalid"}, conflict_code="snapshot_stale"
         ) from exc
+
+
+async def preview_snapshot(
+    provider: KnowledgeProvider,
+    target: KnowledgeTarget,
+    snapshot: dict[str, Any],
+    *,
+    trace_run_id: str | None = None,
+) -> dict[str, Any]:
+    """Memory's plan of a reconciliation (``dryRun``): nothing is written there,
+    and the caller journals nothing here.
+
+    An answer that is not a plan -- no ``dryRun: true`` or no ``stateToken`` --
+    comes from a Memory without the preview (MEM-ADR-020 amendment 2026-09-28),
+    which ignores ``dryRun`` and applies the snapshot: that is a deployment
+    fault of the core's dependency, not a plan to show (502, not retryable).
+    """
+    try:
+        answer = await provider.reconcile_snapshot(
+            namespace=target.namespace,
+            scopes=target.scopes,
+            snapshot=snapshot,
+            dry_run=True,
+            trace_run_id=trace_run_id,
+        )
+    except ContextProviderError as exc:
+        # A snapshot older than the applied one has no plan either: 409.
+        raise memory_failure(
+            exc, invalid={400: "snapshot_invalid"}, conflict_code="snapshot_stale"
+        ) from exc
+    token = answer.get("stateToken")
+    if answer.get("dryRun") is not True or not isinstance(token, str) or not token:
+        logger.error(
+            "memory answered a reconcile preview without a plan (dryRun=%r, stateToken=%s)",
+            answer.get("dryRun"),
+            "present" if token else "missing",
+        )
+        raise UpstreamError(
+            "memory_unavailable",
+            "Memory service does not support snapshot preview",
+            details={"memoryStatus": 200, "retryable": False},
+        )
+    return answer
 
 
 async def record_snapshot_reconciled(
@@ -291,11 +347,69 @@ def changed_keys(answer: dict[str, Any]) -> tuple[list[dict[str, str]], bool]:
     return changes, truncated
 
 
+# --- documents -------------------------------------------------------------
+
+
+async def store_document(
+    provider: KnowledgeProvider,
+    target: KnowledgeTarget,
+    document: dict[str, Any],
+    *,
+    trace_run_id: str | None = None,
+) -> dict[str, Any]:
+    try:
+        return await provider.store_document(
+            namespace=target.namespace,
+            scopes=target.scopes,
+            document=document,
+            trace_run_id=trace_run_id,
+        )
+    except ContextProviderError as exc:
+        raise memory_failure(exc, invalid={400: "document_invalid"}) from exc
+
+
+async def record_document_stored(
+    session: AsyncSession,
+    ctx: AuthContext,
+    target: KnowledgeTarget,
+    document: dict[str, Any],
+) -> uuid.UUID:
+    """Journal who stored which document where: identity and counts, no text."""
+    event = await record_event(
+        session,
+        tenant_id=ctx.tenant_id,
+        event_type="knowledge.document_stored",
+        entity_type="workspace",
+        entity_id=target.workspace_id,
+        actor_id=ctx.principal_id,
+        request_id=ctx.request_id,
+        correlation_id=ctx.correlation_id,
+        causation_id=ctx.causation_id,
+        trace_run_id=ctx.trace_run_id,
+        payload={
+            "naturalKey": document["natural_key"],
+            "title": document["title"],
+            "type": document["type"],
+            "workspaceId": str(target.workspace_id),
+            "rootWorkspaceId": str(target.root_workspace_id),
+            "namespace": target.namespace,
+            "chunkCount": len(document["chunks"]),
+            "linkCount": len((document.get("properties") or {}).get("links") or []),
+        },
+    )
+    return event.id
+
+
 # --- domain packs ----------------------------------------------------------
 
 # Memory's pack name and version grammar (``core.kinds``): a namespace enables
-# only pinned ``name@version`` references.
-PACK_REF_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}@[0-9A-Za-z][0-9A-Za-z.+-]{0,31}$")
+# only pinned ``name@version`` references; ``tenant:name@version`` names a pack
+# of the tenant (amendment 2026-09-28), which Memory finds only under its owner.
+PACK_REF_RE = re.compile(r"^(?:tenant:)?[a-z0-9][a-z0-9._-]{0,63}@[0-9A-Za-z][0-9A-Za-z.+-]{0,31}$")
+# Memory's 409 ``detail.code`` when a tenant pack's name, a kind or a relation
+# clashes with a shared pack: the manifest is wrong, not a version conflict.
+PACK_SCOPE_CONFLICTS = frozenset({"pack_name_conflict", "kind_conflict", "relation_conflict"})
+TENANT_PACK_SCOPE = "tenant"
 
 
 def authorize_pack_registration(ctx: AuthContext, settings: Settings) -> None:
@@ -316,6 +430,30 @@ def authorize_pack_registration(ctx: AuthContext, settings: Settings) -> None:
             "Registering knowledge packs is reserved to platform administrators",
             details={"required": "knowledge_pack_admin"},
         )
+
+
+async def prepare_pack(
+    ctx: AuthContext, settings: Settings, manifest: dict[str, Any]
+) -> dict[str, Any]:
+    """Authorize a pack registration and build what Memory receives.
+
+    A shared pack (no ``scope``) is for platform administrators only. A pack of
+    the caller's tenant (``scope: tenant``) takes ``knowledge.packs.manage`` of
+    the tenant, and the core names its owner: the tenant's namespace, under
+    which every workspace tree of the tenant sees it. The client cannot name
+    the owner (the request schema refuses ``namespace``).
+    """
+    if manifest.get("scope") == TENANT_PACK_SCOPE:
+        await authorize(ctx, Permission.KNOWLEDGE_PACKS_MANAGE)
+        require_pack_identity(manifest)
+        return {
+            **manifest,
+            "scope": TENANT_PACK_SCOPE,
+            "namespace": tenant_namespace(settings, ctx.tenant_id),
+        }
+    authorize_pack_registration(ctx, settings)
+    require_pack_identity(manifest)
+    return manifest
 
 
 def require_pack_identity(package: dict[str, Any]) -> None:
@@ -349,6 +487,13 @@ async def register_pack(
     try:
         return await provider.register_package(package=package, trace_run_id=trace_run_id)
     except ContextProviderError as exc:
+        if exc.status == 409 and exc.code in PACK_SCOPE_CONFLICTS:
+            logger.warning("memory refused the pack: %s", exc)
+            raise ValidationError(
+                "pack_invalid",
+                "A name of the tenant pack is taken by a shared pack",
+                details={"memoryStatus": 409, "conflict": exc.code},
+            ) from exc
         raise memory_failure(
             exc, invalid={400: "pack_invalid"}, conflict_code="pack_version_conflict"
         ) from exc
@@ -376,14 +521,17 @@ async def record_pack_registered(
     """Journal who registered which pack version (manifest content stays out)."""
     name, version = _pack_identity(package, answer)
     status = answer.get("status")
+    tenant = package.get("scope") == TENANT_PACK_SCOPE
+    # Packs live in Memory and have no row here: a stable id per version groups
+    # the journal entries of one pack version. Tenant packs of different tenants
+    # may share a name, so their id carries the tenant.
+    key = f"tenant:{ctx.tenant_id}:{name}@{version}" if tenant else f"{name}@{version}"
     event = await record_event(
         session,
         tenant_id=ctx.tenant_id,
         event_type="knowledge.pack_registered",
         entity_type="knowledge_pack",
-        # Packs live in Memory and have no row here: a stable id per version
-        # groups the journal entries of one pack version.
-        entity_id=uuid.uuid5(uuid.NAMESPACE_URL, f"knowledge-pack:{name}@{version}"),
+        entity_id=uuid.uuid5(uuid.NAMESPACE_URL, f"knowledge-pack:{key}"),
         actor_id=ctx.principal_id,
         request_id=ctx.request_id,
         correlation_id=ctx.correlation_id,
@@ -393,13 +541,15 @@ async def record_pack_registered(
             "name": name,
             "version": version,
             "status": status if isinstance(status, str) else None,
+            "scope": TENANT_PACK_SCOPE if tenant else "common",
         },
     )
     return event.id
 
 
 def require_pinned_packs(packs: list[str]) -> list[str]:
-    """Deduplicated ``name@version`` references; an unpinned one is 422."""
+    """Deduplicated ``name@version`` (or ``tenant:name@version``) references;
+    an unpinned one is 422."""
     refs = list(dict.fromkeys(ref.strip() for ref in packs))
     unpinned = [ref for ref in refs if not PACK_REF_RE.match(ref)]
     if unpinned:

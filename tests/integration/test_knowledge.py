@@ -386,6 +386,7 @@ async def test_pack_registration_is_platform_admin_only(client: httpx.AsyncClien
     assert event["payload"]["name"] == "selfdev"
     assert event["payload"]["version"] == "1"
     assert event["payload"]["status"] == "created"
+    assert event["payload"]["scope"] == "common"
     assert "kinds" not in event["payload"]
 
 

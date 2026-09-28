@@ -357,6 +357,37 @@ async def test_reconcile_accepts_the_core_body_and_rejects_stale(
     assert info.value.status == 409
 
 
+async def test_reconcile_preview_writes_nothing_and_expected_state_guards_the_apply(
+    provider: HttpContextProvider, namespace: str
+) -> None:
+    # MEM-ADR-020 amendment 2026-09-28 (memory K004): a dry run is a plan with
+    # the state it was computed on; an apply on a moved state is 409.
+    snapshot = _knowledge_snapshot("snap-1", "2026-09-23T10:00:00Z")
+    plan = await provider.reconcile_snapshot(
+        namespace=namespace, scopes=["workspace:w"], snapshot=snapshot, dry_run=True
+    )
+    assert plan["dryRun"] is True and isinstance(plan["stateToken"], str)
+    again = await provider.reconcile_snapshot(
+        namespace=namespace, scopes=["workspace:w"], snapshot=snapshot, dry_run=True
+    )
+    assert again["duplicate"] is False and again["stateToken"] == plan["stateToken"]
+    applied = await provider.reconcile_snapshot(
+        namespace=namespace,
+        scopes=["workspace:w"],
+        snapshot={**snapshot, "entities": [{"kind": "decision", "key": "decision:contract"}]},
+        expected_state=plan["stateToken"],
+    )
+    assert applied["duplicate"] is False
+    with pytest.raises(ContextProviderError) as info:
+        await provider.reconcile_snapshot(
+            namespace=namespace,
+            scopes=["workspace:w"],
+            snapshot=_knowledge_snapshot("snap-2", "2026-09-23T11:00:00Z"),
+            expected_state=plan["stateToken"],
+        )
+    assert info.value.status == 409
+
+
 async def test_reconcile_rejects_an_invalid_snapshot_with_400(
     provider: HttpContextProvider, namespace: str
 ) -> None:

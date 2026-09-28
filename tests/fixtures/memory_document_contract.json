@@ -1,5 +1,5 @@
 {
-  "$comment": "Pinned request contract of the Memory Service document ingest the Context Adapter calls for case documents (CP-ADR-0076 §2). Hand-extracted from memory-service server/app.py (DocumentIngestRequest, DocumentChunkIn; chunks capped by retrieval/documents.MAX_CHUNKS_PER_REQUEST). Pydantic there ignores unknown fields, so additionalProperties is false here: a misspelled field would otherwise be dropped silently. Regenerate when memory-service changes the endpoint.",
+  "$comment": "Pinned request contract of the Memory Service document ingest the Context Adapter calls for case documents (CP-ADR-0076 §2) and POST /knowledge/documents calls for knowledge base documents (CP-ADR-0060 amendment 2026-09-28, K3; re-checked for K009 against memory-service 76c6a26, unchanged). Hand-extracted from memory-service server/app.py (DocumentIngestRequest, DocumentChunkIn; chunks capped by retrieval/documents.MAX_CHUNKS_PER_REQUEST). Pydantic there ignores unknown fields, so additionalProperties is false here: a misspelled field would otherwise be dropped silently. Regenerate when memory-service changes the endpoint.",
   "memoryService": {
     "repository": "monthu56/taimen-memory-service",
     "commit": "6ef1ef9"

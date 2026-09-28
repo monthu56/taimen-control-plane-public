@@ -80,6 +80,20 @@ class RecallCall:
     traverse: list[dict[str, Any]] = field(default_factory=list)
     as_of: datetime | None = None
     budget_tokens: int = DEFAULT_BUDGET_TOKENS
+    # recall.where as the caller gave it: literals, sent to memory as they are.
+    where: list[dict[str, Any]] = field(default_factory=list)
+
+
+def with_where(request: dict[str, Any], where: list[dict[str, Any]]) -> dict[str, Any]:
+    """A typed request with ``where`` (MEM-ADR-020, K006) when there are conditions.
+
+    The route and a process's step both send it through here: the core does
+    not read the conditions, memory applies them. Without conditions the key
+    is absent and the request stays what it was.
+    """
+    if where:
+        request["where"] = where
+    return request
 
 
 def require_graph(provider: object | None) -> GraphProvider:
@@ -141,6 +155,7 @@ async def prepare_recall(
     task_ref: str | None,
     workspace_id: uuid.UUID | None,
     budget_tokens: int = DEFAULT_BUDGET_TOKENS,
+    where: list[dict[str, Any]] | None = None,
 ) -> RecallCall:
     """Authorize and resolve the scope of a recall (transactional half)."""
     # The graph is durable memory: the same right as recall through /context.
@@ -164,6 +179,7 @@ async def prepare_recall(
         ],
         as_of=as_of,
         budget_tokens=budget_tokens,
+        where=list(where or ()),
     )
 
 
@@ -215,7 +231,13 @@ async def fetch_recall(
         }
         if call.as_of is not None:
             request["as_of"] = call.as_of.isoformat()
-        pack = await typed(provider, call.scope, request, deadline=deadline, trace_run_id=trace)
+        pack = await typed(
+            provider,
+            call.scope,
+            with_where(request, call.where),
+            deadline=deadline,
+            trace_run_id=trace,
+        )
     except TimeoutError:
         raise DependencyUnavailableError(
             "Memory did not answer in time", code="memory_timeout"
@@ -319,6 +341,8 @@ class ProcessRecallCall:
     query: str = ""
     kinds: list[str] = field(default_factory=list)
     limit: int | None = None
+    # recall.where as the engine computed it: sent to memory as it is.
+    where: list[dict[str, Any]] = field(default_factory=list)
 
 
 def process_recall_call(intent: dict[str, Any], scope: GraphScope) -> ProcessRecallCall:
@@ -347,6 +371,7 @@ def process_recall_call(intent: dict[str, Any], scope: GraphScope) -> ProcessRec
         query=str(intent.get("query") or "").strip(),
         kinds=[str(k) for k in intent.get("kinds") or ()],
         limit=intent.get("limit"),
+        where=[dict(c) for c in intent.get("where") or ()],
     )
 
 
@@ -415,14 +440,18 @@ async def fetch_process_recall(
             if call.as_of:
                 request["as_of"] = call.as_of
             explicit = await typed(
-                provider, call.scope, request, deadline=deadline, trace_run_id=trace
+                provider,
+                call.scope,
+                with_where(request, call.where),
+                deadline=deadline,
+                trace_run_id=trace,
             )
         semantic = None
         if call.query:
             semantic = await typed(
                 provider,
                 call.scope,
-                semantic_request(call.query, call.as_of),
+                with_where(semantic_request(call.query, call.as_of), call.where),
                 deadline=deadline,
                 trace_run_id=trace,
             )

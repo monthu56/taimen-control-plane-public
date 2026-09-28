@@ -323,3 +323,36 @@ def test_the_workspace_is_an_id_not_an_install_variable() -> None:
     assert _codes(_check(_sample(workspaceId="nowhere"))) == {
         ("schema_violation", "/spec/workspaceId")
     }
+
+
+def test_recall_where_values_are_expressions_checked_by_operator() -> None:
+    # CP-ADR-0076, amendment 2026-09-28: a value is CEL (a list of CEL for in).
+    spec = _sample()
+    stage = next(
+        index
+        for index, stage in enumerate(spec["stages"])
+        if any(s["id"] == "history" for s in stage["steps"])
+    )
+    step = next(s for s in spec["stages"][stage]["steps"] if s["id"] == "history")
+    step["recall"]["where"] = [
+        {"attr": "okpd2", "op": "prefix", "value": "'62.' + data.number"},
+        {"attr": "validUntil", "op": "gte", "value": "data.deadline"},
+        {"attr": "status", "op": "in", "value": ["'active'", "data.decision"]},
+        {"attr": "region", "op": "in", "value": "['77', '50']"},
+        {"attr": "inn", "op": "exists", "value": False},
+        {"attr": "rank", "op": "lte", "value": 3},
+    ]
+    assert _check(spec).problems == ()
+    here = f"/spec/stages/{stage}/steps/0/recall/where"
+    step["recall"]["where"] = [
+        {"attr": "okpd2", "op": "prefix", "value": "data.amount"},
+        {"attr": "status", "op": "in", "value": "data.decision"},
+        {"attr": "inn", "op": "exists", "value": "data.number"},
+        {"attr": "kind", "op": "eq", "value": "data.nope"},
+    ]
+    assert _codes(_check(spec)) == {
+        ("expression_type_error", f"{here}/0/value"),
+        ("expression_type_error", f"{here}/1/value"),
+        ("expression_type_error", f"{here}/2/value"),
+        ("expression_type_error", f"{here}/3/value"),
+    }

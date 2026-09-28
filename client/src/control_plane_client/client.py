@@ -1521,26 +1521,79 @@ class ControlPlaneClient:
 
     # -- knowledge (CP-ADR-0060) -------------------------------------------------
 
-    async def submit_knowledge_snapshot(self, *, workspace_id: str, snapshot: Json) -> Json:
+    async def submit_knowledge_snapshot(
+        self, *, workspace_id: str, snapshot: Json, expected_state: str | None = None
+    ) -> Json:
         """Hand a connector's snapshot (pack, source, scope, snapshotId,
         observedAt, entities, relations) to the core, which reconciles it into
         the namespace of the workspace tree root with the workspace's
-        visibility. Returns Memory's answer (counters, ``duplicate``); a stale
-        snapshot is a ``ConflictError``. Safe to retry: Memory recognises a
+        visibility. Returns Memory's answer (counters, ``duplicate``,
+        ``stateToken``); a stale snapshot is a ``ConflictError``. With
+        ``expected_state`` (the ``stateToken`` of
+        :meth:`preview_knowledge_snapshot`) it applies only while the source's
+        knowledge is still in the previewed state, otherwise ``ConflictError``
+        ``snapshot_stale``: preview again. Safe to retry: Memory recognises a
         repeated ``snapshotId``."""
         body: Json = {**snapshot, "workspaceId": workspace_id}
+        if expected_state is not None:
+            body["expectedState"] = expected_state
         return await self._request("POST", "/knowledge/snapshots", json_body=body, idempotent=True)
 
+    async def preview_knowledge_snapshot(self, *, workspace_id: str, snapshot: Json) -> Json:
+        """What applying ``snapshot`` would change -- ``changes``, counters,
+        ``conflicts`` with other sources -- and ``stateToken``, the state the
+        plan was built on. Nothing is written."""
+        body: Json = {**snapshot, "workspaceId": workspace_id}
+        return await self._request(
+            "POST", "/knowledge/snapshots:preview", json_body=body, idempotent=True
+        )
+
+    async def submit_knowledge_document(self, *, workspace_id: str, document: Json) -> Json:
+        """Store a knowledge base document (naturalKey, title, type, chunks,
+        links ``{kind, key, rel}``, meta) in the namespace of the workspace
+        tree root with the workspace's visibility. The text is already
+        extracted and cut into chunks: the core parses no files. Returns
+        Memory's answer. Safe to retry: a write with the same ``naturalKey``
+        replaces the document's chunks."""
+        body: Json = {**document, "workspaceId": workspace_id}
+        return await self._request("POST", "/knowledge/documents", json_body=body, idempotent=True)
+
+    async def query_knowledge_entities(
+        self,
+        *,
+        workspace_id: str,
+        kinds: list[str],
+        where: list[Json] | None = None,
+        as_of: str | None = None,
+        limit: int | None = None,
+        cursor: str | None = None,
+    ) -> Json:
+        """One page of the entities of ``kinds`` in the workspace's knowledge
+        valid at ``as_of`` (now when omitted) whose attributes satisfy every
+        ``where`` condition (``{attr, op, value}``, literals). Returns
+        ``items`` and ``nextCursor``: pass it back as ``cursor`` with the same
+        arguments for the next page; the list ends at ``nextCursor: None``.
+        The server reads the namespace of the workspace tree root with the
+        caller's visibility."""
+        body: Json = {"workspaceId": workspace_id, "kinds": kinds}
+        for key, value in (("where", where), ("asOf", as_of), ("limit", limit), ("cursor", cursor)):
+            if value is not None:
+                body[key] = value
+        return await self._request("POST", "/knowledge/entities:query", json_body=body)
+
     async def register_knowledge_pack(self, pack: Json) -> Json:
-        """Register a domain knowledge pack. Platform administrators only
-        (``CP_KNOWLEDGE_PACK_ADMINS`` on the server): the pack registry is
-        shared by all tenants."""
+        """Register a domain knowledge pack. A shared pack is for platform
+        administrators only (``CP_KNOWLEDGE_PACK_ADMINS`` on the server): the
+        registry of shared packs serves all tenants. A manifest with
+        ``"scope": "tenant"`` registers a pack of the caller's tenant under
+        ``knowledge.packs.manage``; it is enabled as ``tenant:name@version``."""
         return await self._request("POST", "/knowledge/packs", json_body=pack)
 
     async def set_workspace_knowledge_packs(
         self, workspace_id: str, *, packs: list[str], strict: bool = False
     ) -> Json:
-        """Enable ``packs`` (pinned ``name@version`` references) and
+        """Enable ``packs`` (pinned ``name@version`` or ``tenant:name@version``
+        references) and
         ``strict`` kind checking for the memory namespace of a root workspace.
         Replaces the previous set."""
         return await self._request(

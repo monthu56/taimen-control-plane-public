@@ -410,7 +410,9 @@ async def test_directory_and_artifact_reads_use_documented_paths() -> None:
     ]
 
 
-async def test_knowledge_snapshot_and_packs(client: httpx.AsyncClient, sdk: Make, app) -> None:
+async def test_knowledge_snapshot_document_and_packs(
+    client: httpx.AsyncClient, sdk: Make, app
+) -> None:
     from control_plane_client.errors import ConflictError
     from tests.helpers import FakeKnowledge, create_workspace
     from tests.helpers import knowledge_snapshot as snapshot
@@ -428,6 +430,32 @@ async def test_knowledge_snapshot_and_packs(client: httpx.AsyncClient, sdk: Make
                 workspace_id=root["id"], snapshot=snapshot()
             )
             assert answer["duplicate"] is False
+            plan = await agent.preview_knowledge_snapshot(
+                workspace_id=root["id"], snapshot=snapshot(snapshotId="snap-2")
+            )
+            assert plan["dryRun"] is True
+            applied = await agent.submit_knowledge_snapshot(
+                workspace_id=root["id"],
+                snapshot=snapshot(snapshotId="snap-2"),
+                expected_state=plan["stateToken"],
+            )
+            assert applied["stateToken"] != plan["stateToken"]
+            with pytest.raises(ConflictError):
+                await agent.submit_knowledge_snapshot(
+                    workspace_id=root["id"],
+                    snapshot=snapshot(snapshotId="snap-3"),
+                    expected_state=plan["stateToken"],
+                )
+            stored = await agent.submit_knowledge_document(
+                workspace_id=root["id"],
+                document={
+                    "naturalKey": "document:license-1",
+                    "title": "License",
+                    "chunks": [{"text": "License No. 1"}],
+                    "links": [{"kind": "credential", "key": "license-1", "rel": "evidenced_by"}],
+                },
+            )
+            assert stored["natural_key"] == "document:license-1"
         async with sdk(admin_key) as admin:
             registered = await admin.register_knowledge_pack({"name": "selfdev", "version": 1})
             assert registered["status"] == "created"
@@ -442,8 +470,52 @@ async def test_knowledge_snapshot_and_packs(client: httpx.AsyncClient, sdk: Make
     finally:
         app.state.context_provider = None
         app.state.settings.knowledge_pack_admins = []
-    assert [kind for kind, _ in fake.calls] == ["reconcile", "package", "kinds"]
-    assert fake.calls[2][1]["strict"] is True
+    assert [kind for kind, _ in fake.calls] == [
+        "reconcile",
+        "reconcile",
+        "reconcile",
+        "reconcile",
+        "document",
+        "package",
+        "kinds",
+    ]
+    assert fake.calls[1][1]["dry_run"] is True
+    assert fake.calls[2][1]["expected_state"] == "st1-1"
+    assert fake.calls[6][1]["strict"] is True
+
+
+async def test_knowledge_entities_page_by_page(client: httpx.AsyncClient, sdk: Make, app) -> None:
+    from tests.fake_graph_memory import FakeGraphMemory
+    from tests.helpers import create_workspace
+
+    boot = await do_bootstrap(client)
+    admin_key = boot["apiKey"]["key"]
+    _, agent_key = await create_agent_with_key(client, admin_key)
+    root = await create_workspace(client, admin_key, "root")
+    fake = FakeGraphMemory()
+    app.state.context_provider = fake
+    keys: list[str] = []
+    try:
+        async with sdk(agent_key) as agent:
+            cursor = None
+            while True:
+                page = await agent.query_knowledge_entities(
+                    workspace_id=root["id"],
+                    kinds=["endpoint", "adr"],
+                    where=[{"attr": "method", "op": "exists", "value": False}],
+                    as_of="2026-09-28T00:00:00+00:00",
+                    limit=1,
+                    cursor=cursor,
+                )
+                keys += [item["key"] for item in page["items"]]
+                cursor = page["nextCursor"]
+                if cursor is None:
+                    break
+    finally:
+        app.state.context_provider = None
+    assert keys == ["CP-0019", "GET /runs/{}/checkpoints"]
+    assert [r.get("cursor") for r in fake.entities_requests] == [None, "adr|CP-0019"]
+    assert fake.entities_requests[0]["asOf"] == "2026-09-28T00:00:00+00:00"
 
 
 async def test_goal_methods_and_work_graph_task_fields(

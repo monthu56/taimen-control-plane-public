@@ -398,12 +398,46 @@ async def _read_artifact(
         else:
             if await is_input_of(session, ctx.tenant_id, artifact.id, recipient):
                 return artifact, recipient
-    await authorize(
-        ctx,
-        Permission.ARTIFACTS_READ,
-        resource=artifact_resource(artifact.task_id, artifact.workspace_id),
-    )
+    try:
+        await authorize(
+            ctx,
+            Permission.ARTIFACTS_READ,
+            resource=artifact_resource(artifact.task_id, artifact.workspace_id),
+        )
+    except AuthorizationError:
+        if not await _skill_executor_reads(session, ctx, artifact):
+            raise
     return artifact, None
+
+
+async def _skill_executor_reads(
+    session: AsyncSession, ctx: AuthContext, artifact: Artifact
+) -> bool:
+    """A skill executor reads a task's artifact on the task's workspace.
+
+    CP-ADR-0072, amendment 2026-09-28 (company-knowledge): the executor holds
+    ``skills.execute`` but not ``tasks.read``; ``artifacts.read`` granted on
+    the workspace of the artifact's task lets its skills read the attached
+    file. Nobody without ``skills.execute`` gains a path here.
+    """
+    if artifact.task_id is None:
+        # Decided on its own workspace (or the tenant) already.
+        return False
+    workspace_id = await session.scalar(
+        select(Task.workspace_id).where(
+            Task.id == artifact.task_id, Task.tenant_id == ctx.tenant_id
+        )
+    )
+    if workspace_id is None:
+        return False
+    try:
+        await authorize(ctx, Permission.SKILLS_EXECUTE)
+        await authorize(
+            ctx, Permission.ARTIFACTS_READ, resource=ResourceRef("workspace", str(workspace_id))
+        )
+    except AuthorizationError:
+        return False
+    return True
 
 
 async def get_readable_artifact(
