@@ -12,7 +12,8 @@ TASK-000585. Контракт (маршруты, тела, права, собы�
 у демона исполнителя — D006 (TASK-000591, п.14). Амендмент 2026-09-27 (фича
 `declarative-cycle`, C002 — TASK-000641): ссылка `agent:<key>` в полях назначения
 (А1), вывод `workingCopy.review` из описания (А2); реализованы в C006
-(TASK-000645, 2026-09-27).
+(TASK-000645, 2026-09-27). Амендмент 2026-09-28 (TASK-000803): скиллы, которые
+агент вызывает, — `skills.invoke`, назначение реестром (Б1–Б3).
 
 Контекст: TAI-ADR-0052 «Декларативные агенты» (вид каталога `Agent`, схема
 `packages/schema/v1` — D001, TASK-000586); TAI-ADR-0018 п.1–3 (реестр
@@ -70,6 +71,7 @@ TASK-000585. Контракт (маршруты, тела, права, собы�
 | `executor {kind, params, instructions}` | адаптер вида | `kind` — строка `^[a-z][a-z0-9-]*$`; `params` — объект, ядро его не толкует; `instructions` ≤ 64 KiB |
 | `workingCopy {repository, directory?, baseRef?, neighbours, superproject?, publish, review?}` | демон исполнителя (TAI-ADR-0016 п.5) | форма: `repository` обязателен; `directory` и имена соседей — `^[a-z0-9][a-z0-9._-]*$`; `review {mode: human\|agent\|none, taskType, taskTypes, reviewer, base}` |
 | `skills {protocols, local, httpOrigins, mcpOrigins, audiences, concurrency}` | демон исполнителя | `protocols` ⊆ `local`/`http`/`mcp`; `local` — entrypoint или пакет; `concurrency` 1…32 |
+| `skills.invoke` (амендмент 2026-09-28) | ядро | версии скиллов `имя@версия`, которые агент вызывает через ядро; существуют в tenant'е и не `disabled`; назначаются principal'у агента (Б1–Б3) |
 | `placement {requires, secrets, resources, replicas, drainSeconds}`, `none` или нет поля | fleet-controller | форма: `requires` — метка узла `имя` или `имя=значение` (`^[a-z0-9][a-z0-9.-]*(=[a-zA-Z0-9._-]+)?$`); `secrets` — имена `^[a-z0-9][a-z0-9-]{0,62}$`; `resources {cpus, memoryMb}`; `replicas` 0…20; `drainSeconds` 0…14400 (предел run) |
 | `state: running\|stopped` | ядро (п.3) | перечисление |
 
@@ -589,6 +591,65 @@ UUID или `agent:<key>` с C002. До C006 ссылка на агента в `
   принимало ядро. Раздел уходит из `AgentSpec` вместе с удалением из схемы
   суперпроекта (после перевода пакетов, C012).
 
+## Амендмент 2026-09-28: скиллы, которые агент вызывает
+
+Задача TASK-000803. **Проблема.** Агент, работа которого — вызов скилла (тип
+задачи с `execution`, CP-ADR-0056 §3; например `oss-publisher` и тип
+`oss-publish` → `oss.publish@1`), проходит в `POST /skills/{ref}:invoke` две
+проверки: право `skills.invoke` у связки и назначение скилла principal'у
+(`principal_skills`; под прогоном `decide_for_skill` → `403
+tool_not_authorized`). Права связки реестр выводит из ревизии (п.6), роли и
+capabilities тоже, а назначение скиллов — нет. Его делали руками
+(`POST /principals/{id}/skills`), и на новом стенде или у нового агента каждый
+прогон такой задачи падал `403`.
+
+### Б1. Поле `skills.invoke`
+
+`spec.skills.invoke` — список уникальных ссылок `имя@версия`
+(`^[^@\s/]{1,200}@[^@\s/]{1,50}$`): версии скиллов, которые агент **вызывает**
+через ядро. Остальные поля `skills` (`protocols`, `local`, `httpOrigins`,
+`mcpOrigins`, …) говорят о скиллах, которые агент **исполняет** сам; демон
+исполнителя `invoke` не читает. Версия закреплена, как в `execution`: назначение
+выдаётся на строку `skills`, а «новейшая активная» меняла бы права без новой
+ревизии. Поле входит в ревизию и её хэш; описание без него хэшируется как
+прежде.
+
+### Б2. Проверки при публикации (п.5)
+
+Вместе с остальными, до записи, одинаково у `POST` и `:validate`:
+
+- непустой `skills.invoke` требует у применяющего `org.manage` — то же право,
+  которым назначают скилл руками (`403 permission_escalation`);
+- версии нет в tenant'е — `422 unknown_reference` с `details.path =
+  spec.skills.invoke[i]`; версия `disabled` — `422 skill_disabled`;
+- непустой `skills.invoke` без права `skills.invoke` в `identity.permissions` —
+  `422 skills_invoke_not_permitted` (`details.path`, `details.missing`);
+- согласованность с работой: если тип из `work.taskTypes` исполняется скиллом
+  (у какой-либо активной версии типа есть `execution`), этот `skill@version`
+  должен быть в `skills.invoke` — иначе `422 execution_skill_not_invoked`
+  (`details.path`, `taskType`, `skill`). Это ошибка, а не предупреждение: без
+  назначения каждый прогон такой задачи падает `403`, и описание, которое это
+  гарантирует, публиковать незачем. Пустой `work.taskTypes` («любой тип») не
+  проверяется: набор типов неизвестен.
+
+### Б3. Назначение реестром
+
+Публикация ревизии связанного агента и `PUT …/identity` (п.6) приводят
+`principal_skills` principal'а к `skills.invoke` в той же транзакции, что роли и
+capabilities: недостающее назначается (`skill.assigned`), лишнее снимается
+(`skill.revoked`). Назначение реестра помечено `metadata.assignedBy =
+agent-registry`; снимается только помеченное — назначение, сделанное руками,
+реестр не трогает, даже если скилла нет в описании. `PUT …/identity` пропускает
+версию, выключенную после публикации ревизии, а не отказывает в привязке.
+`skills.invoke` входит в сигнатуру личности, поэтому его изменение даёт
+`permissionsChanged: true` в `agent.revision_published`.
+
+Схема вида каталога суперпроекта (`packages/schema/v1/object.schema.json`,
+`$defs.agentSpec.properties.skills.properties.invoke`) описывает то же поле;
+закреплённая копия `tests/fixtures/superproject/object.schema.json` обновлена
+этим шагом, схему суперпроекта, `cp_packages` и пакет selfdev
+(`oss-publisher: skills.invoke: [oss.publish@1]`) обновляют в суперпроекте.
+
 ## Conformance
 
 - `tests/unit/test_agent_contract.py`:
@@ -633,3 +694,8 @@ UUID или `agent:<key>` с C002. До C006 ссылка на агента в `
   параметры, которые адаптер отвергает; `tools.allow/deny` поверх запрета
   авторитетных команд; инструкции ревизии вместо файла; зеркала и рабочая
   копия.
+- Амендмент 2026-09-28: `tests/integration/test_agent_invoked_skills.py` —
+  проверки Б2 (`:validate` отвечает как `POST`), назначение и снятие по
+  ревизиям, ручное назначение не снимается, прогон типа с `execution` вызывает
+  скилл без ручного назначения (пакет бухгалтерии, не из разработки);
+  `tests/unit/test_agent_contract.py` — `skills.invoke` в схеме вида и `AgentSpec`.

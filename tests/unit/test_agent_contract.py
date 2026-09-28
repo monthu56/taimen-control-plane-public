@@ -223,6 +223,7 @@ BOTH_ACCEPT: list[tuple[str, tuple[str, ...], Any]] = [
     ("coder", ("skills", "mcpOrigins"), ["https://mcp.example.com"]),
     ("coder", ("skills", "audiences"), ["platform-core"]),
     ("skills-executor", ("skills", "concurrency"), 32),
+    ("skills-executor", ("skills", "invoke"), ["oss.publish@1", "ledger.post@2.0.0"]),
     ("coder", ("workingCopy", "baseRef"), "feature/declarative-agents"),
     ("coder", ("workingCopy", "superproject"), "https://git.example/org/superproject.git"),
     ("coder", ("workingCopy", "publish"), False),
@@ -259,6 +260,10 @@ BOTH_REJECT: list[tuple[str, tuple[str, ...], Any]] = [
     ("coder", ("skills", "concurrency"), 33),
     ("coder", ("skills", "local"), ["not an entry point"]),
     ("coder", ("skills", "unknownField"), True),
+    ("coder", ("skills", "invoke"), ["oss.publish"]),  # a version is pinned
+    ("coder", ("skills", "invoke"), ["oss.publish@1", "oss.publish@1"]),
+    ("coder", ("skills", "invoke"), ["oss publish@1"]),
+    ("coder", ("skills", "invoke"), ["@1"]),
     ("coder", ("placement", "requires"), ["GPU"]),
     ("coder", ("placement", "requires"), ["gpu=a 100"]),
     ("coder", ("placement", "secrets"), ["sk-ant-Very_Secret"]),

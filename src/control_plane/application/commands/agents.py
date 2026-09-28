@@ -12,6 +12,9 @@ so ``:validate`` and ``POST`` answer alike and re-applying an unchanged
 package with a narrow credential still fails. Because of that check the core
 itself derives the agent's principal, roles and IAM binding from the revision
 (§6): the placement service only reports which IAM identity it created.
+The same goes for the skills the agent invokes (``skills.invoke``, amendment
+2026-09-28): the registry assigns them to its principal and takes back only
+what it assigned itself.
 """
 
 import copy
@@ -39,6 +42,7 @@ from control_plane.domain.enums import (
     AgentStatus,
     Permission,
     PrincipalStatus,
+    SkillStatus,
     TaskTypeStatus,
     WorkspaceStatus,
 )
@@ -60,8 +64,10 @@ from control_plane.infrastructure.db.models import (
     Principal,
     PrincipalCapability,
     PrincipalRole,
+    PrincipalSkill,
     ProjectProfile,
     Role,
+    Skill,
     TaskType,
     Workspace,
 )
@@ -72,6 +78,10 @@ AGENT_SPEC_MAX_STRING_CHARS = 65_536
 AGENT_SPEC_MAX_BYTES = 256 * 1024
 
 RETIRE_RELEASE_REASON = "agent_retired"
+
+# ``principal_skills.metadata`` of an assignment the registry made: only those
+# are taken back when a revision no longer names the skill.
+REGISTRY_ASSIGNMENT = {"assignedBy": "agent-registry"}
 
 
 @dataclass(frozen=True)
@@ -88,6 +98,7 @@ class CheckedSpec:
     permissions: list[str]
     role_ids: list[uuid.UUID]
     capability_ids: list[uuid.UUID]
+    skill_ids: list[uuid.UUID]
     workspace_id: uuid.UUID | None
     executor_kind: str | None
     placed: bool
@@ -299,6 +310,81 @@ async def _resolve_capabilities(
     return sorted(set(ids))
 
 
+async def _resolve_invoked_skills(
+    session: AsyncSession, ctx: AuthContext, refs: list[str], *, strict: bool = True
+) -> list[uuid.UUID]:
+    """``skills.invoke``: pinned versions of the tenant, not disabled.
+
+    ``strict=False`` is for linking an identity to a revision checked earlier:
+    a version disabled since then is left out rather than failing the link.
+    """
+    ids: list[uuid.UUID] = []
+    for index, ref in enumerate(refs):
+        name, _, version = ref.partition("@")
+        skill = await session.scalar(
+            select(Skill).where(
+                Skill.tenant_id == ctx.tenant_id, Skill.name == name, Skill.version == version
+            )
+        )
+        if skill is None or skill.status == SkillStatus.DISABLED:
+            if not strict:
+                continue
+            if skill is None:
+                raise _unknown(f"spec.skills.invoke[{index}]", ref, "Unknown skill version")
+            raise ValidationError(
+                "skill_disabled",
+                "A disabled skill version cannot be assigned",
+                details={"path": f"spec.skills.invoke[{index}]", "value": ref},
+            )
+        ids.append(skill.id)
+    return sorted(set(ids))
+
+
+def _invoked_refs(spec: dict[str, Any]) -> list[str]:
+    skills = spec.get("skills") or {}
+    return list(skills.get("invoke", []))
+
+
+async def _check_executions(
+    session: AsyncSession, ctx: AuthContext, work: dict[str, Any], invoked: set[str]
+) -> None:
+    """A type the agent takes that a skill executes needs that skill in ``skills.invoke``.
+
+    The run of such a task is one ``POST /skills/{ref}:invoke`` under the
+    agent's principal; without the assignment it fails with
+    ``tool_not_authorized`` on every attempt. Every active version counts: a
+    task keeps the version it was created with.
+    """
+    for index, type_key in enumerate(work.get("taskTypes", [])):
+        executions = (
+            await session.scalars(
+                select(TaskType.execution)
+                .where(
+                    TaskType.tenant_id == ctx.tenant_id,
+                    TaskType.key == type_key,
+                    TaskType.status == TaskTypeStatus.ACTIVE,
+                    TaskType.execution.is_not(None),
+                )
+                .order_by(TaskType.version)
+            )
+        ).all()
+        for execution in executions:
+            if not execution:
+                continue
+            ref = f"{execution['skill']}@{execution['version']}"
+            if ref not in invoked:
+                raise ValidationError(
+                    "execution_skill_not_invoked",
+                    "The agent takes a task type executed by a skill it does not invoke",
+                    details={
+                        "path": f"spec.work.taskTypes[{index}]",
+                        "taskType": type_key,
+                        "skill": ref,
+                        "expected": "spec.skills.invoke",
+                    },
+                )
+
+
 async def _resolve_workspace(
     session: AsyncSession, ctx: AuthContext, ref: str, *, path: str
 ) -> Workspace:
@@ -399,17 +485,27 @@ async def check_agent_spec(
 
     roles = list(identity.get("roles", []))
     capabilities = list(identity.get("capabilities", []))
-    if (roles or capabilities) and not ctx.has(Permission.ORG_MANAGE):
+    invoked = _invoked_refs(spec)
+    if (roles or capabilities or invoked) and not ctx.has(Permission.ORG_MANAGE):
         raise AuthorizationError(
-            "Assigning roles or capabilities requires org.manage",
+            "Assigning roles, capabilities or skills requires org.manage",
             code="permission_escalation",
             details={"missing": [Permission.ORG_MANAGE.value]},
         )
     role_ids = await _resolve_roles(session, ctx, roles)
     capability_ids = await _resolve_capabilities(session, ctx, capabilities)
+    skill_ids = await _resolve_invoked_skills(session, ctx, invoked)
+    if invoked and Permission.SKILLS_INVOKE.value not in permissions:
+        raise ValidationError(
+            "skills_invoke_not_permitted",
+            "An agent that invokes skills needs the skills.invoke permission",
+            details={"path": "spec.identity.permissions", "missing": ["skills.invoke"]},
+        )
 
     work = spec.get("work")
     workspace_id = await _check_work(session, ctx, work) if work is not None else None
+    if work is not None:
+        await _check_executions(session, ctx, work, set(invoked))
 
     executor = spec.get("executor")
     if executor is not None:
@@ -438,6 +534,7 @@ async def check_agent_spec(
             permissions=permissions,
             role_ids=role_ids,
             capability_ids=capability_ids,
+            skill_ids=skill_ids,
             workspace_id=workspace_id,
             executor_kind=executor["kind"] if executor is not None else None,
             placed=placement != "none",
@@ -454,6 +551,7 @@ def _identity_signature(spec: dict[str, Any]) -> tuple[Any, ...]:
         sorted(set(identity.get("permissions", []))),
         sorted(set(identity.get("roles", []))),
         sorted(set(identity.get("capabilities", []))),
+        sorted(set(_invoked_refs(spec))),
     )
 
 
@@ -662,7 +760,7 @@ async def _principal_event(
 async def _apply_identity(
     session: AsyncSession, ctx: AuthContext, agent: Agent, checked: CheckedSpec
 ) -> list[tuple[str, uuid.UUID]]:
-    """Bring the linked principal, its roles, capabilities and binding to ``checked``.
+    """Bring the linked principal, its roles, capabilities, skills and binding to ``checked``.
 
     Runs in the transaction that publishes the revision, so there is no
     window where the revision is new and the rights are old. The authority is
@@ -752,6 +850,8 @@ async def _apply_identity(
             {"capabilityId": str(capability_id)},
         )
 
+    await _apply_invoked_skills(session, ctx, principal_id, checked.skill_ids)
+
     touched: list[tuple[str, uuid.UUID]] = []
     binding = await session.scalar(
         select(IamPrincipalBinding)
@@ -776,6 +876,44 @@ async def _apply_identity(
     return touched
 
 
+async def _apply_invoked_skills(
+    session: AsyncSession, ctx: AuthContext, principal_id: uuid.UUID, skill_ids: list[uuid.UUID]
+) -> None:
+    """``principal_skills`` to ``skills.invoke``: missing ones assigned, the
+    registry's own extra ones revoked. An assignment made by hand
+    (``POST /principals/{id}/skills``) is neither marked nor taken back."""
+    held = {
+        row.skill_id: row
+        for row in (
+            await session.scalars(
+                select(PrincipalSkill).where(PrincipalSkill.principal_id == principal_id)
+            )
+        ).all()
+    }
+    for skill_id in sorted(set(skill_ids) - set(held)):
+        session.add(
+            PrincipalSkill(
+                id=new_uuid(),
+                tenant_id=ctx.tenant_id,
+                principal_id=principal_id,
+                skill_id=skill_id,
+                metadata_json=dict(REGISTRY_ASSIGNMENT),
+                created_at=utcnow(),
+            )
+        )
+        await _principal_event(
+            session, ctx, principal_id, "skill.assigned", {"skillId": str(skill_id)}
+        )
+    for skill_id in sorted(set(held) - set(skill_ids)):
+        row = held[skill_id]
+        if (row.metadata_json or {}).get("assignedBy") != REGISTRY_ASSIGNMENT["assignedBy"]:
+            continue
+        await session.delete(row)
+        await _principal_event(
+            session, ctx, principal_id, "skill.revoked", {"skillId": str(skill_id)}
+        )
+
+
 async def link_agent_identity(
     session: AsyncSession,
     ctx: AuthContext,
@@ -785,7 +923,7 @@ async def link_agent_identity(
     iam_tenant_id: uuid.UUID,
     iam_principal_id: uuid.UUID,
 ) -> AgentView:
-    """Derive the agent's principal, roles and binding from its current revision (§6).
+    """Derive the agent's principal, roles, skills and binding from its current revision (§6).
 
     The caller is the placement service: it created the IAM identity and says
     which one it is. Relinking the same identity changes nothing; another
@@ -887,6 +1025,7 @@ async def link_agent_identity(
         capability_ids=await _resolve_capabilities(
             session, ctx, list(identity.get("capabilities", []))
         ),
+        skill_ids=await _resolve_invoked_skills(session, ctx, _invoked_refs(spec), strict=False),
         workspace_id=agent.workspace_id,
         executor_kind=None,
         placed=False,

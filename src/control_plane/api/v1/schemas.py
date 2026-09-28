@@ -2087,8 +2087,16 @@ class AgentWorkingCopySpec(ApiModel):
     review: AgentReviewSpec | None = None
 
 
+# A pinned skill version the agent invokes: ``name@version``.
+_AGENT_SKILL_REF = Annotated[str, Field(max_length=251, pattern=r"^[^@\s/]{1,200}@[^@\s/]{1,50}$")]
+
+
 class AgentSkillsSpec(ApiModel):
-    """Which skills the agent executes itself (CP-ADR-0056) and where they may go."""
+    """Which skills the agent executes itself (CP-ADR-0056) and where they may go.
+
+    ``invoke`` is the other direction: skill versions the agent calls through
+    ``POST /skills/{ref}:invoke`` rather than hosts (amendment 2026-09-28).
+    """
 
     protocols: list[Literal["local", "http", "mcp"]] = Field(default_factory=list)
     local: list[Annotated[str, Field(pattern=r"^[A-Za-z_][\w.]*(:[A-Za-z_]\w*)?$")]] = Field(
@@ -2104,6 +2112,17 @@ class AgentSkillsSpec(ApiModel):
         description="IAM audiences the skills get a token for",
     )
     concurrency: int | None = Field(default=None, ge=1, le=32)
+    invoke: Annotated[
+        list[_AGENT_SKILL_REF],
+        Field(max_length=_AGENT_ITEMS),
+        AfterValidator(_unique_items),
+    ] = Field(
+        default_factory=list,
+        description=(
+            "Skill versions the agent calls through the core (name@version); "
+            "the registry assigns them to its principal"
+        ),
+    )
 
 
 class AgentResourcesSpec(ApiModel):

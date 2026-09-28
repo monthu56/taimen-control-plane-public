@@ -633,10 +633,15 @@ POST /api/v1/agents                       agents.manage (body {key, spec} — sp
                                           placement.replicas: 201 новая, 200 без изменений;
                                           state/replicas из spec — желаемое состояние;
                                           права ревизии ⊆ права применяющего — 403
-                                          permission_escalation, роли/capabilities — org.manage;
+                                          permission_escalation, роли/capabilities/
+                                          skills.invoke — org.manage;
                                           422 invalid_permissions|permissions_not_allowed_for_kind|
-                                          unknown_reference|secret_material_rejected; 409
-                                          agent_retired; событие agent.revision_published)
+                                          unknown_reference|secret_material_rejected|
+                                          skill_disabled|skills_invoke_not_permitted|
+                                          execution_skill_not_invoked; 409
+                                          agent_retired; событие agent.revision_published;
+                                          skills.invoke связанного агента приводится в
+                                          principal_skills: skill.assigned|revoked)
 POST /api/v1/agents:validate              agents.manage (те же проверки без записи; ответ
                                           {key, specHash, currentRevision,
                                           wouldCreateRevision, wouldChangeState}; отказ — та же

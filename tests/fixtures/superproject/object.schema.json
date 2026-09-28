@@ -151,7 +151,8 @@
             "httpOrigins": {"type": "array", "uniqueItems": true, "items": {"type": "string", "minLength": 1, "maxLength": 500}},
             "mcpOrigins": {"type": "array", "uniqueItems": true, "items": {"type": "string", "minLength": 1, "maxLength": 500}},
             "audiences": {"type": "array", "uniqueItems": true, "items": {"type": "string", "minLength": 1, "maxLength": 100}, "description": "Audiences IAM, в которые скиллы получают токен"},
-            "concurrency": {"type": "integer", "minimum": 1, "maximum": 32}
+            "concurrency": {"type": "integer", "minimum": 1, "maximum": 32},
+            "invoke": {"type": "array", "uniqueItems": true, "items": {"type": "string", "maxLength": 251, "pattern": "^[^@\\s/]{1,200}@[^@\\s/]{1,50}$"}, "description": "Версии скиллов, которые агент вызывает через ядро (имя@версия), а не исполняет сам; реестр назначает их principal'у агента (CP-ADR-0073, амендмент 2026-09-28)"}
           }
         },
         "placement": {
