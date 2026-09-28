@@ -20,6 +20,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from control_plane.application.authorization import AuthContext, ResourceRef, authorize
 from control_plane.application.commands._claim_release import release_claim_on_locked_task
+from control_plane.application.commands.agent_assignees import agent_principal, resolve_assignee
 from control_plane.application.commands.eligibility import (
     RequirementSpec,
     set_task_requirements,
@@ -55,6 +56,7 @@ from control_plane.domain.errors import (
     ValidationError,
 )
 from control_plane.domain.work_graph import (
+    attempt_checks,
     check_evidence_against_acceptance,
     normalize_checks,
     normalize_evidence,
@@ -70,7 +72,14 @@ from control_plane.domain.work_item import (
     validate_planned_dates,
     validate_task_custom_fields,
 )
-from control_plane.infrastructure.db.models import Run, Session, Task, TaskClaim, TaskCounter
+from control_plane.infrastructure.db.models import (
+    Run,
+    Session,
+    Task,
+    TaskClaim,
+    TaskCounter,
+    TaskType,
+)
 
 _UNSET: Any = object()
 
@@ -148,7 +157,7 @@ async def create_task(
     type_key: str | None = None,
     type_version: int | None = None,
     owner_id: uuid.UUID | None = None,
-    assignee_id: uuid.UUID | None = None,
+    assignee_id: uuid.UUID | str | None = None,
     workspace_id: uuid.UUID | None = None,
     custom_fields: dict[str, Any] | None = None,
     start_date: datetime | None = None,
@@ -158,11 +167,15 @@ async def create_task(
     origin: dict[str, Any] | None = None,
     acceptance: list[dict[str, Any]] | None = None,
     evidence: list[dict[str, Any]] | None = None,
+    assignee_field: str = "assigneeId",
 ) -> Task:
     """File a work item.
 
     ``origin`` is recorded once and never rewritten (CP-ADR-0062); omitted, it
     is derived from the writer's principal kind, never from the content.
+    ``assignee_id`` may be an ``agent:<key>`` reference (CP-ADR-0073, A1),
+    resolved once the write is authorized; ``assignee_field`` names the field
+    it came from in an ``unknown_agent`` refusal.
     """
     from control_plane.application.commands.workspaces import require_active_workspace
 
@@ -208,16 +221,16 @@ async def create_task(
     due_date = normalize_planned_date(due_date)
     validate_planned_dates(start_date, due_date)
 
+    assignee_id = await resolve_assignee(session, ctx.tenant_id, assignee_id, field=assignee_field)
     for ref in (owner_id, assignee_id):
         if ref is not None:
             await get_tenant_principal(session, ctx, ref)
     if workspace_id is not None:
         await require_active_workspace(session, ctx, workspace_id)
 
-    checks = normalize_checks(acceptance or [], field="acceptance")
-    await _check_acceptance_skills(session, ctx, checks)
+    checks = await _own_checks(session, ctx, task_type, acceptance or [])
     gathered = normalize_evidence(evidence or [])
-    check_evidence_against_acceptance(gathered, checks)
+    check_evidence_against_acceptance(gathered, [*task_type.acceptance, *checks])
     origin_doc = await resolve_origin(session, ctx, origin, field="origin")
     await verify_evidence(session, ctx, gathered)
     if goal_id is not None:
@@ -291,12 +304,30 @@ async def create_task(
     return task
 
 
-async def _check_acceptance_skills(
-    session: AsyncSession, ctx: AuthContext, checks: list[dict[str, Any]]
-) -> None:
+async def _own_checks(
+    session: AsyncSession, ctx: AuthContext, task_type: TaskType, acceptance: Any
+) -> list[dict[str, Any]]:
+    """A task's own acceptance, checked against the checks of its type version.
+
+    The type's checks run ahead of the task's in every attempt (CP-ADR-0067,
+    amendment 2026-09-27, B5): a task may add checks, never replace one of
+    its type's — a key the type already declares is ``invalid_acceptance``.
+    An external write of the task may rest on a decision the type declares.
+    """
     from control_plane.application.commands.verification import check_acceptance_skills
 
-    await check_acceptance_skills(session, ctx, checks)
+    checks = normalize_checks(acceptance, field="acceptance")
+    declared = {check["key"] for check in task_type.acceptance}
+    for index, check in enumerate(checks):
+        if check["key"] in declared:
+            raise ValidationError(
+                "invalid_acceptance",
+                f"acceptance[{index}].key {check['key']!r} is a check of the task type; "
+                "a task adds checks, it does not replace its type's",
+                details={"field": f"acceptance[{index}].key", "key": check["key"]},
+            )
+    await check_acceptance_skills(session, ctx, checks, before=list(task_type.acceptance))
+    return checks
 
 
 def check_expected_version(task: Task, expected_version: int) -> None:
@@ -476,6 +507,8 @@ async def update_task(
     previous_status = task.status
     if status is not _UNSET:
         changes.update(await _plan_transition(session, task, str(status)))
+    if isinstance(assignee_id, str):
+        assignee_id = await agent_principal(session, ctx.tenant_id, assignee_id, field="assigneeId")
     for field_name, value in (("owner_id", owner_id), ("assignee_id", assignee_id)):
         if value is not _UNSET:
             if value is not None:
@@ -527,18 +560,18 @@ async def update_task(
         # Both are whole-document replaces, like custom_fields. Evidence tied
         # to a check is validated against the acceptance the task will HAVE,
         # so dropping a check that evidence still cites is refused too.
+        task_type = await task_type_of(session, task)
         new_acceptance = (
-            normalize_checks(acceptance, field="acceptance")
+            await _own_checks(session, ctx, task_type, acceptance)
             if acceptance is not _UNSET
             else task.acceptance
         )
         new_evidence = normalize_evidence(evidence) if evidence is not _UNSET else task.evidence
-        check_evidence_against_acceptance(new_evidence, new_acceptance)
+        check_evidence_against_acceptance(new_evidence, [*task_type.acceptance, *new_acceptance])
         if evidence is not _UNSET:
             await verify_evidence(session, ctx, new_evidence)
             changes["evidence"] = new_evidence
         if acceptance is not _UNSET:
-            await _check_acceptance_skills(session, ctx, new_acceptance)
             changes["acceptance"] = new_acceptance
 
     if not changes and requirements is None:
@@ -730,19 +763,21 @@ async def finish_locked_task(
     acceptance of its own: a rule closing work verifies it by the evidence it
     wrote (CP-ADR-0063, amendment A1). The required outputs of the task's
     type come first on every path, even with an acceptance of its own: there
-    is no way to done without them (CP-ADR-0067, amendment 2026-09-26).
+    is no way to done without them (CP-ADR-0067, amendment 2026-09-26); the
+    checks its type version declares follow, then its own (amendment
+    2026-09-27, :func:`attempt_checks`).
     """
     from control_plane.application.commands.verification import (
         open_attempt,
         open_verification,
     )
 
-    outputs = output_checks(await artifact_schema_of(session, task))
-    implicit = {check["key"] for check in outputs}
-    checks = [
-        *outputs,
-        *(c for c in task.acceptance or implicit_checks or [] if c["key"] not in implicit),
-    ]
+    checks = attempt_checks(
+        output_checks(await artifact_schema_of(session, task)),
+        list((await task_type_of(session, task)).acceptance),
+        list(task.acceptance or []),
+        implicit_checks or [],
+    )
     if await open_attempt(session, task.id) is not None:
         # Completed again while its checks run: the attempt already open is
         # the answer, a second one is never opened (FR-011).

@@ -15,6 +15,12 @@ Delivery contract: **at-least-once, lossless, per tenant**.
         → provider confirms everything
         → THEN advance that tenant's durable cursor
 
+Processes (CP-ADR-0076 §2-§3): an event of a case or of a published version
+is translated together with the earlier events of its stream (read from the
+journal, hot and archived), and an artifact of a case the process declares
+as a document is ingested into memory as a document before the batch goes
+out, with an ``has_document`` edge from the case in the batch itself.
+
 A crash between provider confirm and cursor commit re-delivers the batch;
 the Memory Service deduplicates on stable observation identity. A permanent
 provider rejection (poison) does NOT advance the cursor: **only the failing
@@ -31,22 +37,40 @@ was explicitly out of scope.
 
 import asyncio
 import contextlib
+import json
 import logging
 import signal
 import uuid
+from collections import defaultdict
 from datetime import timedelta
 from typing import Any
 from typing import cast as type_cast
 
-from sqlalchemy import BigInteger, ColumnElement, Text, cast, func, select, text
+from sqlalchemy import BigInteger, ColumnElement, Text, cast, func, or_, select, text, tuple_
 from sqlalchemy.dialects.postgresql import insert as pg_insert
-from sqlalchemy.ext.asyncio import AsyncEngine
+from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
 
 from control_plane.application.common import utcnow
-from control_plane.application.context.mapping import map_event
+from control_plane.application.context.mapping import (
+    DEFINITION_EVENT,
+    KIND_DOCUMENT,
+    PROJECTION_EVENTS,
+    CaseDocument,
+    case_of,
+    map_event_parts,
+    node_key,
+    projection_stream,
+)
 from control_plane.application.event_cursor import EventPosition
 from control_plane.application.queries.events import JournalEvent, fetch_events_after
 from control_plane.config import Settings
+from control_plane.infrastructure.content_store import (
+    ContentObjectMissing,
+    ContentStore,
+    ContentStoreUnavailable,
+    build_content_store,
+    object_key,
+)
 from control_plane.infrastructure.context_provider import (
     ContextProvider,
     ContextProviderError,
@@ -54,7 +78,14 @@ from control_plane.infrastructure.context_provider import (
     tenant_namespace,
 )
 from control_plane.infrastructure.db.engine import build_engine, build_session_factory, transaction
-from control_plane.infrastructure.db.models import EventConsumerCursor
+from control_plane.infrastructure.db.models import (
+    Artifact,
+    Event,
+    EventArchive,
+    EventConsumerCursor,
+    ProcessDefinition,
+    Task,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -67,6 +98,53 @@ def _stable_horizon() -> ColumnElement[int]:
     return cast(cast(func.pg_snapshot_xmin(func.pg_current_snapshot()), Text), BigInteger)
 
 
+# A case document goes to memory as text: bytes of these media types, or the
+# JSON content of the artifact. Anything else is a document node without text.
+_TEXT_MEDIA = ("text/", "application/json", "application/yaml", "application/x-yaml")
+DOCUMENT_TEXT_LIMIT = 2 * 1024 * 1024  # bytes read from the store per document
+DOCUMENT_CHUNK_CHARS = 2000
+DOCUMENT_CHUNK_LIMIT = 500  # Memory's limit per document request
+
+
+def document_chunks(content: str) -> list[dict[str, Any]]:
+    """Paragraphs packed into chunks of at most ``DOCUMENT_CHUNK_CHARS``."""
+    chunks: list[str] = []
+    current = ""
+    for paragraph in (p.strip() for p in content.split("\n\n")):
+        if not paragraph:
+            continue
+        while len(paragraph) > DOCUMENT_CHUNK_CHARS:
+            if current:
+                chunks.append(current)
+                current = ""
+            chunks.append(paragraph[:DOCUMENT_CHUNK_CHARS])
+            paragraph = paragraph[DOCUMENT_CHUNK_CHARS:]
+        if current and len(current) + 2 + len(paragraph) > DOCUMENT_CHUNK_CHARS:
+            chunks.append(current)
+            current = ""
+        current = f"{current}\n\n{paragraph}" if current else paragraph
+    if current:
+        chunks.append(current)
+    return [{"text": text, "order": i} for i, text in enumerate(chunks[:DOCUMENT_CHUNK_LIMIT])]
+
+
+def _process_ref(origin: Any) -> uuid.UUID | None:
+    """The instance of a task a process filed: origin ``process/<instance>/<element>``."""
+    if not isinstance(origin, dict) or origin.get("kind") != "process":
+        return None
+    parts = str(origin.get("ref") or "").split("/")
+    if len(parts) < 3 or parts[0] != "process":
+        return None
+    try:
+        return uuid.UUID(parts[1])
+    except ValueError:
+        return None
+
+
+def _after(event: JournalEvent, other: JournalEvent) -> bool:
+    return (event.tx_id, event.sequence) > (other.tx_id, other.sequence)
+
+
 class ContextAdapter:
     def __init__(
         self,
@@ -74,11 +152,15 @@ class ContextAdapter:
         *,
         engine: AsyncEngine | None = None,
         provider: ContextProvider | None = None,
+        content_store: ContentStore | None = None,
     ) -> None:
         self.settings = settings
         self.engine = engine or build_engine(settings)
         self.session_factory = build_session_factory(self.engine)
         self.provider = provider if provider is not None else build_context_provider(settings)
+        self.content_store = (
+            content_store if content_store is not None else build_content_store(settings)
+        )
         self._stop = asyncio.Event()
         self.consecutive_failures = 0
 
@@ -250,16 +332,19 @@ class ContextAdapter:
         if not events:
             return 0
 
+        namespace = tenant_namespace(self.settings, tenant_id)
+        streams, documents = await self.process_inputs(tenant_id, events, namespace)
         observations: list[dict[str, Any]] = []
         for event in events:
-            observation = map_event(event)
-            if observation is not None:
-                observations.append(observation)
+            stream = projection_stream(event)
+            earlier = [e for e in streams.get(stream, ()) if _after(event, e)] if stream else []
+            observations += map_event_parts(
+                event, earlier=earlier, document=documents.get(event.id)
+            )
 
         delivered = 0
         duplicates = 0
         if observations:
-            namespace = tenant_namespace(self.settings, tenant_id)
             # The batch spans many originating traces, so the request-level
             # header is the adapter's own; each observation carries its
             # event's traceRunId in `data` (ADR-0039).
@@ -291,6 +376,202 @@ class ContextAdapter:
             },
         )
         return len(events)
+
+    # -- processes (CP-ADR-0076 §2-§3) -----------------------------------------
+
+    async def process_inputs(
+        self, tenant_id: uuid.UUID, events: list[JournalEvent], namespace: str
+    ) -> tuple[dict[tuple[str, str], list[JournalEvent]], dict[uuid.UUID, CaseDocument]]:
+        """The streams the batch's projections continue, and its case documents."""
+        artifacts = [
+            e
+            for e in events
+            if e.event_type == "artifact.created" and (e.payload or {}).get("taskId")
+        ]
+        instances = {e.entity_id for e in events if e.event_type in PROJECTION_EVENTS}
+        definitions = {
+            str(e.payload["key"])
+            for e in events
+            if e.event_type == DEFINITION_EVENT and (e.payload or {}).get("key")
+        }
+        if not artifacts and not instances and not definitions:
+            return {}, {}
+        async with self.session_factory() as session:
+            owners = await self._artifact_instances(session, tenant_id, artifacts)
+            instances |= set(owners.values())
+            streams = await self._streams(session, tenant_id, events[-1], instances, definitions)
+            documents: dict[uuid.UUID, CaseDocument] = {}
+            for event in artifacts:
+                instance = owners.get(event.id)
+                if instance is None:
+                    continue
+                document = await self._case_document(
+                    session, tenant_id, event, streams.get(("case", str(instance)), []), namespace
+                )
+                if document is not None:
+                    documents[event.id] = document
+        return streams, documents
+
+    async def _artifact_instances(
+        self, session: AsyncSession, tenant_id: uuid.UUID, artifacts: list[JournalEvent]
+    ) -> dict[uuid.UUID, uuid.UUID]:
+        """artifact.created event id -> the instance whose task the artifact is on."""
+        task_ids: dict[uuid.UUID, uuid.UUID] = {}
+        for event in artifacts:
+            with contextlib.suppress(ValueError):
+                task_ids[event.id] = uuid.UUID(str(event.payload["taskId"]))
+        if not task_ids:
+            return {}
+        rows = await session.execute(
+            select(Task.id, Task.origin).where(
+                Task.tenant_id == tenant_id, Task.id.in_(set(task_ids.values()))
+            )
+        )
+        instance_of = {row.id: _process_ref(row.origin) for row in rows}
+        return {
+            event_id: instance
+            for event_id, task_id in task_ids.items()
+            if (instance := instance_of.get(task_id)) is not None
+        }
+
+    async def _streams(
+        self,
+        session: AsyncSession,
+        tenant_id: uuid.UUID,
+        last: JournalEvent,
+        instances: set[uuid.UUID],
+        definitions: set[str],
+    ) -> dict[tuple[str, str], list[JournalEvent]]:
+        """Every event of the streams up to the end of the batch, in journal order.
+
+        The hot journal is read before the archive: a row an archive run moves
+        in between is then read twice (and kept once), never missed.
+        """
+        found: dict[uuid.UUID, JournalEvent] = {}
+        for model in (Event, EventArchive):
+            conditions = []
+            if instances:
+                conditions.append(
+                    (model.entity_type == "process_instance")
+                    & model.entity_id.in_(instances)
+                    & model.event_type.in_(PROJECTION_EVENTS)
+                )
+            if definitions:
+                conditions.append(
+                    (model.entity_type == "process_definition")
+                    & (model.event_type == DEFINITION_EVENT)
+                    & model.payload["key"].astext.in_(definitions)
+                )
+            rows = await session.scalars(
+                select(model).where(
+                    model.tenant_id == tenant_id,
+                    tuple_(model.tx_id, model.sequence) <= (last.tx_id, last.sequence),
+                    or_(*conditions),
+                )
+            )
+            for row in type_cast("list[JournalEvent]", rows.all()):
+                found.setdefault(row.id, row)
+        streams: dict[tuple[str, str], list[JournalEvent]] = defaultdict(list)
+        for event in sorted(found.values(), key=lambda e: (e.tx_id, e.sequence)):
+            stream = projection_stream(event)
+            if stream is not None:
+                streams[stream].append(event)
+        return dict(streams)
+
+    async def _case_document(
+        self,
+        session: AsyncSession,
+        tenant_id: uuid.UUID,
+        event: JournalEvent,
+        stream: list[JournalEvent],
+        namespace: str,
+    ) -> CaseDocument | None:
+        """Ingest the artifact as a document if the case's process declares its type."""
+        before = [e for e in stream if _after(event, e) and case_of(e) is not None]
+        if not before:
+            return None  # no case in memory yet to hold the document
+        state = before[-1]
+        case = case_of(state)
+        assert case is not None
+        payload = state.payload or {}
+        spec = await session.scalar(
+            select(ProcessDefinition.spec).where(
+                ProcessDefinition.tenant_id == tenant_id,
+                ProcessDefinition.key == payload.get("definitionKey"),
+                ProcessDefinition.version == payload.get("version"),
+            )
+        )
+        documents = ((spec or {}).get("memory") or {}).get("documents") or {}
+        if (event.payload or {}).get("type") not in (documents.get("artifacts") or ()):
+            return None
+        artifact = await session.get(Artifact, event.entity_id)
+        if artifact is None or artifact.tenant_id != tenant_id:
+            return None
+        key = node_key(KIND_DOCUMENT, f"artifact/{artifact.id}")
+        await self._ingest_document(tenant_id, artifact, key, namespace, payload)
+        workspace = payload.get("workspaceId")
+        return CaseDocument(
+            key=key, case=case[1], workspace_id=str(workspace) if workspace else None
+        )
+
+    async def _document_text(self, tenant_id: uuid.UUID, artifact: Artifact) -> str | None:
+        if artifact.content is not None:
+            return json.dumps(artifact.content, ensure_ascii=False, indent=2)
+        media = (artifact.media_type or "").split(";")[0].strip().lower()
+        if (
+            artifact.content_state != "stored"
+            or artifact.sha256 is None
+            or not media.startswith(_TEXT_MEDIA)
+            or self.content_store is None
+        ):
+            return None
+        try:
+            stream = await self.content_store.open(object_key(tenant_id, artifact.sha256))
+        except ContentObjectMissing:
+            return None
+        except ContentStoreUnavailable as exc:
+            # The bytes exist and will be readable again: retry the batch.
+            raise ContextProviderError(f"content store unavailable: {exc}", retryable=True) from exc
+        read = bytearray()
+        try:
+            async for chunk in stream.chunks():
+                read += chunk
+                if len(read) >= DOCUMENT_TEXT_LIMIT:
+                    break
+        finally:
+            await stream.aclose()
+        return bytes(read[:DOCUMENT_TEXT_LIMIT]).decode("utf-8", errors="replace")
+
+    async def _ingest_document(
+        self,
+        tenant_id: uuid.UUID,
+        artifact: Artifact,
+        key: str,
+        namespace: str,
+        case: dict[str, Any],
+    ) -> None:
+        assert self.provider is not None
+        content = await self._document_text(tenant_id, artifact)
+        await self.provider.ingest_document(
+            namespace=namespace,
+            document={
+                "natural_key": key,
+                "title": artifact.name,
+                "type": KIND_DOCUMENT,
+                "source_path": f"control-plane://artifacts/{artifact.id}",
+                "properties": {
+                    "artifactId": str(artifact.id),
+                    "artifactType": artifact.type,
+                    "mediaType": artifact.media_type,
+                    "taskId": str(artifact.task_id) if artifact.task_id else None,
+                    "processInstanceId": case.get("instanceId"),
+                    "process": case.get("definitionKey"),
+                },
+                "chunks": document_chunks(content) if content else [],
+                "replace": True,
+            },
+            trace_run_id=f"adapter_{uuid.uuid4().hex}",
+        )
 
     async def deliver_once(self) -> int:
         """One cycle over the due tenants; returns the total events advanced."""
@@ -410,6 +691,8 @@ class ContextAdapter:
             await lock_connection.close()
             if self.provider is not None:
                 await self.provider.aclose()
+            if self.content_store is not None:
+                await self.content_store.aclose()
             await self.engine.dispose()
             logger.info("context adapter stopped")
 

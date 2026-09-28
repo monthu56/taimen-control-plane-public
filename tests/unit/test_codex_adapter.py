@@ -12,6 +12,7 @@ The CLI is replaced by a script that speaks the same JSON event stream, so
 the subprocess layer — argv, stdin, parsing, timeout — is exercised for real.
 """
 
+import asyncio
 import json
 import os
 import stat
@@ -34,8 +35,13 @@ def fake_cli(
     agent_message: str | None = "Changed two files; tests pass.",
     turn_failed: str | None = None,
     exit_code: int = 0,
+    blocked: str | None = None,
 ) -> Path:
-    """A stand-in for `codex` that records argv and stdin, then replies."""
+    """A stand-in for `codex` that records argv and stdin, then replies.
+
+    ``blocked``: the agent inside says "stopped, not done" the way the prompt
+    tells it to — the reason into the file named by the environment.
+    """
     script = tmp_path / "fake-codex"
     events: list[dict[str, Any]] = []
     if thread_id is not None:
@@ -59,7 +65,9 @@ def fake_cli(
         "#!/bin/sh\n"
         f'printf "%s" "$*" > "{tmp_path}/argv.txt"\n'
         f'cat > "{tmp_path}/stdin.txt"\n'
-        f"cat <<'JSON'\n{payload}\nJSON\n"
+        f'printf "%s" "$CONTROL_PLANE_BLOCKED_FILE" > "{tmp_path}/blocked-path.txt"\n'
+        + (f"printf '%s' '{blocked}' > \"$CONTROL_PLANE_BLOCKED_FILE\"\n" if blocked else "")
+        + f"cat <<'JSON'\n{payload}\nJSON\n"
         f"exit {exit_code}\n"
     )
     script.chmod(0o755)
@@ -431,3 +439,38 @@ def test_importing_the_daemon_does_not_drag_in_the_vendor_adapter() -> None:
     )
 
     assert probe.stdout.strip() == "False"
+
+
+# --- "stopped, not done" (declarative-cycle C006) -----------------------------------
+
+
+@pytest.mark.asyncio
+async def test_the_blocked_file_becomes_the_blocked_checkpoint(tmp_path: Path) -> None:
+    """Codex has no Control Plane tools: the adapter turns its file into the signal."""
+    workspace = tmp_path / "copy"
+    workspace.mkdir()
+    script = fake_cli(tmp_path, blocked="Two schemas contradict; a person must choose.")
+    client = FakeClient()
+
+    class _Copy:
+        path = workspace
+
+    await adapter_for(script, tmp_path).execute(TASK, RUN, client, _Copy())  # type: ignore[arg-type]
+
+    [blocked] = [item for item in client.written if item["kind"] == "blocked"]
+    assert blocked["data"] == {"reason": "Two schemas contradict; a person must choose."}
+    # Outside the working copy, so the signal is never committed, and gone after the turn.
+    path = Path((tmp_path / "blocked-path.txt").read_text())
+    assert workspace not in path.parents
+    assert not await asyncio.to_thread(path.exists)
+    # The prompt says how.
+    assert "CONTROL_PLANE_BLOCKED_FILE" in (tmp_path / "stdin.txt").read_text()
+
+
+@pytest.mark.asyncio
+async def test_no_file_no_signal(tmp_path: Path) -> None:
+    client = FakeClient()
+
+    await adapter_for(fake_cli(tmp_path), tmp_path).execute(TASK, RUN, client, None)
+
+    assert [item for item in client.written if item["kind"] == "blocked"] == []

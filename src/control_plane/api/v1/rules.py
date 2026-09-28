@@ -35,7 +35,8 @@ router = APIRouter(tags=["rules"])
 
 _RULE_ENTITY = "rule"
 
-# Null on these is never "clear it"; condition, interpretation and goalId are.
+# Null on these is never "clear it"; condition, interpretation, goalId and
+# identity are.
 _NON_NULLABLE_PATCH_FIELDS = ("description", "trigger", "action")
 
 
@@ -66,6 +67,7 @@ async def create_rule(
             interpretation=payload.interpretation,
             action=payload.action,
             status=payload.status,
+            identity=payload.identity.model_dump() if payload.identity else None,
         )
         return 201, dump(RuleOut, rule)
 
@@ -142,6 +144,7 @@ async def update_rule(
             interpretation=pick("interpretation"),
             action=pick("action"),
             goal_id=pick("goal_id"),
+            identity=pick("identity"),
         )
         return 200, dump(RuleOut, rule)
 

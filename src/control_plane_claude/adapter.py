@@ -89,6 +89,11 @@ not.
 A file that is a result of this task and not part of the code — a document, a
 report — is handed in with `cp_create_artifact(type=..., name=..., file=...)`:
 the file is uploaded to the Control Plane and becomes an artifact of this run.
+
+If you cannot do the work, leave `cp_checkpoint(kind="blocked", data={"reason":
+"<why>"})` before you finish: the runner then fails the run and hands the task
+to a person instead of publishing it as done. Nothing is committed in that case,
+and the working copy stays as you left it.
 """
 
 

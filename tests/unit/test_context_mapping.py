@@ -170,8 +170,11 @@ def test_actor_attribution_from_journal_not_payload() -> None:
 def test_every_retained_type_produces_valid_observation() -> None:
     from control_plane.application.context.mapping import _RETAINED
 
+    # A case event says something only through its projection (CP-ADR-0076 §2).
+    memory = {"case": {"kind": "case", "key": "c-1"}, "facts": {}, "entities": []}
     for event_type in _RETAINED:
-        observation = map_event(_event(event_type, {"kind": "note", "content": "x"}))
+        payload = {"kind": "note", "content": "x", "memory": memory, "key": "sample"}
+        observation = map_event(_event(event_type, payload))
         assert observation is not None, event_type
         assert observation["content"], event_type
         assert observation["source"]["external_id"].startswith("event:"), event_type

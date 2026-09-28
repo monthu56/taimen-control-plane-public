@@ -1,0 +1,79 @@
+# yaml-language-server: $schema=../../schema/v1/object.schema.json
+# Сдвиг указателя сабмодуля в суперпроекте — решение с воротами (TAI-ADR-0053 п.6,
+# ADR-0029: указатель bump'ается отдельным коммитом после публикации компонента).
+# Работу и gate-approval заводит правило submodule-lag (request_decision); исполнителя
+# у задачи нет — одобрение вызывает скилл git.bump_submodule@1, и указатель
+# сдвигается ровно на одобренную ревизию head.
+#
+# approve → git.bump_submodule@1 (external_write, основание — это решение) в основную
+#   ветку суперпроекта установки; bumped: true — задача выполнена.
+#   Иначе — комментарий с причиной, задача остаётся открытой:
+#   - already_current — указатель уже на одобренной head (повтор после успеха или
+#     сдвиг руками): закроет правило submodule-lag-resolved на следующем коммите
+#     суперпроекта (expect сравнивает только литералы, «bumped или already_current»
+#     им не выражается);
+#   - pointer_moved / conflict / unknown_revision / not_submodule — указатель сдвинули
+#     иначе или ветку двигают параллельно: нужно новое решение (запросить approval на
+#     этой задаче) или закрыть задачу руками.
+# reject → задача отменяется; следующий коммит компонента заведёт новое решение.
+apiVersion: taimen.ai/v1
+kind: TaskType
+key: submodule-bump
+spec:
+  displayName: Submodule bump
+  description: >-
+    Решение: сдвинуть указатель сабмодуля в основной ветке суперпроекта на голову
+    ветки компонента. approve вызывает git.bump_submodule@1 и закрывает задачу по
+    итогу; reject отменяет. Заводит правило submodule-lag.
+  fieldSchema:
+    type: object
+    required: [path, pinned, head]
+    additionalProperties: false
+    properties:
+      path: {type: string, minLength: 1, maxLength: 200, description: Путь сабмодуля в суперпроекте}
+      pinned: {type: string, pattern: "^[0-9a-f]{40}$", description: Ревизия, закреплённая сейчас}
+      head: {type: string, pattern: "^[0-9a-f]{40}$", description: Голова ветки компонента — на неё сдвигается указатель}
+      branch: {type: string, maxLength: 200, description: Ветка компонента}
+      repository: {type: string, maxLength: 500, description: Репозиторий компонента (где смотреть изменения)}
+  lifecycleSchema:
+    statuses:
+      - {key: todo, category: active, displayName: To do}
+      - {key: in_progress, category: active, displayName: In progress}
+      - {key: blocked, category: blocked, displayName: Blocked}
+      - {key: done, category: terminal_success, displayName: Done}
+      - {key: cancelled, category: terminal_cancelled, displayName: Cancelled}
+    transitions:
+      - {from: todo, to: [in_progress, blocked, done, cancelled]}
+      - {from: in_progress, to: [todo, blocked, done, cancelled]}
+      - {from: blocked, to: [todo, in_progress, done, cancelled]}
+    initialStatus: todo
+    claimStatus: in_progress
+    releaseStatus: todo
+    completionStatus: done
+  approvalSchema:
+    gates:
+      default:
+        outcomes:
+          approved:
+            - invokeSkill:
+                skill: git.bump_submodule@1
+                inputs:
+                  repository: ${SELFDEV_SUPERPROJECT_URL}
+                  branch: main
+                  path: "$.task.customFields.path!"
+                  pinned: "$.task.customFields.pinned!"
+                  head: "$.task.customFields.head!"
+                  decision: "$.task.publicId!"
+                expect: {bumped: true}
+                onSuccess:
+                  - completeTask: {}
+                onFailure:
+                  - comment:
+                      body: |-
+                        Сдвиг указателя $.task.customFields.path! одобрен, но не выполнен: $.invocation.output.reason$.invocation.error.code.
+                        $.invocation.output.details|truncate:2000$.invocation.error.message
+                        already_current — указатель уже на одобренной ревизии, задачу закроет правило submodule-lag-resolved. Иначе указатель или ветку суперпроекта сдвинули параллельно: запросите решение снова или закройте задачу.
+          rejected:
+            - comment:
+                body: "Сдвиг указателя отклонён: $.approval.comment"
+            - transition: {status: cancelled}

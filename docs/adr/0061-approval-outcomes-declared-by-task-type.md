@@ -700,6 +700,11 @@ work в п.7, но не отдельной задачей: завершивши�
 пропущенное ревью хуже дубля, который человек видит и закрывает. Код
 `review.py` остаётся до перевода пакетов.
 
+Путь авто-ревью демона удалён в declarative-cycle C006 (TASK-000645,
+2026-09-27; ADR-0052 → Superseded): ревью и вливание — критерии приёмки типа
+задачи (ADR-0067, амендмент 2026-09-27), и проверка `completionSchema` демону
+больше не нужна.
+
 ### А5. Не входит
 
 Перевод пакетов суперпроекта (core `coding-task`, selfdev `code-review-merge`,
@@ -837,8 +842,6 @@ Profile; чтение `task_completion_work` через API (пока — соб
 - grep: {path: tests/client/test_merge_outcome.py, pattern: "test_approved_review_closes_by_the_result_of_the_merge"}
   repo: control-plane
 - grep: {path: src/control_plane/application/queries/approval_gates.py, pattern: "pending_gate_approvals"}
-  repo: control-plane
-- grep: {path: src/control_plane_agent/review.py, pattern: "custom_fields"}
   repo: control-plane
 - file: src/control_plane/domain/completion_work.py
   repo: control-plane

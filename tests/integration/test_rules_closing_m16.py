@@ -217,6 +217,7 @@ async def test_a_pair_of_rules_closes_the_work_as_done_on_two_observations(
         {
             "key": "rule-evidence",
             "kind": "external_state",
+            "source": "rule",
             "status": "passed",
             "evidence": [{"kind": "observation", "observationId": resolved}],
             "reason": None,

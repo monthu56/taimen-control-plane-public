@@ -695,6 +695,7 @@ async def test_a_human_check_asks_its_approver_and_passes_by_the_approval(
     assert attempt["results"][1] == {
         "key": "looked-at",
         "kind": "human",
+        "source": "task",
         "status": "passed",
         "evidence": [{"kind": "approval", "ref": first["id"]}],
         "reason": None,

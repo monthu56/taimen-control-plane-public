@@ -1,0 +1,125 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://taimen.ai/schema/packages/v1/test.schema.json",
+  "title": "Тест процесса пакета (TAI-ADR-0054 Р8)",
+  "description": "Файл <имя>.test.yaml в каталоге tests/ пакета. Прогоняет ядро (POST /packages:test) тем же движком, что живой прогон, в песочнице: задачи, approvals и таймеры — в памяти, скиллы, агенты и память — заглушки, проверенные по схемам каталога, время виртуальное. Побочных эффектов нет.",
+  "type": "object",
+  "required": ["process", "name", "steps"],
+  "additionalProperties": false,
+  "properties": {
+    "$schema": {"type": "string"},
+    "process": {"type": "string", "pattern": "^[a-z0-9][a-z0-9_-]*$", "description": "Ключ процесса пакета"},
+    "version": {"type": "integer", "minimum": 1, "description": "По умолчанию — версия в пакете"},
+    "name": {"type": "string", "minLength": 1, "maxLength": 200},
+    "description": {"type": "string", "maxLength": 2000},
+    "given": {
+      "type": "object", "additionalProperties": false,
+      "properties": {
+        "clock": {"type": "string", "format": "date-time", "description": "Начальное виртуальное время"},
+        "data": {"type": "object", "description": "Начальные данные экземпляра (без события старта)"},
+        "stage": {"type": "string", "description": "Начать с открытой стадии"},
+        "fromInstance": {"type": "string", "description": "Только пробный прогон на стенде: состояние копируется из живого экземпляра"},
+        "calendar": {"type": "string", "description": "Ключ календаря вместо календаря процесса"},
+        "principals": {
+          "type": "object", "additionalProperties": {"type": "array", "items": {"type": "string"}},
+          "description": "Роль → вымышленные principal теста (для назначений и разделения обязанностей)"
+        }
+      }
+    },
+    "mocks": {
+      "type": "object", "additionalProperties": false,
+      "properties": {
+        "skills": {
+          "type": "object",
+          "propertyNames": {"pattern": "^[^@\\s]+@[^@\\s]+$"},
+          "additionalProperties": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/mockAnswer"}},
+          "description": "name@version → ответы по порядку вызовов (или по when); выход проверяется по схеме скилла из каталога"
+        },
+        "agents": {
+          "type": "object",
+          "additionalProperties": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/mockAnswer"}}
+        },
+        "recall": {
+          "type": "array", "items": {"$ref": "#/$defs/mockAnswer"},
+          "description": "Ответы памяти шагам recall; step — id шага, when — CEL над запросом"
+        }
+      }
+    },
+    "steps": {"type": "array", "minItems": 1, "maxItems": 500, "items": {"$ref": "#/$defs/testStep"}},
+    "coverage": {
+      "type": "object", "additionalProperties": false,
+      "properties": {"minimum": {"type": "number", "minimum": 0, "maximum": 100, "description": "Порог покрытия элементов процесса этим тестом, %"}}
+    }
+  },
+  "$defs": {
+    "mockAnswer": {
+      "type": "object", "additionalProperties": false,
+      "oneOf": [{"required": ["output"]}, {"required": ["error"]}, {"required": ["timeout"]}],
+      "properties": {
+        "step": {"type": "string"},
+        "when": {"type": "string", "description": "CEL над input вызова"},
+        "output": {},
+        "error": {"type": "object", "required": ["type"], "properties": {"type": {"type": "string"}, "status": {"type": "integer"}, "detail": {"type": "string"}}},
+        "timeout": {"const": true}
+      }
+    },
+    "testStep": {
+      "type": "object", "additionalProperties": false,
+      "oneOf": [
+        {"required": ["emit"]}, {"required": ["advance"]}, {"required": ["complete"]},
+        {"required": ["approve"]}, {"required": ["expect"]}
+      ],
+      "properties": {
+        "emit": {
+          "type": "object", "additionalProperties": false,
+          "oneOf": [{"required": ["event"]}, {"required": ["observation"]}],
+          "properties": {
+            "event": {"type": "string"},
+            "observation": {"type": "string"},
+            "source": {"type": "string"},
+            "payload": {"type": "object"}
+          }
+        },
+        "advance": {"type": "string", "description": "Сдвиг виртуального времени (ISO 8601, P3D) или до момента: until:<id таймера>"},
+        "complete": {
+          "type": "object", "required": ["step"], "additionalProperties": false,
+          "properties": {
+            "step": {"type": "string"},
+            "by": {"type": "string", "description": "principal теста или agent:<key>"},
+            "output": {"type": "object", "description": "Данные формы или результат агента; проверяются по схеме формы"},
+            "cancel": {"const": true}
+          }
+        },
+        "approve": {
+          "type": "object", "required": ["step", "by", "decision"], "additionalProperties": false,
+          "properties": {
+            "step": {"type": "string"},
+            "by": {"type": "string"},
+            "decision": {"enum": ["approve", "reject"]},
+            "expectRefused": {"type": "string", "description": "Код отказа ядра, например separation_of_duties_violation"}
+          }
+        },
+        "expect": {
+          "type": "object", "additionalProperties": false,
+          "properties": {
+            "stages": {"type": "object", "additionalProperties": {"enum": ["open", "completed", "skipped", "not_started"]}},
+            "milestones": {"type": "array", "items": {"type": "string"}},
+            "tasks": {"type": "array", "items": {"type": "object", "properties": {
+              "step": {"type": "string"}, "status": {"type": "string"}, "assignee": {"type": "string"}, "due": {"type": "string"}}}},
+            "timers": {"type": "array", "items": {"type": "object", "properties": {
+              "id": {"type": "string"}, "at": {"type": "string"}, "provisional": {"type": "boolean"}}}},
+            "data": {"type": "object", "description": "Путь в данных → ожидаемое значение"},
+            "events": {"type": "array", "items": {"type": "string"}, "description": "Типы событий process.* с последнего expect"},
+            "memory": {"type": "object", "additionalProperties": false, "properties": {
+              "recalled": {"type": "array", "items": {"type": "string"}},
+              "remembered": {"type": "array", "items": {"type": "object"}}}},
+            "outcome": {"type": "string"},
+            "status": {"enum": ["running", "suspended", "completed", "failed", "cancelled"]},
+            "error": {"type": "string"},
+            "noSideEffects": {"const": true}
+          }
+        }
+      }
+    }
+  }
+}

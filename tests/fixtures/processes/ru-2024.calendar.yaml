@@ -1,0 +1,30 @@
+# yaml-language-server: $schema=../../../../packages/schema/v1/object.schema.json
+# Test data: the production calendar of the Russian Federation for 2024
+# (Government decree of 2023-08-10 No. 1306): 248 working days. 2025 is listed
+# as provisional on purpose.
+apiVersion: taimen.ai/v1
+kind: Calendar
+key: ru
+spec:
+  displayName: Производственный календарь РФ
+  timezone: Europe/Moscow
+  weekend: [6, 7]
+  years:
+    - year: 2024
+      source: Постановление Правительства РФ от 10.08.2023 № 1306
+      holidays: [
+        "2024-01-01", "2024-01-02", "2024-01-03", "2024-01-04", "2024-01-05",
+        "2024-01-06", "2024-01-07", "2024-01-08",
+        "2024-02-23", "2024-03-08",
+        "2024-04-29", "2024-04-30", "2024-05-01",
+        "2024-05-09", "2024-05-10",
+        "2024-06-12", "2024-11-04",
+        "2024-12-30", "2024-12-31"
+      ]
+      workdays: ["2024-04-27", "2024-11-02", "2024-12-28"]
+      shortDays: ["2024-02-22", "2024-03-07", "2024-05-08", "2024-06-11", "2024-11-02",
+                  "2024-12-28"]
+    - year: 2025
+      provisional: true
+      holidays: ["2025-01-01", "2025-01-02", "2025-01-03", "2025-01-06", "2025-01-07",
+                 "2025-01-08"]

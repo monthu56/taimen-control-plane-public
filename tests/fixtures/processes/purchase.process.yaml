@@ -1,0 +1,128 @@
+# yaml-language-server: $schema=../../../../packages/schema/v1/object.schema.json
+# Пример процесса для контракта схемы (TAI-ADR-0054): не пакет, не устанавливается.
+# Показывает оба уровня языка, согласование с кворумом, таймеры от даты данных,
+# таблицу решений, память (проекция дела, recall, remember, контекст шага),
+# регламенты, компенсацию, приостановку и разбор дела.
+apiVersion: taimen.ai/v1
+kind: Process
+key: purchase-example
+spec:
+  version: 1
+  displayName: Участие в закупке (пример схемы)
+  identity: {agent: example-process}
+  owner: [{role: purchase-lead}]
+  calendar: ru
+  governedBy: [{document: "regulation:purchasing"}]
+  data:
+    type: object
+    required: [purchase]
+    properties:
+      purchase:
+        type: object
+        properties:
+          number: {type: string}
+          subject: {type: string}
+          nmck: {type: number}
+          submissionDeadline: {type: string, format: date-time}
+          customer: {type: object, properties: {inn: {type: string}, name: {type: string}}}
+      history: {type: array}
+      decision: {type: string}
+      price: {type: number}
+      outcome: {type: string}
+  start:
+    on: {observation: purchase.notice_published}
+    key: event.payload.number
+    set: {purchase: event.payload}
+  correlate:
+    - on: {observation: purchase.notice_changed}
+      key: event.payload.number
+      set: {purchase: event.payload}
+  memory:
+    case: {key: "'purchase:' + data.purchase.number", title: data.purchase.subject}
+    facts: {nmck: data.purchase.nmck, decision: data.decision, outcome: data.outcome}
+    entities:
+      - {kind: legal_entity, key: data.purchase.customer.inn, name: data.purchase.customer.name, rel: customer}
+    documents: {artifacts: [notice-document]}
+  decisions:
+    - id: approval-level
+      hitPolicy: first
+      governedBy: [{document: "regulation:purchasing", section: "4.2"}]
+      inputs: [{id: nmck, expr: data.purchase.nmck, type: number}]
+      outputs: [{id: approvers, type: number}]
+      rules:
+        - {when: {nmck: "[0..10000000)"}, then: {approvers: 1}}
+        - {when: {nmck: "-"}, then: {approvers: 2}}
+  stages:
+    - id: go-no-go
+      steps:
+        - id: recall-history
+          recall:
+            anchors: [{kind: legal_entity, key: data.purchase.customer.inn}]
+            traverse: [{relation: customer, direction: in, depth: 1, limit: 20}, {relation: applies_to, direction: in, from: anchors}]
+            kinds: [case, lesson]
+            timeout: PT2M
+            onTimeout: [{id: no-history, set: {history: "[]"}}]
+          output: {as: {history: step.result.nodes}}
+        - id: decide-participation
+          human:
+            taskType: go-no-go
+            assign: [{role: purchase-lead}]
+            due: {at: "cal.addWorkdays(timestamp(data.purchase.submissionDeadline), -5, 'ru')"}
+            escalations:
+              - {after: due, action: notify, to: [{role: director}]}
+            context:
+              anchors: [{case: true}, {kind: legal_entity, key: data.purchase.customer.inn}]
+              traverse: [{relation: applies_to, direction: in}]
+          output: {as: {decision: step.result.decision}}
+        - id: decline
+          when: data.decision == 'no-go'
+          complete: {outcome: declined}
+      exit: data.decision in ['go', 'no-go']
+    - id: price
+      entry: data.decision == 'go'
+      governedBy: [{document: "regulation:purchasing", section: "4"}]
+      steps:
+        - id: level
+          decide: {table: approval-level}
+          output: {as: {approversNeeded: step.result.approvers}}
+        - id: approve-price
+          approve:
+            approvers: [{role: finance}]
+            quorum: {atLeast: 1}
+            separationOfDuties: "[task.assigneeId]"
+            due: P2D
+            onDue: escalate
+          onCompensate: [{id: revoke-note, remember: {facts: {priceApprovalRevoked: "true"}}}]
+      timers:
+        - id: deadline-reminder
+          at: {at: "cal.addWorkdays(timestamp(data.purchase.submissionDeadline), -3, 'ru')"}
+          do: [{id: remind, call: {skill: "notify.send@1", input: {text: "'Срок подачи через 3 рабочих дня'"}}}]
+    - id: results
+      entry: stage.price.completed
+      steps:
+        - id: wait-protocol
+          listen:
+            any:
+              - on: {observation: purchase.protocol, where: "event.payload.kind == 'results'"}
+                do: [{id: store-outcome, set: {outcome: event.payload.result}}]
+            timeout: P30D
+            onTimeout: [{id: no-protocol, raise: {type: protocol-timeout}}]
+        - id: remember-winner
+          remember:
+            entity: {kind: legal_entity, key: event.payload.winner.inn, name: event.payload.winner.name,
+                     links: [{rel: won, kind: case, key: "'purchase:' + data.purchase.number"}]}
+        - id: close
+          complete: {outcome: finished}
+  onEvent:
+    - on: {observation: purchase.cancelled}
+      do: [{id: undo, compensate: all}, {id: cancelled, complete: {outcome: cancelled-by-customer}}]
+    - on: {observation: purchase.suspended}
+      do: [{id: pause, suspend: {reason: "'приостановлена заказчиком или ФАС'"}}]
+    - on: {observation: purchase.resumed}
+      do: [{id: unpause, resume: {}}]
+  retrospective:
+    taskType: lessons-review
+    assign: [{role: purchase-lead}]
+    appliesTo: [legal_entity]
+  migrations:
+    - {from: 1, to: 2, policy: migrate, map: {decide-participation: go-decision}}

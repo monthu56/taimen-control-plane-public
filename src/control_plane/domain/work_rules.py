@@ -16,9 +16,12 @@ Documents (camelCase, as over the wire)::
     action:         {"kind": "ensure_work" | "update_work" | "cancel_work"
                              | "complete_work" | "request_decision",
                      "taskType": "<type key>", "dedupKeyTemplate": "<template>",
+                     "taskTypes"?: ["<type key>", ...],
                      "fields": {"title", "description", "priority", "assignee",
-                                "approver", "approverRole",
-                                "customFields": {"<field>": "<template>", ...}},
+                                "approver", "approverRole", "workspaceId",
+                                "customFields": {"<field>": "<template>", ...},
+                                "relations": {"spawnedBy"?: "<template>",
+                                              "dependsOn"?: "<template>" | [...]}},
                      "acceptance"?: [<acceptance checks, templates allowed>],
                      "check"?: "<template of the check key>",
                      "forEach"?: "<path to a list>", "where"?: <expression>}
@@ -37,6 +40,20 @@ task to one of its checks (CP-ADR-0063, amendment 2026-09-25).
 work filed: only their form is checked here, the rendered values meet the
 ``fieldSchema`` of the task type when the work is created (CP-ADR-0063,
 oss-sync amendment, B1). Work found by the key keeps its fields.
+
+``fields.workspaceId`` (creating actions only) is a template of the
+workspace the work is filed in, the rule's own when it is omitted or renders
+to nothing; the rule's identity must be allowed to file work there.
+``fields.assignee`` names a principal by id, an agent as ``agent:<key>`` or a
+role of the target workspace as ``role:<slug>`` — work any holder of the role
+may take (CP-ADR-0063, amendment process-packages P012).
+
+``ensure_work`` may pick the task type per item: ``taskType`` is then a
+template and ``taskTypes`` lists the keys it may render to. Its
+``fields.relations`` link the work it files: ``spawnedBy`` names a task (id
+or public id), ``dependsOn`` names dedup keys of other work, resolved among
+the items of the same evaluation first, then in the tenant's rule work
+(CP-ADR-0063, amendment 2026-09-27, G2/G3).
 
 Expressions are JSON, never code. An expression is a single-key object naming
 an operator, or a literal ``true`` / ``false``:
@@ -173,9 +190,27 @@ _COMPARISONS = ("eq", "ne", "lt", "le", "gt", "ge")
 OPERATORS = frozenset({*_LOGICAL, "not", *_COMPARISONS, "in", "exists"})
 
 CUSTOM_FIELDS = "customFields"
+RELATIONS = "relations"
+WORKSPACE_FIELD = "workspaceId"
 FIELD_KEYS = frozenset(
-    {"title", "description", "priority", "assignee", "approver", "approverRole", CUSTOM_FIELDS}
+    {
+        "title",
+        "description",
+        "priority",
+        "assignee",
+        "approver",
+        "approverRole",
+        WORKSPACE_FIELD,
+        CUSTOM_FIELDS,
+        RELATIONS,
+    }
 )
+# ``fields.assignee`` of a role: the work goes to whoever holds it.
+ROLE_ASSIGNEE_PREFIX = "role:"
+RELATION_SPAWNED_BY = "spawnedBy"
+RELATION_DEPENDS_ON = "dependsOn"
+MAX_TASK_TYPES = 20
+MAX_DEPENDENCIES = 50
 # Same bounds as the customFields of an approval outcome's ensureWork
 # (domain/approval_outcomes.py).
 MAX_CUSTOM_FIELDS = 32
@@ -590,6 +625,7 @@ def normalize_action(value: Any, *, interpreted: bool) -> dict[str, Any]:
             "where",
             "acceptance",
             "check",
+            "taskTypes",
         },
         label="action",
         code=code,
@@ -616,9 +652,26 @@ def normalize_action(value: Any, *, interpreted: bool) -> dict[str, Any]:
         result["where"] = doc["where"]
 
     task_type = doc.get("taskType")
+    task_types = doc.get("taskTypes")
+    if task_types is not None:
+        if kind != ActionKind.ENSURE_WORK:
+            raise _invalid(code, "action.taskTypes is only used by ensure_work", "action.taskTypes")
+        result["taskTypes"] = _normalize_task_types(task_types)
     if kind in CREATING_ACTIONS:
-        if not isinstance(task_type, str) or not _TYPE_KEY_RE.match(task_type):
+        if isinstance(task_type, str) and _has_placeholder(task_type):
+            if task_types is None:
+                raise _invalid(
+                    code,
+                    "a templated action.taskType needs action.taskTypes, the keys it may name",
+                    "action.taskType",
+                )
+            template_paths(task_type, roots=roots, where="action.taskType", code=code)
+        elif not isinstance(task_type, str) or not _TYPE_KEY_RE.match(task_type):
             raise _invalid(code, f"action.taskType is required for {kind}", "action.taskType")
+        elif task_types is not None and task_type not in result["taskTypes"]:
+            raise _invalid(
+                code, "action.taskType is not one of action.taskTypes", "action.taskType"
+            )
         result["taskType"] = task_type
     elif task_type is not None:
         raise _invalid(
@@ -651,6 +704,21 @@ def normalize_action(value: Any, *, interpreted: bool) -> dict[str, Any]:
                 )
             _check_custom_fields(template_value, roots=roots)
             continue
+        if name == RELATIONS:
+            if kind != ActionKind.ENSURE_WORK:
+                raise _invalid(
+                    code,
+                    "action.fields.relations is only used by ensure_work",
+                    "action.fields.relations",
+                )
+            _check_relations(template_value, roots=roots)
+            continue
+        if name == WORKSPACE_FIELD and kind not in CREATING_ACTIONS:
+            raise _invalid(
+                code,
+                f"action.fields.workspaceId is only used by {sorted(CREATING_ACTIONS)}",
+                "action.fields.workspaceId",
+            )
         if not isinstance(template_value, str):
             raise _invalid(code, f"action.fields.{name} must be a string", f"action.fields.{name}")
         template_paths(template_value, roots=roots, where=f"action.fields.{name}", code=code)
@@ -714,6 +782,46 @@ def _check_custom_fields(value: Any, *, roots: frozenset[str]) -> None:
         template_paths(template_value, roots=roots, where=f"{where}.{name}", code=code)
 
 
+def _normalize_task_types(value: Any) -> list[str]:
+    code = "invalid_rule_action"
+    where = "action.taskTypes"
+    if not isinstance(value, list) or not 1 <= len(value) <= MAX_TASK_TYPES:
+        raise _invalid(code, f"{where} must list 1..{MAX_TASK_TYPES} task type keys", where)
+    for index, key in enumerate(value):
+        if not isinstance(key, str) or not _TYPE_KEY_RE.match(key):
+            raise _invalid(code, f"{where}[{index}] is not a task type key", f"{where}[{index}]")
+    if len(set(value)) != len(value):
+        raise _invalid(code, f"{where} lists a key twice", where)
+    return list(value)
+
+
+def _check_relations(value: Any, *, roots: frozenset[str]) -> None:
+    """``{spawnedBy?, dependsOn?}`` of templates; what they name is resolved when work is filed."""
+    code = "invalid_rule_action"
+    where = "action.fields.relations"
+    if not isinstance(value, dict) or not value:
+        raise _invalid(code, f"{where} must be a non-empty object", where)
+    _unknown_keys(value, {RELATION_SPAWNED_BY, RELATION_DEPENDS_ON}, label=where, code=code)
+    spawned_by = value.get(RELATION_SPAWNED_BY)
+    if RELATION_SPAWNED_BY in value:
+        at = f"{where}.{RELATION_SPAWNED_BY}"
+        if not isinstance(spawned_by, str) or not spawned_by:
+            raise _invalid(code, f"{at} must be a template of a task id", at)
+        template_paths(spawned_by, roots=roots, where=at, code=code)
+    if RELATION_DEPENDS_ON in value:
+        at = f"{where}.{RELATION_DEPENDS_ON}"
+        depends_on = value[RELATION_DEPENDS_ON]
+        entries = depends_on if isinstance(depends_on, list) else [depends_on]
+        if not entries or len(entries) > MAX_DEPENDENCIES:
+            raise _invalid(
+                code, f"{at} must be a template or a list of 1..{MAX_DEPENDENCIES} templates", at
+            )
+        for index, entry in enumerate(entries):
+            if not isinstance(entry, str) or not entry:
+                raise _invalid(code, f"{at} must hold templates of dedup keys", at)
+            template_paths(entry, roots=roots, where=f"{at}[{index}]", code=code)
+
+
 def _is_template(value: Any) -> bool:
     """A string that is exactly one placeholder: its value is known only at run time."""
     return isinstance(value, str) and _PLACEHOLDER_RE.fullmatch(value) is not None
@@ -765,6 +873,9 @@ def _normalize_acceptance(value: Any, *, roots: frozenset[str]) -> Any:
             stand_in["kind"] = "human"
         if _is_template(item.get("description")):
             stand_in["description"] = "templated"
+        if _has_placeholder(item.get("when")):
+            # Known only when the rule fires; create_task checks it then.
+            stand_in.pop("when")
         probe.append(stand_in)
         typed.append(
             not _is_template(item.get("kind"))
@@ -772,7 +883,7 @@ def _normalize_acceptance(value: Any, *, roots: frozenset[str]) -> Any:
             and not _has_placeholder(item.get("spec"))
         )
     try:
-        checks = normalize_checks(probe, field=where, typed_spec=False)
+        checks = normalize_checks(probe, field=where, typed_spec=False, conditions=True)
         for index, check in enumerate(checks):
             if typed[index]:
                 check_spec(check["kind"], check["spec"], field=f"{where}[{index}].spec")
@@ -848,6 +959,7 @@ def rule_roots(
     paths += template_paths(
         action.get("dedupKeyTemplate", ""), roots=all_roots, where="", code=code
     )
+    paths += template_paths(action.get("taskType", ""), roots=all_roots, where="", code=code)
     paths += template_paths(action.get("fields", {}), roots=all_roots, where="", code=code)
     paths += template_paths(action.get("acceptance", []), roots=all_roots, where="", code=code)
     paths += template_paths(action.get("check", ""), roots=all_roots, where="", code=code)

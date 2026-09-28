@@ -121,6 +121,17 @@ class Permission(StrEnum):
     AGENTS_READ = "agents.read"
     AGENTS_MANAGE = "agents.manage"
     AGENTS_STATUS_WRITE = "agents.status.write"
+    # process-packages (CP-ADR-0074 §11). Publishing a process and operating its
+    # instances are different roles: suspending or cancelling a running case is
+    # an operator's decision, not the author's. Testing and planning a package
+    # write nothing, so they are rights of their own, apart from applying it;
+    # a calendar is tenant data every process reads.
+    PROCESSES_READ = "processes.read"
+    PROCESSES_WRITE = "processes.write"
+    PROCESSES_OPERATE = "processes.operate"
+    PACKAGES_TEST = "packages.test"
+    PACKAGES_PLAN = "packages.plan"
+    CALENDARS_WRITE = "calendars.write"
     ADMIN = "admin"
 
 

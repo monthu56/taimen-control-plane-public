@@ -168,6 +168,72 @@ async def test_journal_event_carries_counters_not_content(client: httpx.AsyncCli
     assert "entities" not in payload and "relations" not in payload
 
 
+async def test_changed_regulation_is_one_knowledge_changed_event(
+    client: httpx.AsyncClient, app
+) -> None:
+    """CP-ADR-0076 §7: the keys Memory reports for a snapshot become one event."""
+    _, admin_key, agent_key = await _setup(client)
+    root = await create_workspace(client, admin_key, "root")
+    child = await create_workspace(client, admin_key, "child", parent_id=root["id"])
+    app.state.context_provider = FakeKnowledge(
+        changes={
+            "opened": [],
+            "changed": [{"kind": "regulation", "key": "regulation:procurement"}],
+            "closed": [],
+            "limit": 1000,
+            "truncated": False,
+        }
+    )
+    try:
+        response = await client.post(
+            "/api/v1/knowledge/snapshots",
+            json={**snapshot(), "workspaceId": child["id"]},
+            headers=auth(agent_key),
+        )
+    finally:
+        app.state.context_provider = None
+    assert response.status_code == 200, response.text
+
+    [event] = await _events(client, agent_key, "knowledge.changed")
+    assert event["entityType"] == "workspace" and event["entityId"] == child["id"]
+    payload = event["payload"]
+    assert payload["changes"] == [
+        {"kind": "regulation", "key": "regulation:procurement", "change": "changed"}
+    ]
+    assert payload["truncated"] is False
+    assert payload["snapshotId"] == "snap-1"
+    assert payload["source"] == snapshot()["source"]
+    assert payload["workspaceId"] == child["id"]
+    assert payload["rootWorkspaceId"] == root["id"]
+    assert SECRET_TEXT not in json.dumps(event)
+    [reconciled] = await _events(client, agent_key, "knowledge.snapshot_reconciled")
+    # Keys go to knowledge.changed; the counters stay numbers of the answer.
+    assert not any(name.startswith("changes.") for name in reconciled["payload"]["counters"])
+
+
+async def test_reconciliation_without_changes_writes_no_knowledge_changed(
+    client: httpx.AsyncClient, app
+) -> None:
+    _, admin_key, agent_key = await _setup(client)
+    root = await create_workspace(client, admin_key, "root")
+    empty = {"opened": [], "changed": [], "closed": [], "limit": 1000, "truncated": False}
+    try:
+        # Memory before MEM-ADR-020 answers without ``changes``; a repeated or
+        # unchanged snapshot answers with empty lists.
+        for fake in (FakeKnowledge(), FakeKnowledge(changes=empty)):
+            app.state.context_provider = fake
+            response = await client.post(
+                "/api/v1/knowledge/snapshots",
+                json={**snapshot(), "workspaceId": root["id"]},
+                headers=auth(agent_key),
+            )
+            assert response.status_code == 200, response.text
+    finally:
+        app.state.context_provider = None
+    assert len(await _events(client, agent_key, "knowledge.snapshot_reconciled")) == 2
+    assert await _events(client, agent_key, "knowledge.changed") == []
+
+
 async def test_memory_failures_are_mapped(client: httpx.AsyncClient, app) -> None:
     _, admin_key, agent_key = await _setup(client)
     root = await create_workspace(client, admin_key, "root")

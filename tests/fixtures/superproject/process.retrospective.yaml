@@ -1,0 +1,203 @@
+# yaml-language-server: $schema=../../schema/v1/object.schema.json
+# Сгенерировано skill-sdk из кода — правьте код и перегенерируйте (TAI-ADR-0045).
+apiVersion: taimen.ai/v1
+kind: Skill
+key: process.retrospective
+spec:
+  version: '1'
+  description: 'Разобрать закрытое дело процесса: уроки со ссылками на записи журнала и сущности дела
+    — на подтверждение человеку'
+  sideEffects: none
+  riskLevel: low
+  contract:
+    inputs:
+      $schema: https://json-schema.org/draft/2020-12/schema
+      type: object
+      required:
+      - case
+      - journal
+      additionalProperties: false
+      properties:
+        case:
+          type: object
+          required:
+          - key
+          description: 'Узел дела из проекции memory: {kind, key, title}'
+          properties:
+            kind:
+              type: string
+            key:
+              type: string
+              minLength: 1
+            title:
+              type:
+              - string
+              - 'null'
+        definitionKey:
+          type: string
+        version:
+          type: integer
+        instanceId:
+          type: string
+        outcome:
+          type:
+          - string
+          - 'null'
+        data:
+          type: object
+          description: Данные экземпляра на момент закрытия
+        journal:
+          type: array
+          maxItems: 5000
+          description: Журнал решений экземпляра (ProcessJournalEntryOut), по seq
+          items:
+            type: object
+            required:
+            - seq
+            - kind
+            properties:
+              seq:
+                type: integer
+              at:
+                type: string
+              kind:
+                type: string
+              element:
+                type:
+                - string
+                - 'null'
+              reason:
+                type: string
+              actorId:
+                type:
+                - string
+                - 'null'
+              eventId:
+                type:
+                - string
+                - 'null'
+              data:
+                type: object
+        entities:
+          type: array
+          maxItems: 200
+          description: 'Сущности дела из проекции memory: {kind, key, name, rel}'
+          items:
+            type: object
+            required:
+            - kind
+            - key
+            properties:
+              kind:
+                type: string
+              key:
+                type: string
+                minLength: 1
+              name:
+                type:
+                - string
+                - 'null'
+              rel:
+                type:
+                - string
+                - 'null'
+        documents:
+          type: array
+          maxItems: 50
+          items:
+            type: object
+            required:
+            - key
+            properties:
+              key:
+                type: string
+              title:
+                type:
+                - string
+                - 'null'
+              text:
+                type:
+                - string
+                - 'null'
+        appliesToKinds:
+          type: array
+          maxItems: 10
+          items:
+            type: string
+          description: 'retrospective.appliesTo процесса: к каким видам сущностей привязывать уроки'
+    outputs:
+      $schema: https://json-schema.org/draft/2020-12/schema
+      type: object
+      required:
+      - case
+      - lessons
+      - dropped
+      properties:
+        case:
+          type: string
+        lessons:
+          type: array
+          maxItems: 10
+          items:
+            type: object
+            required:
+            - key
+            - text
+            - appliesTo
+            - evidence
+            properties:
+              key:
+                type: string
+                description: lesson:<ключ дела>/<id>
+              text:
+                type: string
+                minLength: 1
+              appliesTo:
+                type: array
+                minItems: 1
+                items:
+                  type: object
+                  required:
+                  - kind
+                  - key
+                  properties:
+                    kind:
+                      type: string
+                      minLength: 1
+                    key:
+                      type: string
+                      minLength: 1
+              evidence:
+                type: array
+                minItems: 1
+                items:
+                  type: object
+                  required:
+                  - seq
+                  properties:
+                    seq:
+                      type: integer
+                    eventId:
+                      type:
+                      - string
+                      - 'null'
+        dropped:
+          type: array
+          items:
+            type: object
+            required:
+            - text
+            - reason
+            properties:
+              text:
+                type: string
+              reason:
+                type: string
+    idempotency: natural
+    timeoutSeconds: 300
+    retryPolicy:
+      maxAttempts: 2
+      backoffSeconds: 60
+    implementation:
+      protocol: local
+      entrypoint: taimen_process_knowledge.retrospective:invoke

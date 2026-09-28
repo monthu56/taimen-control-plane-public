@@ -45,6 +45,7 @@ async def request_approval(
             assigned_principal_id=payload.assigned_principal_id,
             comment=payload.comment,
             gate=payload.gate,
+            excluded_principals=payload.excluded_principals or (),
         )
         return 201, dump(ApprovalOut, approval)
 

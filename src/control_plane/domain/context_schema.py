@@ -132,6 +132,10 @@ class ContextSchema:
     traverse: tuple[TraverseSpec, ...] = ()
     as_of: str = AS_OF_TASK_CREATED
     budget_tokens: int | None = None
+    # A process step's profile (CP-ADR-0076 §6): anchors already computed, and
+    # whether a read by similarity follows the explicit links.
+    values: tuple["Candidate", ...] = ()
+    semantic: bool = False
 
     @property
     def roots(self) -> frozenset[str]:
@@ -265,6 +269,49 @@ def parse_context_schema(document: Any) -> ContextSchema | None:
         ),
         as_of=as_of,
         budget_tokens=budget,
+    )
+
+
+def traverse_steps(items: Any, *, where: str) -> tuple[TraverseSpec, ...]:
+    """``traverse`` of a process step (``recall``, ``context``): the same steps as a profile's."""
+    return tuple(_step(item, f"{where}.traverse[{i}]") for i, item in enumerate(items or ()))
+
+
+# The ``source`` of the anchors a process step computed from its instance.
+STEP_SOURCE = "step"
+
+
+def step_profile(document: Any) -> ContextSchema | None:
+    """The ``context`` of a process step as its task carries it (CP-ADR-0076 §6).
+
+    ``{anchors: [{kind, key, via?, case?}], traverse, semantic, budgetTokens}``
+    — the engine computed the anchors when it made the task, so they are
+    values, not paths into the task. An anchor without a key (its expression
+    gave nothing) is not sent. The moment is the task's creation, when the
+    step was reached. ``None`` when the task carries no profile.
+    """
+    if not isinstance(document, dict) or not document:
+        return None
+    values: list[Candidate] = []
+    for item in document.get("anchors") or ():
+        if not isinstance(item, dict) or item.get("key") in (None, ""):
+            continue
+        via = item.get("via")
+        values.append(
+            Candidate(
+                value=str(item["key"])[:MAX_CANDIDATE_CHARS],
+                kind=str(item.get("kind") or ""),
+                source=STEP_SOURCE,
+                via=str(via) if via else None,
+            )
+        )
+    budget = document.get("budgetTokens")
+    return ContextSchema(
+        anchors=(),
+        traverse=traverse_steps(document.get("traverse"), where="context"),
+        budget_tokens=int(budget) if budget is not None else None,
+        values=tuple(values[:MAX_ANCHORS]),
+        semantic=bool(document.get("semantic", True)),
     )
 
 

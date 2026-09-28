@@ -17,10 +17,12 @@ from control_plane.domain.work_graph import (
     INVALID_ACCEPTANCE_SPEC,
     MAX_CHECKS,
     SPEC_KEYS,
+    attempt_checks,
     check_evidence_against_acceptance,
     check_order_advice,
     check_spec,
     context_pack_targets,
+    decision_before,
     evidence_targets,
     normalize_checks,
     normalize_evidence,
@@ -470,3 +472,81 @@ def test_context_pack_is_a_pointer_like_any_other_fact() -> None:
     )
     summary = origin_summary({"kind": "harness", "evidence": items})
     assert summary["evidence"] == [{"kind": "context_pack", "contextPackId": pack}]
+
+
+# --- declarative-cycle C004: ``when``, checks of the type (CP-ADR-0067, 2026-09-27)
+
+HUMAN = {"key": "review", "kind": "human", "description": "A person approves"}
+WRITE = {
+    "key": "merge",
+    "kind": "deterministic",
+    "description": "The result is written out",
+    "spec": {"skill": "write.sample@1"},
+}
+
+
+def test_a_check_takes_when_of_task_expressions() -> None:
+    when = ["$.task.artifact[result].metadata.published", "$.task.customFields.target"]
+    [check] = normalize_checks([{**HUMAN, "when": when}])
+    assert check["when"] == when
+
+
+@pytest.mark.parametrize(
+    ("when", "field"),
+    [
+        ([], "acceptance[0].when"),
+        (["$.task.customFields.f"] * 9, "acceptance[0].when"),
+        ("$.task.status", "acceptance[0].when"),
+        ([7], "acceptance[0].when[0]"),
+        (["task.status"], "acceptance[0].when[0]"),
+        (["$.task.status", "$.approval.comment"], "acceptance[0].when[1]"),
+        (["$.spawnedBy.status"], "acceptance[0].when[0]"),
+        (["$.task.title|truncate:5"], "acceptance[0].when[0]"),
+        (["$.task.unknownField"], "acceptance[0].when[0]"),
+    ],
+)
+def test_a_when_outside_the_grammar_is_refused_with_its_path(when: Any, field: str) -> None:
+    with pytest.raises(ValidationError) as caught:
+        normalize_checks([{**HUMAN, "when": when}])
+    assert caught.value.code == INVALID_ACCEPTANCE_SPEC
+    assert caught.value.details["field"] == field
+
+
+def test_goal_criteria_take_no_when() -> None:
+    criterion = {**HUMAN, "when": ["$.task.status"]}
+    assert _code(normalize_checks, [criterion], typed_spec=False) == "invalid_acceptance"
+    # A rule's acceptance probe checks the grammar without typing the spec.
+    [probe] = normalize_checks([criterion], typed_spec=False, conditions=True)
+    assert probe["when"] == ["$.task.status"]
+
+
+def test_an_external_write_rests_on_an_earlier_decision_under_the_same_condition() -> None:
+    when = ["$.task.customFields.target"]
+    assert decision_before([HUMAN, WRITE], 1)
+    assert decision_before([HUMAN, {**WRITE, "when": when}], 1)
+    assert decision_before([{**HUMAN, "when": when}, {**WRITE, "when": when}], 1)
+    assert decision_before([{**HUMAN, "kind": "llm_judge"}, WRITE], 1)
+    assert not decision_before([WRITE, HUMAN], 0)
+    assert not decision_before([{**HUMAN, "kind": "external_state"}, WRITE], 1)
+    # A decision that may be skipped does not stand behind an unconditional write.
+    assert not decision_before([{**HUMAN, "when": when}, WRITE], 1)
+    assert not decision_before([{**HUMAN, "when": when}, {**WRITE, "when": ["$.task.status"]}], 1)
+
+
+def test_an_attempt_runs_outputs_then_the_type_then_the_task() -> None:
+    output = {"key": "output.report", "kind": "deterministic", "description": "o"}
+    typed = [HUMAN, WRITE]
+    own = [{**HUMAN, "description": "replaced?"}, {**HUMAN, "key": "extra"}]
+    rule = [{"key": "rule-evidence", "kind": "external_state", "description": "r"}]
+    checks = attempt_checks([output], typed, own, rule)
+    assert [(c["key"], c["source"]) for c in checks] == [
+        ("output.report", "output"),
+        ("review", "type"),
+        ("merge", "type"),
+        ("extra", "task"),
+    ]
+    # The type's check stands: a task's check stored under its key is passed over.
+    assert checks[1]["description"] == "A person approves"
+    # The implicit check of a rule runs only when neither declares a check.
+    assert [c["source"] for c in attempt_checks([output], [], [], rule)] == ["output", "rule"]
+    assert attempt_checks([], [], [], []) == []

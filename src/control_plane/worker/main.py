@@ -14,6 +14,14 @@ And it runs the verification stage (CP-ADR-0067): open attempts of tasks
 handed in with acceptance checks are executed check by check, each look in
 its own transaction, waiting between looks on ``next_check_at``.
 
+It runs the process instances too (CP-ADR-0074 §5, §8): its own journal
+cursor ``processes`` feeds the events of each tenant to the instances they
+start, correlate or answer (``process_events``), and due rows of
+``process_timers`` become the instances' timer inputs (``process_timers``).
+The ``recall`` steps of instances are asked of memory here, outside any
+transaction, and answered into their journals (``process_recalls``,
+CP-ADR-0076 §4).
+
 With a content store configured it also sweeps artifact uploads no artifact
 referenced before they expired, and the objects nothing needs any more
 (CP-ADR-0072 §10).
@@ -39,6 +47,7 @@ from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from control_plane.application.authorization import Authorizer, configure_authorizer
+from control_plane.application.commands import process_instances
 from control_plane.application.commands._claim_release import (
     release_active_claims_for_session,
     release_claim_on_locked_task,
@@ -76,6 +85,7 @@ from control_plane.config import Settings
 from control_plane.domain.enums import ClaimStatus, SessionStatus
 from control_plane.infrastructure.auth.policy import build_authorizer
 from control_plane.infrastructure.content_store import ContentStore, build_content_store
+from control_plane.infrastructure.context_provider import GraphProvider, build_context_provider
 from control_plane.infrastructure.db.engine import (
     build_engine,
     build_session_factory,
@@ -102,11 +112,16 @@ class Worker:
         engine: AsyncEngine | None = None,
         authorizer: Authorizer | None = None,
         content_store: ContentStore | None = None,
+        graph_provider: GraphProvider | None = None,
     ) -> None:
         self.settings = settings
         self.engine = engine or build_engine(settings)
         self.content_store = (
             content_store if content_store is not None else build_content_store(settings)
+        )
+        # Memory for the recall steps of processes; None when it is disabled.
+        self.graph_provider: GraphProvider | None = (
+            graph_provider if graph_provider is not None else build_context_provider(settings)  # type: ignore[assignment]
         )
         # Outcome actions pass through the ordinary commands, which ask the
         # process-wide authorizer: without this the worker would answer from
@@ -165,6 +180,9 @@ class Worker:
                 await aclose()
         if self.content_store is not None:
             await self.content_store.aclose()
+        aclose_graph = getattr(self.graph_provider, "aclose", None)
+        if aclose_graph is not None:
+            await aclose_graph()
         await self.engine.dispose()
 
     async def run_once(self) -> dict[str, int]:
@@ -176,6 +194,9 @@ class Worker:
             "rule_schedules_run": await self.process_rule_schedules(),
             "rule_evaluations_resumed": await self.resume_rule_evaluations(),
             "verifications_processed": await self.process_verifications(),
+            "process_events_read": await self.process_events(),
+            "process_timers_fired": await self.process_timers(),
+            "process_recalls_answered": await self.process_recalls(),
             "sessions_expired": await self.expire_sessions(),
             "claims_expired": await self.expire_claims(),
             "skill_leases_expired": await self.expire_skill_invocation_leases(),
@@ -397,6 +418,92 @@ class Worker:
                         seconds=self.settings.outbox_backoff_max_seconds,
                     )
         return resumed
+
+    # -- process instances (CP-ADR-0074) ------------------------------------------
+
+    async def process_events(self) -> int:
+        """One journal batch per due tenant into its process instances.
+
+        An unexpected error rolls the tenant's batch back (its cursor does not
+        move) and holds the tenant back with backoff; the others go on.
+        """
+        async with transaction(self.session_factory) as session:
+            tenants = await process_instances.due_process_tenants(
+                session, limit=self.settings.outbox_batch_size
+            )
+        read = 0
+        for tenant_id in tenants:
+            try:
+                async with transaction(self.session_factory) as session:
+                    read += await process_instances.process_tenant_events(
+                        session,
+                        tenant_id=tenant_id,
+                        batch_size=self.settings.rules_batch_size,
+                        trace_run_id=self.trace_run_id,
+                    )
+            except Exception as exc:
+                logger.exception(
+                    "process event batch failed",
+                    extra={"tenant": str(tenant_id), "worker": self.name},
+                )
+                async with transaction(self.session_factory) as session:
+                    await process_instances.record_tenant_failure(
+                        session,
+                        tenant_id=tenant_id,
+                        error=f"{type(exc).__name__}: {exc}",
+                        backoff_base_seconds=self.settings.outbox_backoff_base_seconds,
+                        backoff_max_seconds=self.settings.outbox_backoff_max_seconds,
+                    )
+        return read
+
+    async def process_timers(self) -> int:
+        """Every due timer is its instance's input, each in its own transaction.
+
+        A timer whose instance is busy (locked by another step) waits for the
+        next cycle; one that keeps breaking is logged and tried again.
+        """
+        async with transaction(self.session_factory) as session:
+            due = await process_instances.due_timers(session, limit=self.settings.outbox_batch_size)
+        fired = 0
+        for timer_id in due:
+            try:
+                async with transaction(self.session_factory) as session:
+                    fired += await process_instances.fire_timer(
+                        session, timer_id, trace_run_id=self.trace_run_id
+                    )
+            except Exception:
+                logger.exception(
+                    "process timer failed",
+                    extra={"timer_id": str(timer_id), "worker": self.name},
+                )
+        return fired
+
+    async def process_recalls(self) -> int:
+        """Every due recall is asked of memory, then answered into its instance.
+
+        Each attempt resolves in one transaction, asks memory outside any, and
+        answers in another; one that breaks is logged and tried again later.
+        """
+        async with transaction(self.session_factory) as session:
+            due = await process_instances.due_recalls(
+                session, limit=self.settings.outbox_batch_size
+            )
+        answered = 0
+        for recall_id in due:
+            try:
+                answered += await process_instances.run_recall(
+                    self.session_factory,
+                    self.graph_provider,
+                    self.settings,
+                    recall_id,
+                    trace_run_id=self.trace_run_id,
+                )
+            except Exception:
+                logger.exception(
+                    "process recall failed",
+                    extra={"recall_id": str(recall_id), "worker": self.name},
+                )
+        return answered
 
     # -- verification stage (CP-ADR-0067) --------------------------------------
 

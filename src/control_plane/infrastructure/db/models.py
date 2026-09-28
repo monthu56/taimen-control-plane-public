@@ -11,7 +11,9 @@ from typing import Any
 
 from sqlalchemy import (
     BigInteger,
+    Boolean,
     CheckConstraint,
+    Float,
     ForeignKey,
     ForeignKeyConstraint,
     Identity,
@@ -255,6 +257,11 @@ class TaskType(Base):
     # (CP-ADR-0072 §7): {"inputs": [...], "outputs": [...]}. Part of the
     # immutable version; empty means "no inputs, no outputs".
     artifact_schema: Mapped[dict[str, Any]] = mapped_column(default=dict)
+    # Checks every task of this version passes before it is done, after the
+    # required outputs and before the task's own acceptance (CP-ADR-0067,
+    # amendment 2026-09-27): [{key, kind, description, spec?, when?}]. Part
+    # of the immutable version; empty means "none", the behaviour before.
+    acceptance: Mapped[list[Any]] = mapped_column(JSONB, default=list)
     status: Mapped[str] = mapped_column(Text, default="active")
     created_by: Mapped[uuid.UUID] = mapped_column(ForeignKey("principals.id"))
     created_at: Mapped[datetime]
@@ -419,6 +426,9 @@ class Task(Base):
     origin: Mapped[dict[str, Any]] = mapped_column(default=lambda: dict(_HUMAN_ORIGIN))
     acceptance: Mapped[list[Any]] = mapped_column(JSONB, default=list)
     evidence: Mapped[list[Any]] = mapped_column(JSONB, default=list)
+    # The ``context`` of the process step this task is (CP-ADR-0076 §6), its
+    # anchors computed: it replaces the profile of the type. NULL — the type's.
+    context_profile: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
     version: Mapped[int] = mapped_column(Integer, default=1)
     claim_epoch: Mapped[int] = mapped_column(BigInteger, default=0)
     active_claim_id: Mapped[uuid.UUID | None] = mapped_column(
@@ -1579,6 +1589,11 @@ class Approval(Base):
     outcome_attempts: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
     outcome_next_attempt_at: Mapped[datetime | None]
     outcome_last_error: Mapped[str | None] = mapped_column(Text)
+    # Separation of duties (CP-ADR-0074 section 7): principal ids (as text)
+    # whose decision the core refuses, whoever the request comes through.
+    excluded_principals: Mapped[list[str]] = mapped_column(
+        JSONB, default=list, server_default=text("'[]'::jsonb")
+    )
     created_at: Mapped[datetime]
     updated_at: Mapped[datetime]
 
@@ -1771,12 +1786,20 @@ class WorkRule(Base):
     # approvals.decision_authority).
     authority: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
     authority_principal_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("principals.id"))
+    # Key of the registry agent the rule evaluates and acts as (amendment
+    # 2026-09-27, G1); NULL: it acts with ``authority``.
+    identity_agent_key: Mapped[str | None] = mapped_column(Text, nullable=True)
     enabled_at: Mapped[datetime | None]
     # Schedule triggers only: when the next evaluation is due.
     next_run_at: Mapped[datetime | None]
     created_by: Mapped[uuid.UUID] = mapped_column(ForeignKey("principals.id"))
     created_at: Mapped[datetime]
     updated_at: Mapped[datetime]
+
+    @property
+    def identity(self) -> dict[str, Any] | None:
+        """The ``identity`` document of the rule, as written."""
+        return {"agent": self.identity_agent_key} if self.identity_agent_key else None
 
 
 class RuleEvaluation(Base):
@@ -2326,3 +2349,258 @@ class AttentionFeedback(Base):
     comment: Mapped[str] = mapped_column(Text, default="")
     created_at: Mapped[datetime]
     updated_at: Mapped[datetime]
+
+
+class CalendarVersion(Base):
+    """One immutable version of a working-day calendar (CP-ADR-0074 §9).
+
+    A trigger rejects every UPDATE and DELETE. ``spec`` is ``$defs.calendarSpec``
+    with its lists in canonical order; ``calendar_hash`` is ``sha256:<hex>`` of
+    its canonical JSON. The latest version of a key is the one with the
+    greatest ``version``.
+    """
+
+    __tablename__ = "calendars"
+    __table_args__ = (
+        CheckConstraint("version >= 1", name="version_positive"),
+        UniqueConstraint("tenant_id", "key", "version", name="uq_calendars_tenant_key_version"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True)
+    tenant_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("tenants.id"))
+    key: Mapped[str] = mapped_column(Text)
+    version: Mapped[int] = mapped_column(Integer)
+    calendar_hash: Mapped[str] = mapped_column(Text)
+    spec: Mapped[dict[str, Any]] = mapped_column(JSONB)
+    created_by: Mapped[uuid.UUID] = mapped_column(ForeignKey("principals.id"))
+    created_at: Mapped[datetime]
+
+
+class ProcessDefinition(Base):
+    """One immutable version of a process (CP-ADR-0074 §1).
+
+    A trigger rejects every UPDATE and DELETE: instances are pinned to the
+    version they started on. ``spec`` is ``$defs.processSpec`` as published
+    (normalized, domain/process_definition.py); ``definition_hash`` is
+    ``sha256:<hex>`` of its canonical JSON. ``governed_by`` lists the documents
+    its elements name, for ``GET /process-definitions?governedBy=``;
+    ``warnings`` are the findings that did not refuse the version.
+    """
+
+    __tablename__ = "process_definitions"
+    __table_args__ = (
+        CheckConstraint("version >= 1", name="version_positive"),
+        UniqueConstraint(
+            "tenant_id", "key", "version", name="uq_process_definitions_tenant_key_version"
+        ),
+        Index(
+            "ix_process_definitions_governed_by",
+            "governed_by",
+            postgresql_using="gin",
+            postgresql_ops={"governed_by": "jsonb_path_ops"},
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True)
+    tenant_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("tenants.id"))
+    workspace_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("workspaces.id"))
+    key: Mapped[str] = mapped_column(Text)
+    version: Mapped[int] = mapped_column(Integer)
+    display_name: Mapped[str] = mapped_column(Text)
+    definition_hash: Mapped[str] = mapped_column(Text)
+    identity_agent: Mapped[str | None] = mapped_column(Text)
+    expression_profile: Mapped[str] = mapped_column(Text)
+    spec: Mapped[dict[str, Any]] = mapped_column(JSONB)
+    governed_by: Mapped[list[str]] = mapped_column(JSONB)
+    warnings: Mapped[list[dict[str, Any]]] = mapped_column(JSONB)
+    created_by: Mapped[uuid.UUID] = mapped_column(ForeignKey("principals.id"))
+    created_at: Mapped[datetime]
+
+
+PROCESS_INSTANCE_STATUSES = ("running", "suspended", "completed", "failed", "cancelled")
+PROCESS_TIMER_STATES = ("pending", "frozen", "fired", "cancelled")
+
+
+class ProcessInstance(Base):
+    """One case of a process, pinned to the version it started on (CP-ADR-0074 §3).
+
+    ``state`` is the engine's JSON state (domain/process_engine.py) and ``data``
+    a copy of its data for reading; both are written only together with the
+    journal entry of the step that produced them. ``(tenant, definition_key,
+    instance_key)`` is unique: one instance per key. ``refs`` routes the
+    journal's facts back to the instance — ``task:<id>``, ``approval:<id>``,
+    ``skill:<id>``, ``child:<id>`` — each to the activity that opened it.
+    """
+
+    __tablename__ = "process_instances"
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('running', 'suspended', 'completed', 'failed', 'cancelled')",
+            name="status_known",
+        ),
+        UniqueConstraint(
+            "tenant_id",
+            "definition_key",
+            "instance_key",
+            name="uq_process_instances_tenant_definition_key_instance_key",
+        ),
+        Index("ix_process_instances_tenant_status", "tenant_id", "status", "definition_key"),
+        Index("ix_process_instances_refs", "refs", postgresql_using="gin"),
+        Index("ix_process_instances_parent", "parent_instance_id"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True)
+    tenant_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("tenants.id"))
+    workspace_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("workspaces.id"))
+    definition_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("process_definitions.id"))
+    definition_key: Mapped[str] = mapped_column(Text)
+    definition_version: Mapped[int] = mapped_column(Integer)
+    instance_key: Mapped[str] = mapped_column(Text)
+    status: Mapped[str] = mapped_column(Text)
+    outcome: Mapped[str | None] = mapped_column(Text)
+    error: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
+    data: Mapped[dict[str, Any]] = mapped_column(JSONB)
+    state: Mapped[dict[str, Any]] = mapped_column(JSONB)
+    refs: Mapped[dict[str, Any]] = mapped_column(JSONB)
+    parent_instance_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("process_instances.id"))
+    parent_activity_id: Mapped[str | None] = mapped_column(Text)
+    started_by: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("principals.id"))
+    started_at: Mapped[datetime]
+    updated_at: Mapped[datetime]
+    completed_at: Mapped[datetime | None]
+
+
+class ProcessTimer(Base):
+    """A timer of an instance as the engine set it (CP-ADR-0074 §8).
+
+    ``id`` is the engine's timer id. A ``pending`` row with ``due_at`` in the
+    past is an input of the timer loop; ``frozen`` keeps ``remaining_seconds``
+    while the instance is suspended (``due_at`` null); ``fired`` never goes
+    back. ``reads`` — the data fields its expression reads, for recomputation.
+    """
+
+    __tablename__ = "process_timers"
+    __table_args__ = (
+        CheckConstraint("state IN ('pending', 'frozen', 'fired', 'cancelled')", name="state_known"),
+        Index(
+            "ix_process_timers_due",
+            "due_at",
+            postgresql_where=text("state = 'pending'"),
+        ),
+        Index("ix_process_timers_instance", "instance_id"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True)
+    tenant_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("tenants.id"))
+    instance_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("process_instances.id"))
+    element: Mapped[str] = mapped_column(Text)
+    timer_kind: Mapped[str] = mapped_column(Text)
+    due_at: Mapped[datetime | None]
+    state: Mapped[str] = mapped_column(Text)
+    remaining_seconds: Mapped[float | None] = mapped_column(Float)
+    reads: Mapped[list[str]] = mapped_column(JSONB)
+    provisional: Mapped[bool] = mapped_column(Boolean)
+    created_at: Mapped[datetime]
+    updated_at: Mapped[datetime]
+    fired_at: Mapped[datetime | None]
+
+
+class PackageObject(Base):
+    """What a package apply last wrote of a catalog object (CP-ADR-0074 §11).
+
+    One row per ``(tenant, kind, key)`` of the kinds the core plans
+    (``Process``, ``Calendar``). ``spec`` is the spec the apply published:
+    a field of the latest version that differs from it was changed by a
+    person since, and the plan names its owner ``console``. ``retired_at`` —
+    the key was renamed away by ``renames``: a retired process starts no new
+    instance, its open instances go on; a publication outside a package
+    brings the key back.
+    """
+
+    __tablename__ = "package_objects"
+    __table_args__ = (
+        CheckConstraint("kind IN ('Process', 'Calendar')", name="kind_known"),
+        UniqueConstraint("tenant_id", "kind", "key", name="uq_package_objects_tenant_kind_key"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True)
+    tenant_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("tenants.id"))
+    kind: Mapped[str] = mapped_column(Text)
+    key: Mapped[str] = mapped_column(Text)
+    package_key: Mapped[str] = mapped_column(Text)
+    version: Mapped[int] = mapped_column(Integer)
+    spec_hash: Mapped[str] = mapped_column(Text)
+    spec: Mapped[dict[str, Any]] = mapped_column(JSONB)
+    plan_hash: Mapped[str] = mapped_column(Text)
+    applied_by: Mapped[uuid.UUID] = mapped_column(ForeignKey("principals.id"))
+    applied_at: Mapped[datetime]
+    retired_at: Mapped[datetime | None]
+
+
+class ProcessRecall(Base):
+    """A ``recall`` intent of an instance, executed after its step (CP-ADR-0076 §4).
+
+    ``id`` is the engine's ``recallId`` and ``request`` the intent. The worker
+    picks up ``pending`` rows whose ``next_attempt_at`` has come (``SKIP
+    LOCKED``), asks memory outside any transaction and gives the answer to the
+    instance as its ``recall`` input: ``answered``. A step that stopped
+    waiting (its timeout fired, it was cancelled) closes the row: ``closed``.
+    """
+
+    __tablename__ = "process_recalls"
+    __table_args__ = (
+        CheckConstraint("state IN ('pending', 'answered', 'closed')", name="state_known"),
+        Index(
+            "ix_process_recalls_due",
+            "next_attempt_at",
+            postgresql_where=text("state = 'pending'"),
+        ),
+        Index("ix_process_recalls_instance", "instance_id"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True)
+    tenant_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("tenants.id"))
+    instance_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("process_instances.id"))
+    element: Mapped[str] = mapped_column(Text)
+    request: Mapped[dict[str, Any]] = mapped_column(JSONB)
+    state: Mapped[str] = mapped_column(Text)
+    attempts: Mapped[int] = mapped_column(Integer)
+    next_attempt_at: Mapped[datetime]
+    last_error: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime]
+    updated_at: Mapped[datetime]
+    answered_at: Mapped[datetime | None]
+
+
+class ProcessInstanceEvent(Base):
+    """One step of an instance: its input whole, the decisions and the intents (CP-ADR-0074 §5).
+
+    Append-only (a trigger rejects UPDATE and DELETE). ``source_ref`` names
+    where the input came from (``event:<id>``, ``timer:<id>``…) and is unique
+    per instance, so the same input delivered twice is taken once. The journal
+    alone replays the instance: ``calendars`` names the calendar versions the
+    step was computed on.
+    """
+
+    __tablename__ = "process_instance_events"
+    __table_args__ = (
+        UniqueConstraint(
+            "instance_id", "source_ref", name="uq_process_instance_events_instance_source"
+        ),
+    )
+
+    instance_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("process_instances.id"), primary_key=True
+    )
+    seq: Mapped[int] = mapped_column(Integer, primary_key=True)
+    tenant_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("tenants.id"))
+    at: Mapped[datetime]
+    kind: Mapped[str] = mapped_column(Text)
+    source_ref: Mapped[str] = mapped_column(Text)
+    event_id: Mapped[uuid.UUID | None]
+    actor_id: Mapped[uuid.UUID | None]
+    input: Mapped[dict[str, Any]] = mapped_column(JSONB)
+    decisions: Mapped[list[dict[str, Any]]] = mapped_column(JSONB)
+    intents: Mapped[list[dict[str, Any]]] = mapped_column(JSONB)
+    calendars: Mapped[dict[str, Any]] = mapped_column(JSONB)
+    created_at: Mapped[datetime]

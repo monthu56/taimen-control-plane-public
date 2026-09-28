@@ -49,12 +49,21 @@ def test_versions_only_add_fields() -> None:
             assert newer.changes, f"{entry.type} v{newer.version} must say what it added"
 
 
-def test_approval_events_are_at_version_two() -> None:
-    for name in ("approval.requested", "approval.approved", "approval.rejected"):
+def test_approval_events_are_at_their_current_versions() -> None:
+    for name in ("approval.approved", "approval.rejected", "approval.cancelled"):
         assert current_version(name) == 2
-    assert current_version("approval.cancelled") == 2
+    # v3 adds the principals whose decision the core refuses (CP-ADR-0074 §7).
+    assert current_version("approval.requested") == 3
     requested = get_event_type("approval.requested").current.schema
-    for field in ("workspaceId", "taskPublicId", "taskTitle", "requestedBy", "comment", "gate"):
+    for field in (
+        "workspaceId",
+        "taskPublicId",
+        "taskTitle",
+        "requestedBy",
+        "comment",
+        "gate",
+        "excludedPrincipals",
+    ):
         assert field in requested["required"]
     decided = get_event_type("approval.approved").current.schema
     for field in ("decisionBy", "comment", "channel"):
@@ -108,6 +117,7 @@ def test_catalog_is_neutral() -> None:
         "artifact",
         "artifact_type",
         "attention_feedback",
+        "calendar",
         "capability",
         "claim",
         "delegation",
@@ -118,6 +128,8 @@ def test_catalog_is_neutral() -> None:
         "knowledge_pack",
         "observation",
         "principal",
+        "process_definition",
+        "process_instance",
         "project",
         "project_template",
         "role",

@@ -1,0 +1,47 @@
+# yaml-language-server: $schema=../../schema/v1/object.schema.json
+# Маршруты ядра под аутентификацией, права — в каталоге (безопасность, CP-ADR-0063):
+# на каждом коммите main control-plane скилл authz.coverage_check@1 ищет маршрут без
+# AuthDep и без метки `# authz: public — причина`, маршрут, теряющий identity, и
+# расхождение enum Permission с authz/catalog.yaml. Каждая находка — отдельная задача
+# (дедуп по виду и утверждению). Класс дыры — как обход через header-identity
+# (TASK-000333): публичным маршрут становится только явным решением в коде.
+apiVersion: taimen.ai/v1
+kind: WorkRule
+key: authz-coverage
+spec:
+  description: Маршрут без аутентификации или расхождение каталога прав — задача
+  workspaceId: ${SELFDEV_WORKSPACE_ID}
+  identity: {agent: selfdev-rules}
+  trigger: {kind: observation, type: repo.commit_observed}
+  condition:
+    and:
+      - {eq: [{var: payload.data.repo}, control-plane]}
+      - {exists: payload.data.url}
+  interpretation:
+    skill: authz.coverage_check@1
+    inputs:
+      repository: "{{payload.data.url}}"
+      ref: "{{payload.data.sha}}"
+      repo: "{{payload.data.repo}}"
+  action:
+    kind: ensure_work
+    taskType: coding-task
+    forEach: skill.output.failing
+    dedupKeyTemplate: "authz:{{item.repo}}:{{item.kind}}:{{item.claim}}"
+    fields:
+      title: "Авторизация: {{item.kind}} — {{item.claim}} ({{item.repo}})"
+      priority: high
+      description: |
+        Проверка авторизации (authz.coverage_check@1) на коммите {{payload.data.sha}}
+        репозитория {{item.repo}}: {{item.kind}}.
+
+        Где: {{item.file}}:{{item.line}}
+        Что: {{item.claim}} — {{item.detail}}
+
+        Что сделать:
+        - unauthenticated_route — добавить AuthDep и проверку прав; если маршрут публичен
+          осознанно, пометить декоратор `# authz: public — причина`;
+        - identity_dropped — передать ctx в команду/запрос или вызвать authorize;
+        - permission_not_in_catalog — объявить действие в authz/catalog.yaml;
+        - catalog_orphan — удалить действие из каталога или завести его в Permission.
+        Задача заведена правилом authz-coverage автоматически.

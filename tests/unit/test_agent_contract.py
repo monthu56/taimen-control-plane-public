@@ -179,11 +179,16 @@ def test_permissions_are_in_the_catalog() -> None:
 
 
 def test_the_pinned_schema_is_the_superproject_one() -> None:
+    """The whole copy, not only the kind Agent: the kinds TaskType and WorkRule
+    carry the core's request bodies too (declarative-cycle C001/C002)."""
     if not SUPERPROJECT_SCHEMA.is_file():
         pytest.skip("not checked out inside the superproject")
-    live = json.loads(SUPERPROJECT_SCHEMA.read_text(encoding="utf-8"))["$defs"]
-    pinned = json.loads(PINNED_SCHEMA.read_text(encoding="utf-8"))["$defs"]
-    assert {name: pinned[name] for name in AGENT_DEFS} == {name: live[name] for name in AGENT_DEFS}
+    live = json.loads(SUPERPROJECT_SCHEMA.read_text(encoding="utf-8"))
+    pinned = json.loads(PINNED_SCHEMA.read_text(encoding="utf-8"))
+    assert {name: pinned["$defs"][name] for name in AGENT_DEFS} == {
+        name: live["$defs"][name] for name in AGENT_DEFS
+    }
+    assert pinned == live
 
 
 def test_the_examples_cover_every_executor_kind_and_the_catalog_accepts_them() -> None:

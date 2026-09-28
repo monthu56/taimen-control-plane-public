@@ -628,9 +628,11 @@ class ControlPlaneClient:
         workspace_id: str | None = None,
         goal_id: str | None = None,
         status: str = "enabled",
+        identity: Json | None = None,
         idempotency_key: str | None = None,
     ) -> Json:
-        """Write a rule; enabled, it acts with this credential's authority."""
+        """Write a rule; enabled, it acts with this credential's authority, or
+        with the agent's of ``identity`` (``{"agent": "<key>"}``)."""
         body: Json = {
             "key": key,
             "trigger": trigger,
@@ -643,6 +645,7 @@ class ControlPlaneClient:
             ("interpretation", interpretation),
             ("workspaceId", workspace_id),
             ("goalId", goal_id),
+            ("identity", identity),
         ):
             if value is not None:
                 body[name] = value
@@ -682,9 +685,9 @@ class ControlPlaneClient:
 
     async def update_rule(self, rule_id: str, *, expected_version: int, **fields: Any) -> Json:
         """Optimistic rule update. ``fields`` use snake_case names (description,
-        trigger, condition, interpretation, action, goal_id); an explicit None
-        resets the condition to "always", removes the interpretation or unlinks
-        the goal."""
+        trigger, condition, interpretation, action, goal_id, identity); an
+        explicit None resets the condition to "always", removes the
+        interpretation or the identity, or unlinks the goal."""
         names = {
             "description": "description",
             "trigger": "trigger",
@@ -692,6 +695,7 @@ class ControlPlaneClient:
             "interpretation": "interpretation",
             "action": "action",
             "goal_id": "goalId",
+            "identity": "identity",
         }
         unknown = sorted(set(fields) - set(names))
         if unknown:
@@ -2263,6 +2267,103 @@ class ControlPlaneClient:
             if value is not None:
                 body[name] = value
         return await self._request("PUT", f"/agents/{key}/status", json_body=body, idempotent=True)
+
+    # -- processes and packages (CP-ADR-0074) -----------------------------------
+
+    async def get_process_definition(self, ref: str) -> Json:
+        """A process by ``key`` (latest version) or ``key@version`` (``ProcessDefinitionOut``)."""
+        return await self._request("GET", f"/process-definitions/{ref}")
+
+    async def list_process_versions(
+        self, key: str, *, limit: int | None = None, cursor: str | None = None
+    ) -> Json:
+        params: Json = {}
+        if limit is not None:
+            params["limit"] = limit
+        if cursor is not None:
+            params["cursor"] = cursor
+        return await self._request(
+            "GET", f"/process-definitions/{key}/versions", params=params or None
+        )
+
+    async def get_process_instance(self, instance_id: str) -> Json:
+        return await self._request("GET", f"/process-instances/{instance_id}")
+
+    async def list_process_journal(
+        self,
+        instance_id: str,
+        *,
+        kind: str | None = None,
+        limit: int | None = None,
+        cursor: str | None = None,
+    ) -> Json:
+        """One page of the decision journal of an instance, oldest first."""
+        params: Json = {}
+        for name, value in (("kind", kind), ("limit", limit), ("cursor", cursor)):
+            if value is not None:
+                params[name] = value
+        return await self._request(
+            "GET", f"/process-instances/{instance_id}/journal", params=params or None
+        )
+
+    async def test_package(
+        self,
+        files: Sequence[Json],
+        *,
+        tests: Sequence[str] | None = None,
+        workspace_id: str | None = None,
+        check_only: bool = False,
+    ) -> Json:
+        """Check a package and run its tests in the core's sandbox; nothing is written.
+
+        ``files`` are ``{path, content}`` of the package; ``check_only`` runs
+        the check without any test.
+        """
+        body: Json = {"package": {"files": list(files)}}
+        if tests is not None:
+            body["tests"] = list(tests)
+        if workspace_id is not None:
+            body["workspaceId"] = workspace_id
+        return await self._request(
+            "POST",
+            "/packages:test",
+            json_body=body,
+            params={"checkOnly": "true"} if check_only else None,
+        )
+
+    async def plan_package(
+        self,
+        files: Sequence[Json],
+        *,
+        workspace_id: str | None = None,
+        replay_limit: int | None = None,
+        overwrite_console: bool = False,
+    ) -> Json:
+        """The plan of applying a package with its ``planHash``; nothing is written."""
+        body: Json = {"package": {"files": list(files)}, "overwriteConsole": overwrite_console}
+        if workspace_id is not None:
+            body["workspaceId"] = workspace_id
+        if replay_limit is not None:
+            body["replayLimit"] = replay_limit
+        return await self._request("POST", "/packages:plan", json_body=body)
+
+    async def apply_package(
+        self,
+        files: Sequence[Json],
+        *,
+        plan_hash: str,
+        workspace_id: str | None = None,
+        overwrite_console: bool = False,
+    ) -> Json:
+        """Apply exactly the plan with ``plan_hash``; a changed catalog is ``plan_stale``."""
+        body: Json = {
+            "package": {"files": list(files)},
+            "planHash": plan_hash,
+            "overwriteConsole": overwrite_console,
+        }
+        if workspace_id is not None:
+            body["workspaceId"] = workspace_id
+        return await self._request("POST", "/packages:apply", json_body=body, idempotent=True)
 
     # -- operator actions (v0.5) ----------------------------------------------
 

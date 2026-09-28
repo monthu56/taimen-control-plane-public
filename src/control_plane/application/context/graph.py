@@ -27,7 +27,7 @@ import regex
 
 from control_plane.application.authorization import AuthContext
 from control_plane.config import Settings
-from control_plane.domain.context_schema import CHARS_PER_TOKEN
+from control_plane.domain.context_schema import CHARS_PER_TOKEN, MAX_CANDIDATE_CHARS
 from control_plane.infrastructure.context_provider import (
     ContextProviderError,
     GraphProvider,
@@ -322,3 +322,177 @@ def drift(recorded: dict[str, Any], current: dict[str, Any]) -> dict[str, Any]:
         "missingFacts": sorted(facts_before - facts_after),
         "extraFacts": sorted(facts_after - facts_before),
     }
+
+
+# --- process memory (CP-ADR-0076) ---------------------------------------------------
+
+
+def entity_key(kind: str, key: str) -> str:
+    """The key of an entity an observation asserts: ``<kind>:<natural key>``.
+
+    Memory resolves an anchor ``{kind, value}`` by this key as well as by the
+    natural key itself, so a case written by ``remember`` or the projection
+    is found by the anchors of ``recall`` and of a step's context.
+    """
+    return f"{kind}:{key}"
+
+
+def _moment(item: dict[str, Any]) -> str:
+    return str(item.get("valid_from") or "")
+
+
+def _node(entity: dict[str, Any], inferred: bool) -> dict[str, Any]:
+    node: dict[str, Any] = {
+        "kind": str(entity.get("kind") or ""),
+        "key": str(entity.get("natural_key") or ""),
+        "title": str(entity.get("title") or ""),
+        "attributes": dict(entity.get("attributes") or {}),
+        "anchor": bool(entity.get("anchor")),
+        "inferred": inferred or entity.get("evidence") == "inferred",
+    }
+    if entity.get("valid_from"):
+        node["validFrom"] = str(entity["valid_from"])
+    return node
+
+
+def _edge(fact: dict[str, Any], inferred: bool) -> dict[str, Any]:
+    edge: dict[str, Any] = {
+        "relation": str(fact.get("relation") or ""),
+        "from": str(fact.get("subject") or ""),
+        "to": str(fact.get("object") or ""),
+        "inferred": inferred or fact.get("evidence") == "inferred",
+    }
+    if fact.get("valid_from"):
+        edge["validFrom"] = str(fact["valid_from"])
+    return edge
+
+
+def _truncated(pack: dict[str, Any]) -> bool:
+    raw = pack.get("stats")
+    stats: dict[str, Any] = raw if isinstance(raw, dict) else {}
+    cut = [*(pack.get("anchors") or []), *(stats.get("steps") or [])]
+    return any(isinstance(item, dict) and item.get("truncated") for item in cut)
+
+
+def _fresh_first(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    by_key = sorted(items, key=lambda e: (str(e.get("kind")), str(e.get("natural_key"))))
+    return sorted(by_key, key=_moment, reverse=True)
+
+
+def recall_answer(
+    explicit: dict[str, Any],
+    semantic: dict[str, Any] | None = None,
+    *,
+    kinds: list[str] | None = None,
+    limit: int | None = None,
+) -> dict[str, Any]:
+    """The answer of a ``recall`` step: ``{nodes, edges, truncated}`` (CP-ADR-0076 §4).
+
+    The entities the explicit links of the anchors reached come first, then
+    what the query found by similarity, marked ``inferred``; within each, the
+    freshest first. ``kinds`` keeps nodes of those kinds, ``limit`` caps the
+    nodes; an edge stays while one of its ends does. ``truncated`` — memory
+    cut a step or an anchor, or the limit cut nodes.
+    """
+    found: dict[str, dict[str, Any]] = {}
+    for entity in _fresh_first(entities_of(explicit)):
+        node = _node(entity, False)
+        found.setdefault(node["key"], node)
+    if semantic is not None:
+        for entity in _fresh_first(entities_of(semantic)):
+            node = _node(entity, True)
+            found.setdefault(node["key"], node)
+    nodes = [n for n in found.values() if n["key"] and (not kinds or n["kind"] in kinds)]
+    truncated = _truncated(explicit) or (semantic is not None and _truncated(semantic))
+    if limit is not None and len(nodes) > limit:
+        nodes, truncated = nodes[:limit], True
+    kept = {n["key"] for n in nodes}
+    edges: dict[tuple[str, str, str], dict[str, Any]] = {}
+    for pack, inferred in ((explicit, False), (semantic or {}, True)):
+        for fact in pack.get("facts") or []:
+            if not isinstance(fact, dict):
+                continue
+            edge = _edge(fact, inferred)
+            if edge["from"] in kept or edge["to"] in kept:
+                edges.setdefault((edge["relation"], edge["from"], edge["to"]), edge)
+    return {"nodes": nodes, "edges": list(edges.values()), "truncated": truncated}
+
+
+def with_inferred(pack: dict[str, Any], semantic: dict[str, Any]) -> dict[str, Any]:
+    """A task pack with what the semantic read found appended, marked ``inferred``.
+
+    The explicit links of the case come first (CP-ADR-0076 §6): the found
+    entities follow every section of the pack, so the budget cuts them first.
+    ``used`` lists them too — they are evidence the executor saw.
+    """
+    seen = {str(e.get("natural_key")) for e in entities_of(pack)}
+    added: dict[str, list[dict[str, Any]]] = {}
+    for entity in _fresh_first(entities_of(semantic)):
+        key = str(entity.get("natural_key") or "")
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        added.setdefault(str(entity.get("kind") or ""), []).append(
+            {**entity, "evidence": "inferred"}
+        )
+    if not added:
+        return pack
+    keys = {str(i["natural_key"]) for items in added.values() for i in items}
+    entities = used_of(pack)["entities"] + [
+        e for e in used_of(semantic)["entities"] if str(e.get("natural_key")) in keys
+    ]
+    return {
+        **pack,
+        "sections": [
+            *(pack.get("sections") or []),
+            *({"kind": kind, "items": items, "inferred": True} for kind, items in added.items()),
+        ],
+        "used": {**(pack.get("used") or {}), "entities": entities},
+    }
+
+
+# The part of a recorded typed request that reads by similarity (CP-ADR-0076 §6).
+SEMANTIC_REQUEST = "semantic"
+_EMPTY_PACK: dict[str, Any] = {
+    "sections": [],
+    "facts": [],
+    "unresolved": [],
+    "used": {"entities": [], "facts": [], "snapshots": []},
+}
+
+
+def semantic_request(text: str, as_of: str | None) -> dict[str, Any]:
+    """The read by similarity of a step's context: its text, nothing traversed."""
+    request: dict[str, Any] = {
+        "anchors": [{"value": text[:MAX_CANDIDATE_CHARS]}],
+        "traverse": [],
+        "allow_semantic": True,
+    }
+    if as_of is not None:
+        request["as_of"] = as_of
+    return request
+
+
+async def typed_pack(
+    provider: GraphProvider,
+    scope: GraphScope,
+    request: dict[str, Any],
+    *,
+    deadline: float,
+    trace_run_id: str | None = None,
+) -> dict[str, Any]:
+    """A pack as its request was recorded: the explicit links, then the read by similarity.
+
+    A request without :data:`SEMANTIC_REQUEST` is one typed traversal, as
+    before CP-ADR-0076; with it, what the second read found is appended to the
+    first, marked ``inferred`` (:func:`with_inferred`).
+    """
+    semantic = request.get(SEMANTIC_REQUEST)
+    explicit = {k: v for k, v in request.items() if k != SEMANTIC_REQUEST}
+    pack = _EMPTY_PACK
+    if explicit.get("anchors"):
+        pack = await typed(provider, scope, explicit, deadline=deadline, trace_run_id=trace_run_id)
+    if isinstance(semantic, dict) and semantic.get("anchors"):
+        found = await typed(provider, scope, semantic, deadline=deadline, trace_run_id=trace_run_id)
+        pack = with_inferred(pack, found)
+    return pack

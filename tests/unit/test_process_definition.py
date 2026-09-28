@@ -1,0 +1,325 @@
+"""The check of a process definition (CP-ADR-0074 §1, §2; process-packages P006).
+
+Negative fixtures (``tests/fixtures/processes/invalid/``) each break one thing
+in a small valid process and name, in their ``# expect:`` lines, the finding
+the check must give — its code and the JSON pointer into the object. The
+check must give those and no other error, so that a fixture pins one class.
+"""
+
+import copy
+import json
+import re
+from pathlib import Path
+from typing import Any
+
+import pytest
+import yaml
+
+from control_plane.domain import process_definition as pd
+from control_plane.domain.process_definition import Catalog, SkillEntry
+from tests.unit.test_process_contract import PINNED, PROCESS, _yaml12_loader
+
+FIXTURES = Path(__file__).resolve().parents[1] / "fixtures" / "processes"
+INVALID = sorted((FIXTURES / "invalid").glob("*.process.yaml"))
+EXPECT = re.compile(r"^# expect: (\S+) (\S+)$", re.MULTILINE)
+
+CATALOG = Catalog(
+    skills={
+        "text.summarize@1": SkillEntry(
+            {"type": "object", "properties": {"text": {"type": "string"}}, "required": ["text"]},
+            {"type": "object", "properties": {"summary": {"type": "string"}}},
+        ),
+    },
+    task_types={"review": {"type": "object", "properties": {"decision": {"type": "string"}}}},
+    agents=frozenset({"sample-process"}),
+    calendars=frozenset({"ru"}),
+    artifact_types=frozenset(),
+    processes=frozenset(),
+)
+
+
+def _load(path: Path) -> dict[str, Any]:
+    document: dict[str, Any] = yaml.load(path.read_text("utf-8"), Loader=_yaml12_loader())
+    return document
+
+
+SAMPLE = _load(FIXTURES / "sample.process.yaml")
+
+
+def _check(
+    spec: dict[str, Any], catalog: Catalog = CATALOG, key: str = "sample"
+) -> pd.CheckedProcess:
+    return pd.check_process(key, pd.normalized_spec(spec), catalog)
+
+
+def _codes(checked: pd.CheckedProcess) -> set[tuple[str, str]]:
+    return {(p.code, p.path) for p in checked.problems}
+
+
+def _sample(**changes: Any) -> dict[str, Any]:
+    spec = copy.deepcopy(SAMPLE["spec"])
+    spec.update(changes)
+    return spec
+
+
+def test_the_sample_passes_without_findings() -> None:
+    checked = _check(SAMPLE["spec"])
+    assert checked.problems == ()
+    assert checked.governed_by == ("regulation:sample",)
+
+
+@pytest.mark.parametrize("path", INVALID, ids=[p.name.split(".")[0] for p in INVALID])
+def test_a_negative_fixture_gives_its_code_and_path(path: Path) -> None:
+    text = path.read_text("utf-8")
+    expected = set(EXPECT.findall(text))
+    assert expected, f"{path.name} names no expected finding"
+    document = _load(path)
+    checked = _check(document["spec"], key=document["key"])
+    found = _codes(checked)
+    assert expected <= found, [p.out() for p in checked.problems]
+    unexpected = [p.out() for p in checked.errors if (p.code, p.path) not in expected]
+    assert unexpected == []
+
+
+def test_every_finding_has_the_one_shape() -> None:
+    document = _load(FIXTURES / "invalid" / "unknown_data_field.process.yaml")
+    problem = _check(document["spec"]).problems[0].out()
+    assert problem == {
+        "code": "unknown_data_field",
+        "severity": "error",
+        "path": "/spec/stages/0/steps/0/output/as/decison",
+        "file": None,
+        "line": None,
+        "message": "data has no field decison",
+        "hint": "did you mean decision?",
+    }
+
+
+def _line_index(text: str) -> dict[str, int]:
+    """JSON pointer -> 1-based line of the node, as a package check would build it."""
+    index: dict[str, int] = {}
+
+    def walk(node: yaml.Node, path: str) -> None:
+        index[path] = node.start_mark.line + 1
+        if isinstance(node, yaml.MappingNode):
+            for key, value in node.value:
+                walk(value, f"{path}/{pd.pointer(key.value)[1:]}")
+        elif isinstance(node, yaml.SequenceNode):
+            for position, value in enumerate(node.value):
+                walk(value, f"{path}/{position}")
+
+    root = yaml.compose(text, Loader=_yaml12_loader())
+    assert root is not None
+    walk(root, "")
+    return index
+
+
+def test_a_finding_of_a_package_file_names_the_file_and_line() -> None:
+    path = FIXTURES / "invalid" / "unknown_data_field.process.yaml"
+    text = path.read_text("utf-8")
+    document = _load(path)
+    lines = _line_index(text)
+    checked = pd.check_process(
+        document["key"],
+        pd.normalized_spec(document["spec"]),
+        CATALOG,
+        file="processes/sample.yaml",
+        locate=lines.get,
+    )
+    problem = checked.problems[0]
+    assert problem.file == "processes/sample.yaml"
+    assert problem.line is not None
+    assert "decison:" in text.splitlines()[problem.line - 1]
+
+
+def test_the_owner_is_kept_and_its_chain_is_checked() -> None:
+    assert "owner" in SAMPLE["spec"]
+    checked = _check(_sample(owner=[{"agent": "nobody"}, {"expr": "data.number"}]))
+    assert _codes(checked) == {("unknown_agent", "/spec/owner/0/agent")}
+    checked = _check(_sample(owner=[{"expr": "1 + 1"}]))
+    assert _codes(checked) == {("expression_type_error", "/spec/owner/0/expr")}
+
+
+def test_the_schema_example_passes_once_its_data_declares_what_it_writes() -> None:
+    """The superproject's example covers every block: the language check
+    types all of them; it only finds the two liberties the example takes."""
+    spec = copy.deepcopy(PROCESS["spec"])
+    catalog = Catalog(
+        skills={
+            "notify.send@1": SkillEntry(
+                {"type": "object", "properties": {"text": {"type": "string"}}}, None
+            ),
+            "process.retrospective@1": SkillEntry(None, None),
+        },
+        task_types={"go-no-go": None, "lessons-review": None},
+        agents=frozenset({"example-process"}),
+        calendars=frozenset({"ru"}),
+        artifact_types=frozenset({"notice-document"}),
+        processes=frozenset(),
+    )
+    assert _codes(_check(spec, catalog, PROCESS["key"])) == {
+        ("unknown_data_field", "/spec/stages/1/steps/0/output/as/approversNeeded"),
+        ("invalid_migration", "/spec/migrations/0"),
+    }
+    spec["data"]["properties"]["approversNeeded"] = {"type": "number"}
+    del spec["migrations"]  # a map into version 2 belongs to version 2
+    checked = _check(spec, catalog, PROCESS["key"])
+    assert checked.problems == ()
+    kinds = {element.id: (element.kind, element.parent) for element in checked.elements}
+    assert kinds["go-no-go"] == ("stage", None)
+    assert kinds["decide-participation"] == ("step", "go-no-go")
+    assert kinds["no-history"] == ("step", "recall-history")
+    assert kinds["approval-level"] == ("decision", None)
+    table = next(e for e in checked.elements if e.id == "approval-level").out()
+    assert table["governedBy"] == [{"document": "regulation:purchasing", "section": "4.2"}]
+
+
+def test_event_payloads_are_typed_by_the_event_catalog() -> None:
+    start = {"on": {"event": "task.completed"}, "key": "event.entityId"}
+    checked = _check(_sample(start={**start, "set": {"number": "event.payload.publicId"}}))
+    assert not checked.errors
+    checked = _check(_sample(start={**start, "set": {"number": "event.payload.publicIdd"}}))
+    assert _codes(checked) >= {("expression_type_error", "/spec/start/set/number")}
+
+
+def test_a_catch_names_the_error_for_its_handlers_only() -> None:
+    step = {
+        "id": "guarded",
+        "try": {
+            "do": [{"id": "risky", "set": {"summary": "'x'"}}],
+            "catch": [{"as": "err", "do": [{"id": "note", "set": {"summary": "err.type"}}]}],
+        },
+    }
+    spec = _sample()
+    spec["stages"][1]["steps"].insert(0, step)
+    assert _check(spec).problems == ()
+    step["try"]["do"][0]["set"] = {"summary": "err.type"}
+    assert _codes(_check(spec)) == {
+        ("expression_type_error", "/spec/stages/1/steps/0/try/do/0/set/summary")
+    }
+    step["try"]["catch"][0]["as"] = "data"
+    assert ("invalid_error_binding", "/spec/stages/1/steps/0/try/catch/0/as") in _codes(
+        _check(spec)
+    )
+
+
+def test_a_disabled_skill_is_not_callable() -> None:
+    catalog = Catalog(
+        **{
+            **CATALOG.__dict__,
+            "skills": {"text.summarize@1": SkillEntry(None, None, status="disabled")},
+        }
+    )
+    assert ("unknown_skill", "/spec/stages/1/steps/0/call/skill") in _codes(
+        _check(SAMPLE["spec"], catalog)
+    )
+
+
+# --- stability of ids against the previous version ---------------------------------
+
+
+def _next(spec: dict[str, Any]) -> dict[str, Any]:
+    return {**copy.deepcopy(spec), "version": spec["version"] + 1}
+
+
+def test_an_id_does_not_change_its_kind() -> None:
+    previous = pd.normalized_spec(SAMPLE["spec"])
+    spec = _next(previous)
+    spec["stages"][1]["steps"][1]["id"] = "finish"
+    spec["stages"][1]["id"] = "summarize"
+    spec["stages"][1]["steps"][0]["id"] = "summarize-text"
+    catalog = Catalog(**{**CATALOG.__dict__, "previous": previous})
+    found = _codes(_check(spec, catalog))
+    assert ("element_kind_changed", "/spec/stages/1/id") in found
+    assert ("element_removed", "/spec") in found  # step "done" is gone
+
+
+def test_a_removed_element_named_by_a_migration_map_is_fine() -> None:
+    previous = pd.normalized_spec(SAMPLE["spec"])
+    spec = _next(previous)
+    spec["stages"][1]["steps"][1]["id"] = "finish"
+    catalog = Catalog(**{**CATALOG.__dict__, "previous": previous, "versions": {1: previous}})
+    removed = [p for p in _check(spec, catalog).problems if p.code == "element_removed"]
+    assert len(removed) == 1 and "'done'" in removed[0].message and not removed[0].error
+
+    spec["migrations"] = [{"from": 1, "to": 2, "policy": "migrate", "map": {"done": "finish"}}]
+    assert _check(spec, catalog).problems == ()
+
+    spec["migrations"][0]["map"] = {"done": "finnish", "gone": "finish"}
+    assert _codes(_check(spec, catalog)) == {
+        ("unknown_element", "/spec/migrations/0/map/done"),
+        ("unknown_element", "/spec/migrations/0/map/gone"),
+    }
+
+
+# --- normalization and the hash ---------------------------------------------------
+
+
+def test_the_hash_does_not_depend_on_key_order_or_number_spelling() -> None:
+    spec = pd.normalized_spec(SAMPLE["spec"])
+    reordered = pd.normalized_spec(dict(reversed(list(copy.deepcopy(SAMPLE["spec"]).items()))))
+    assert pd.definition_hash(spec) == pd.definition_hash(reordered)
+    assert pd.definition_hash(spec).startswith("sha256:") and len(pd.definition_hash(spec)) == 71
+    assert pd.normalized_spec({"version": 1.0, "x": 0.5}) == {"version": 1, "x": 0.5}
+    assert pd.normalized_spec({"name": "é"}) == {"name": "é"}
+    changed = _sample(displayName="Other")
+    assert pd.definition_hash(pd.normalized_spec(changed)) != pd.definition_hash(spec)
+
+
+@pytest.mark.parametrize(
+    "spec",
+    [
+        {"x": float("nan")},
+        {"x": "s" * (pd.MAX_SPEC_STRING + 1)},
+        {"x": {"é": 1, "é": 2}},
+        {"x": {1, 2}},
+        [],
+    ],
+)
+def test_what_cannot_be_hashed_is_refused(spec: Any) -> None:
+    with pytest.raises(pd.SpecError):
+        pd.normalized_spec(spec)
+
+
+def test_a_spec_may_nest_deeper_than_a_manifest() -> None:
+    deep: dict[str, Any] = {}
+    node = deep
+    for _ in range(40):
+        node["n"] = {}
+        node = node["n"]
+    assert pd.normalized_spec(deep) == deep
+    for _ in range(30):
+        node["n"] = {}
+        node = node["n"]
+    with pytest.raises(pd.SpecError):
+        pd.normalized_spec(deep)
+
+
+def test_references_name_what_the_catalog_has_to_hold() -> None:
+    refs = pd.references(PROCESS["spec"])
+    assert refs.skills == {"notify.send@1", "process.retrospective@1"}
+    assert refs.task_types == {"go-no-go", "lessons-review"}
+    assert refs.agents == {"example-process"}
+    assert refs.calendars == {"ru"}
+    assert refs.artifact_types == {"notice-document"}
+    assert refs.migration_versions == {1}
+
+
+# --- the schema of the kind is the catalog's ---------------------------------------
+
+
+def test_the_core_copy_of_the_kind_schema_is_the_catalog_one() -> None:
+    catalog = json.loads((PINNED / "object.schema.json").read_text("utf-8"))
+    held = json.loads(pd.SCHEMA_FILE.read_text("utf-8"))
+    assert held == pd.process_schema_from_catalog(catalog), (
+        "regenerate process_spec.schema.json with process_schema_from_catalog()"
+    )
+    assert "owner" in held["$defs"]["processSpec"]["properties"]
+
+
+def test_the_workspace_is_an_id_not_an_install_variable() -> None:
+    workspace = "0b7f4a52-3c1e-4f6a-9d1c-2f0e6b7a8c9d"
+    assert _check(_sample(workspaceId=workspace)).problems == ()
+    assert _codes(_check(_sample(workspaceId="nowhere"))) == {
+        ("schema_violation", "/spec/workspaceId")
+    }

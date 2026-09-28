@@ -1,0 +1,43 @@
+# yaml-language-server: $schema=../../schema/v1/object.schema.json
+# Accepted ADR выполняются в коде (TAI-ADR-0037, CP-ADR-0063 §11 — пилот): на каждом
+# коммите суперпроекта скилл adr.conformance_check@3 сверяет пробы ```conformance```
+# всех Accepted ADR на закреплённых ревизиях сабмодулей; на каждый ADR, расходящийся
+# с кодом (partial / missing), — задача. Дедуп по ADR: пока задача открыта, новых
+# нет; вернувшееся после закрытия расхождение — новая работа.
+#
+# ADR дорожной карты помечают невыполненные пробы `planned: <веха/задача>` —
+# такие ADR работу не заводят (скилл v3), задачи приходят только по настоящим
+# расхождениям и устаревшим пробам.
+apiVersion: taimen.ai/v1
+kind: WorkRule
+key: adr-conformance
+spec:
+  description: Accepted ADR, пробы которого не выполняются в коде, — задача
+  workspaceId: ${SELFDEV_WORKSPACE_ID}
+  identity: {agent: selfdev-rules}
+  trigger: {kind: observation, type: repo.commit_observed}
+  condition: {eq: [{var: payload.data.repo}, project-taimen-ai]}
+  interpretation:
+    skill: adr.conformance_check@3
+    inputs:
+      repository: ${SELFDEV_SUPERPROJECT_URL}
+      ref: "{{payload.data.sha}}"
+  action:
+    kind: ensure_work
+    taskType: coding-task
+    forEach: skill.output.failing
+    dedupKeyTemplate: "adr-conformance:{{item.adr}}"
+    fields:
+      title: "ADR расходится с кодом: {{item.adr}} {{item.title}} ({{item.status}})"
+      priority: medium
+      description: |
+        Сверка Accepted ADR с кодом (adr.conformance_check@3, TAI-ADR-0037) на коммите
+        суперпроекта {{payload.data.sha}}: {{item.adr}} «{{item.title}}» — {{item.status}}.
+
+        ADR: {{item.path}}
+        Не выполнены пробы:
+        {{item.gaps}}
+
+        Что сделать: довести код до решения ADR, либо поправить пробы, если они
+        устарели, либо изменить статус ADR (Superseded / amendment), если решение
+        пересмотрено. Задача заведена правилом adr-conformance автоматически.

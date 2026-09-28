@@ -1,0 +1,358 @@
+# ADR-0075: Профиль выражений CEL платформы (`cp/1`)
+
+Статус: Accepted (2026-09-27), фича `process-packages`, задача P002
+(TASK-000718). Spec/plan — `specs/process-packages/` суперпроекта (FR-003,
+FR-007; конституция ст. III, IV, V); решение Р2 plan, TAI-ADR-0054 п.3.
+Реализация — P005 (`domain/cel_profile.py`, перевод прежних синтаксисов);
+выбор библиотеки и то, как достигнуты п.2–7, — амендмент P005 в конце ADR.
+
+Контекст: [ADR-0074](0074-process-engine-in-core.md) (движок, таймеры,
+календарь); [ADR-0076](0076-processes-and-memory.md) (выражения проекции,
+`recall`, `context`); ADR-0056 §3 (пути `execution.inputs`), ADR-0061 и
+ADR-0067 (грамматика `$.` исходов approval и `when` критериев), ADR-0063
+(JSON-выражения условий правил), ADR-0064 (`from` профиля контекста).
+
+## Контекст
+
+В пакетах сейчас четыре несовместимых синтаксиса путей к данным:
+
+1. условия правил — JSON-выражения с `var` (ADR-0063);
+2. исходы approval и `when` критериев — пути `$.task…`, `$.approval…`
+   (ADR-0061, ADR-0067);
+3. входы исполнения типа задачи — пути `$.…` `execution.inputs` (ADR-0056 §3);
+4. якоря профиля контекста — `from` (ADR-0064).
+
+Общего типизированного разбора нет: ошибка в пути видна только на живом
+событии. Вычислений нет: нельзя сказать «до окончания подачи меньше трёх
+рабочих дней». Процессам (ADR-0074) нужны условия, вычисляемые поля, сроки,
+назначения и ключи — и всё это должно быть детерминированно, иначе нет ни
+тестов без стенда, ни replay (FR-017).
+
+## Решение
+
+### 1. Один язык — CEL, профиль `cp/1`
+
+Все выражения языка процессов пишутся на CEL (Common Expression Language):
+
+- сторожа (`when`, `entry`, `exit`, `where` триггера, условия `listen`);
+- ключи (`start.key`, `correlate[].key`) и `set`;
+- `input.from`, `output.as`, `export.as`;
+- сроки (`due`, `at` таймеров, `after` эскалаций);
+- назначения (элемент цепочки `assign`/`approvers`), `separationOfDuties`;
+- входы таблиц решений;
+- выражения памяти — `memory`, якоря `recall` и `context` (ADR-0076).
+
+Профиль — это окружение (переменные и их типы), набор функций, запреты и
+лимиты. Имя профиля в ядре — `cp/1`; ядро записывает его в версию определения
+(`expressionProfile`). Добавление функции, не меняющее прежних значений,
+остаётся в `cp/1`; изменение смысла — новый профиль `cp/2`, и определение на
+`cp/1` вычисляется по `cp/1`, пока живы его экземпляры.
+
+Документы суперпроекта (TAI-ADR-0054, plan, описание `$defs.cel` схемы
+каталога) называют этот профиль продуктовым кодовым именем с номером `/1`.
+Это тот же профиль: в ядре идентификатор нейтрален, потому что кодовое имя
+продукта в идентичности ядра недопустимо (ADR-0022, ADR-0040; гард
+`tests/unit/test_branding.py`). Схема каталога имя профиля не хранит — оно
+только в описании, — поэтому пакеты от этого не меняются.
+
+### 2. Переменные окружения и их типы
+
+| Переменная | Что | Тип |
+|---|---|---|
+| `data` | данные экземпляра | из JSON Schema `spec.data` |
+| `event` | событие входа: `type`, `time`, `payload`, `entityId`… | payload — из каталога событий (ADR-0068) или схемы вида наблюдения; иначе `dyn` |
+| `step` | результат шага: `result`, `error`; в блоке — последний завершённый шаг потока, в `output.as` — сам шаг (в `onCompensate` тоже, амендмент P027) | выход скилла по его схеме, форма задачи, ответ `recall` |
+| `task` | задача шага (`id`, `assigneeId`, `customFields`…) | подмножество `TaskOut` |
+| `stage` | стадии: `stage.<id>.completed`, `.active` | `bool` |
+| `instance` | `id`, `key`, `version`, `startedAt`, `clock` | `clock` — время входа (ADR-0074 п.4) |
+
+Типы из JSON Schema: `string` → `string`; `integer` → `int`; `number` →
+`double`; `boolean` → `bool`; `array` → `list(T)`; `object` с `properties` —
+запись с объявленными полями (обращение к необъявленному полю — ошибка
+проверки); `object` без `properties` — `map(string, dyn)`; `format: date-time`
+→ `timestamp`, `format: duration` → `duration`; `type: [T, "null"]` —
+значение может быть `null`. Где тип вывести нельзя, выражение получает `dyn`
+и проверяется при вычислении.
+
+### 3. Функции сверх стандарта
+
+- Календарь (ADR-0074 п.9):
+  - `cal.addWorkdays(ts, n, calendarKey)` — сдвиг на `n` рабочих дней
+    (отрицательное `n` — назад);
+  - `cal.isWorkday(ts, calendarKey)`;
+  - `cal.workdaysBetween(a, b, calendarKey)`.
+
+  `calendarKey` необязателен, если у процесса есть `spec.calendar`. Если
+  вычисление затронуло год с `provisional: true` или вышло за опубликованные
+  годы (тогда — только выходные дни недели), результат помечается
+  «предварительно»: пометку получает таймер или шаг, чьё выражение её дало.
+- `duration("P3D")` принимает и ISO 8601, `timestamp("…")` — RFC 3339.
+- Расширения строк (`strings`: `lowerAscii`, `split`, `join`, `replace`…) и
+  списков (`lists`: `slice`, `flatten`, `sort`…), макросы `all`, `exists`,
+  `map`, `filter`.
+
+### 4. Детерминизм
+
+- **Нет текущего времени.** Функции `now()` нет. Время входит в выражение
+  только как `event.time` и `instance.clock` — их задаёт вход движка.
+- Нет случайности, ввода-вывода и обращения к памяти или каталогу: память
+  попадает в выражения только через записанный в журнал ответ `recall`
+  (ADR-0076 п.4), календарь — версией, записанной в журнале (ADR-0074 п.9).
+- Одно выражение на одних входах даёт одно значение в живом прогоне, тесте и
+  replay.
+
+### 5. Лимит стоимости
+
+Каждое вычисление ограничено стоимостью (оценка CEL: шаги, размер
+промежуточных списков и строк). Лимит по умолчанию — 10 000 единиц на
+вычисление (`CP_CEL_COST_LIMIT`). Превышение — ошибка шага RFC 7807 с `type:
+expression_cost_exceeded`: шаг не выполняется, ошибку ловит `try`, иначе
+экземпляр `failed` с понятной причиной — процесс не виснет молча. Длина
+выражения — до 4000 символов (схема каталога).
+
+Там, где стоимость видна при разборе (глубина вложенности, размер литералов),
+проверка публикации отвергает выражение заранее.
+
+### 6. Проверка при публикации
+
+Все выражения определения разбираются и проверяются по типам при публикации
+(ADR-0074 п.2). Ошибка — находка с путём в объекте и позицией в выражении:
+
+```json
+{"code": "expression_type_error", "severity": "error",
+ "path": "/spec/stages/0/steps/1/human/due/at", "file": "processes/tender.yaml",
+ "line": 31, "message": "no such field 'submisionDeadline' at 1:34",
+ "hint": "data.procurement has submissionDeadline"}
+```
+
+Разбор выражения даёт ещё и **список полей, которые оно читает**. По нему
+движок пересчитывает таймеры при изменении данных (ADR-0074 п.8), а проверка
+находит обращения к полям, которые нигде не пишутся.
+
+Вычисление, упавшее на `null` или отсутствующем поле, — ошибка шага
+`expression_error`. Для необязательных полей — `has(data.x)` и, если выбранная
+реализация его поддерживает, синтаксис необязательных значений
+(`data.?x.orValue(…)`).
+
+### 7. Прежние синтаксисы
+
+Четыре прежних синтаксиса работают как прежде, пока пакеты selfdev, sdd и
+notify не переведены (отдельная работа, граница spec). У каждого есть
+автоматический перевод в CEL — функция `domain/cel_profile.py` (P005) и
+команда `cp_packages migrate-expr`:
+
+| Прежнее | CEL |
+|---|---|
+| `{"==": [{"var": "payload.kind"}, "results"]}` | `event.payload.kind == "results"` |
+| `$.task.customFields.branch` | `task.customFields.branch` |
+| `$.spawnedBy.artifact[commit].metadata.sha` | переменная входа по связи; перевод называет её явно |
+| `execution.inputs: $.customFields.url` | `task.customFields.url` |
+| `from: "$.customFields.okpdCodes"` | `task.customFields.okpdCodes` |
+
+Перевод проверяется на всех выражениях пакетов selfdev, sdd и notify: на
+записанных событиях он даёт те же значения (приёмка P005).
+
+### 8. Реализация
+
+Основной вариант — `cel-expr-python` (официальные привязки Google к
+cel-cpp, проверка типов при разборе, оценка стоимости). Запасной, если
+привязки не соберутся под образ, — `cel-python` (celpy) с проверкой типов
+собственным проходом по разобранному дереву. Выбор, версия и то, как в нём
+достигнуты п.4–6, P005 записывает сюда амендментом. Консоль и визуальный
+редактор позже используют `@bufbuild/cel` с тем же окружением.
+
+## Границы
+
+- Профиль не даёт выражениям побочных эффектов: запись в данные — только
+  `set`/`output.as` самого языка.
+- Шаблоны текстов (`{{…}}` правил) в профиль не входят и остаются как есть.
+- Типы видов памяти ядру неизвестны: ответ `recall` типизирован как
+  `{nodes, edges, truncated}` с `dyn`-свойствами узлов.
+
+## Не принято
+
+- JSONata и JMESPath — нет типов и лимита стоимости.
+- FEEL — язык DMN, реализации только на JVM.
+- Расширение нынешних операторов JSON-выражений — вышел бы пятый синтаксис.
+- `now()` с записью значения в журнал — время и так приходит входом, а функция
+  соблазняла бы писать недетерминированные условия.
+
+## Амендмент 2026-09-27 (P005, TASK-000721): реализация
+
+**Р1. Библиотека — `cel-expr-python` 0.1.3** (привязки Google к cel-cpp,
+колёса manylinux для amd64 и arm64 под Python 3.12) и `protobuf`. Запасной
+`cel-python` не понадобился и не взят: в нём нет проверки типов (её пришлось бы
+писать целиком), расширений строк и списков, синтаксиса необязательных значений
+и ISO-длительностей, а зависимости тянут `pendulum`, `google-re2`, `jmespath`.
+Чего нет в привязках cel-cpp, достроено в `domain/cel_profile.py`; ниже — как.
+
+**Р2. Типы из JSON Schema (п.2) — сообщения protobuf.** На каждое окружение
+строится пул дескрипторов: переменная-объект со свойствами — сообщение, и
+проверка типов cel-cpp отвергает необъявленное поле при разборе. Отображение:
+
+- скаляры (`string`, `integer`, `number`, `boolean`) — обёртки protobuf:
+  отсутствующее или `null` читается как `null`, как в JSON, и падает при
+  использовании (`expression_error`); свойство из `required` без `null` в типе
+  — простое поле (нулевое значение, если не задано);
+- `format: date-time` — `timestamp`, `format: duration` — `duration` (значение
+  данных — ISO 8601 или форма CEL); незаданное такое поле protobuf читал бы как
+  1970 год или ноль, поэтому чтение незаданного поля времени без `has()` или
+  `.?` — `expression_error` до вычисления;
+- `array` — `list(T)`, отсутствующий массив — пустой список; массив объектов
+  со свойствами — список записей;
+- `object` без `properties` — `map(string, dyn)`; объект только с
+  `additionalProperties`-записью — `map(string, запись)`; объект, у которого
+  имя свойства не идентификатор CEL, — `map(string, dyn)`;
+- прочее (`oneOf`, `$ref`, смесь типов, схема без типа) — `dyn`.
+
+`event.payload` и `step.result` без схемы — `map(string, dyn)` (полезная
+нагрузка и выход скилла — всегда объекты): отсутствующие — пустой объект, и
+`.?поле` читает «нет значения», а не падает.
+
+Поля встроенных переменных: `task` — `id`, `publicId`, `typeKey`,
+`typeVersion`, `title`, `description`, `status`, `systemStatusCategory`,
+`priority`, `ownerId`, `assigneeId`, `workspaceId`, `goalId`, `customFields`
+(по `fieldSchema` типа, иначе `map(string, dyn)`), `startDate`, `dueDate`,
+`createdAt`, `completedAt`, `verification`, `artifacts` (новейший артефакт
+каждого типа по ключу типа: `task.artifacts["commit"].metadata.sha`);
+`event` — `id`, `type`, `time`, `entityType`, `entityId`, `actorId`,
+`correlationId`, `payload`; `step` — `id`, `skill`, `status`, `result`,
+`error.code`, `error.message`; `instance` — `id`, `key`, `version`,
+`startedAt`, `clock`; `stage.<id>.completed`/`.active` — поля по id стадий
+(`stage["<id>"]`, если id не идентификатор CEL).
+
+**Р3. Функции (п.3).** `cal.addWorkdays`, `cal.isWorkday`,
+`cal.workdaysBetween` — поверх `domain/calendar.py` (P004); форма без
+`calendarKey` объявляется, только если окружению дан календарь процесса, иначе
+это ошибка типа при разборе. Версии календарей передаются вычислению
+(`calendars=`); календаря нет — `expression_error` с `reason:
+calendar_missing`. Пометку «предварительно» несёт результат вычисления
+(`Result.provisional`). Расширения cel-cpp: `strings` (v4), `optional`
+(`data.?x.orValue(…)`), `bindings` (`cel.bind`). Расширение `lists` cel-cpp в
+Python не привязано, поэтому `slice`, `flatten`, `sort`, `distinct` — свои, на
+`list(dyn)` (параметрические типы привязки при вычислении не поддерживают):
+тип элемента результата — `dyn`. `reverse` — только строковый из `strings`;
+сортировать списки времени привязки не умеют. `duration("P3D")`: стандартную
+перегрузку cel-cpp заменить не даёт, поэтому литерал ISO 8601 (недели, дни,
+часы, минуты, секунды; годы и месяцы — ошибка типа) переписывается в форму CEL
+до разбора, позиции ошибок пересчитываются к исходному тексту; строка ISO,
+вычисленная во время работы, не разбирается — длительности данных типизируются
+схемой (Р2).
+
+**Р4. Детерминизм (п.4).** `now()` не объявлена: её вызов — ошибка типа при
+разборе с подсказкой про `event.time` и `instance.clock`. Результат
+необязательного типа (`optional`) запрещён при разборе — выражение
+заканчивается `orValue(…)`.
+
+**Р5. Стоимость (п.5).** Счётчика стоимости cel-cpp привязки не отдают, поэтому
+стоимость оценивается сверху **до** вычисления по проверенному дереву
+(`Expression.serialize()` — `cel.expr.CheckedExpr`, разбирается в модуле) и
+фактическим размерам входов: чтение — шаг на сегмент пути; вызов — 1 + размер
+аргументов / 10; макросы (`all`, `exists`, `map`, `filter`) — число итераций
+= размер списка, умноженное на стоимость тела; размер результата растёт по
+правилам функций (`+`, `replace`, `join`, `split`, `flatten`…). Выше лимита
+вычисление не запускается: `expression_cost_exceeded` с оценкой и лимитом.
+Лимит по умолчанию — 10 000 (`DEFAULT_COST_LIMIT`, параметр `cost_limit`);
+переменную `CP_CEL_COST_LIMIT` читает движок (P007). При разборе — то, что
+видно без данных: длина до 4000 символов, глубина дерева до 32, вложенность
+итерирующих макросов до 3 (`cel.bind` не итерирует) — иначе
+`expression_too_complex`.
+
+**Р6. Ошибки и читаемые поля (п.6).** Коды разбора — `expression_syntax_error`,
+`expression_type_error`, `expression_too_complex`; вычисления —
+`expression_error`, `expression_cost_exceeded`. Ошибка разбора несёт строку и
+столбец (с 1), путь выражения в документе (`compile(…, path=…)`) и подсказку
+для опечатки в поле (`data.procurement has submissionDeadline`);
+`ExpressionError.finding()` — форма находки проверки публикации (`file` и
+`line` добавляет проверка определения, P006). `Program.reads` — поля, которые
+выражение читает (`data.procurement.submissionDeadline`), `Program.guarded` —
+те из них, что проверяются на присутствие (`has()`, `.?`).
+
+**Р7. Перевод прежних синтаксисов (п.7).** Функции `translate_condition`,
+`translate_rule_path`, `translate_path`, `translate_when`,
+`translate_execution_input`, `translate_context_source`, общий вход
+`translate(…)` и поиск выражений в объекте каталога `legacy_expressions(kind,
+spec)`. Перевод:
+
+| Прежнее | CEL |
+|---|---|
+| `{"var": "payload.data.repo"}` | `event.payload.?data.?repo.orValue(null)` |
+| `{"var": "skill.output.items"}` | `step.result.?items.orValue(null)` |
+| `{"var": "task.typeKey"}` | `task.typeKey` |
+| `{"exists": "payload.data.url"}` | `event.payload.?data.?url.orValue(null) != null` |
+| `{"lt": [{"var": "x"}, 3]}` | `x != null && x < 3` (сторона `null` — ложь, как прежде) |
+| `trigger.…`, `goal.…`, `item`, `observation.…` | переменные с тем же именем |
+| `$.task.customFields.branch` | `task.customFields.?branch.orValue(null)` |
+| `$.task.customFields.branch!` | `task.customFields.branch` (нет поля — ошибка) |
+| `$.task.artifact[commit].metadata.sha` | `task.artifacts.?commit.?metadata.?sha.orValue(null)` |
+| `$.spawnedBy.…`, `$.approval.…` | переменные `spawnedBy` (тип задачи), `approval` |
+| `$.invocation.output.x`, `.error.code` | `step.result.?x.orValue(null)`, `step.error.code` |
+| шаблон `"Merge $.task.publicId!: $.task.title"` | конкатенация; отсутствующее — `""`; `\|truncate:N` — `substring` |
+| `when: ["$.…", …]` | `!(… in [null, "", false])`, условия через `&&` |
+| `execution.inputs: $.customFields.url` | `task.customFields.?url.orValue(null)` |
+| `from: description`, `from: "$.customFields.okpdCodes"` | `task.description`, `task.customFields.?okpdCodes.orValue(null)` |
+
+Отсутствующее значение, как и прежде, — `null` (`.?` и `orValue(null)`):
+поэтому `ne` против отсутствующего поля по-прежнему истинно. Перевод
+возвращает и имена переменных сверх профиля, которые выражение читает
+(`Translation.bindings`, их смысл — `BINDINGS`). Шаблоны `{{…}}` не
+переводятся (граница ADR). Условие `on.when` правил уведомлений переводится
+тем же переводом условий (корень `payload` — `event.payload`).
+
+Где перевод расходится с прежним вычислением (на записанных событиях пакетов
+этого нет): обязательное `!` на поле, заданном пустой строкой или `null`
+типизированного поля задачи, прежде отказывало (`unresolved_expression`), в
+CEL даёт `""`/`null`; нестроковое значение в шаблоне прежде печаталось
+`str()` Python (`True`), в CEL — `string()` (`true`); отсутствующий вход
+исполнения прежде опускался, в CEL — `null` (схема входа скилла решает так
+же); `0` в `when` прежде считался невыполненным (`0 == False` в Python), в
+CEL — выполненным.
+
+Проверено `tests/unit/test_cel_translation.py`: все 66 выражений пакетов
+selfdev, sdd и notify (копии объектов с такими выражениями —
+`tests/fixtures/legacy_expressions/`) переводятся, проходят разбор профиля и
+на записанных фактах (`recorded.yaml`: наблюдения git-коннектора,
+`task.completed`, `task.verification_failed`, контексты решений) дают то же
+значение, что прежний вычислитель, или отказывают оба. Команда
+`cp_packages migrate-expr` — инструмент суперпроекта поверх этих функций, не
+часть P005.
+
+## Амендмент 2026-09-28 (P027, TASK-000747): `step` и `compensated` в `onCompensate`
+
+`step` в блоке `onCompensate` значит то же, что в любом блоке: результат
+текущего шага потока, в `output.as` и `export.as` шага — его собственный
+результат. Прежде движок подменял `step` компенсируемым шагом на весь блок, и
+результат задачи или скилла компенсации нельзя было прочитать через
+`step.result`, хотя проверка типизировала `output.as` по выходу самого шага.
+
+Компенсируемый шаг — привязка окружения **`compensated`** (как имя ошибки
+`catch[].as`, не переменная профиля): тип — как у `step` (`id`, `skill`,
+`status`, `result`, `error`), `result` — по выходу компенсируемого шага.
+Привязка есть только внутри `onCompensate` (во вложенном `onCompensate` —
+ближайший компенсируемый шаг); выражение вне блока, которое её читает, не
+проходит проверку. Пример:
+
+```yaml
+- id: reserve
+  call: {skill: slot.reserve@1, input: {number: data.number}}
+  output: {as: {slot: step.result.slot}}
+  onCompensate:
+    - id: release
+      call: {skill: slot.release@1, input: {slot: compensated.result.slot}}
+      output: {as: {released: step.result.released}}
+```
+
+Реализация — ADR-0074, уточнение P027. Проверено
+`tests/unit/test_process_engine.py`.
+
+## Conformance
+
+- `tests/unit/test_process_contract.py` (P002): схема каталога описывает
+  выражения как CEL этого ADR (`$defs.cel`), пример процесса проходит схему
+  и модель ядра.
+- `tests/unit/test_cel_profile.py` (P005): ошибка типа находится при разборе
+  с путём и позицией; типы из JSON Schema; `expression_cost_exceeded`;
+  отсутствие `now()`; `cal.*` на предварительном году; ISO-длительности;
+  читаемые поля.
+- `tests/unit/test_cel_translation.py` (P005): перевод выражений пакетов
+  selfdev, sdd, notify даёт те же значения на записанных фактах.

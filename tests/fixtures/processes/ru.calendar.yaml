@@ -1,0 +1,14 @@
+# yaml-language-server: $schema=../../../../packages/schema/v1/object.schema.json
+apiVersion: taimen.ai/v1
+kind: Calendar
+key: ru
+spec:
+  displayName: Производственный календарь РФ (пример схемы)
+  timezone: Europe/Moscow
+  years:
+    - year: 2026
+      source: пример для контракта схемы, не данные
+      holidays: ["2026-01-01", "2026-01-02", "2026-05-01"]
+      workdays: []
+    - year: 2027
+      provisional: true

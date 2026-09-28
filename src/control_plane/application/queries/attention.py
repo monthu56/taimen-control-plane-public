@@ -238,7 +238,8 @@ async def _eligible_approvals(session: AsyncSession, scope: Scope) -> ColumnElem
         conditions.append(
             and_(Approval.required_role_id == role_id, Approval.workspace_id.in_(subtree))
         )
-    return or_(*conditions)
+    # An excluded principal may not decide at all (CP-ADR-0074 §7).
+    return and_(or_(*conditions), ~Approval.excluded_principals.contains([str(me)]))
 
 
 def _approval_fetch(*, gate: bool) -> RuleFetch:

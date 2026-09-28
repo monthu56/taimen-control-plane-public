@@ -1,0 +1,111 @@
+# yaml-language-server: $schema=../../schema/v1/object.schema.json
+# Разбиение фичи (TAI-ADR-0047, TAI-ADR-0053 п.2). Шаг сдаёт документ задач по форме
+# specs/_templates/tasks.md — коммитом в ветку фичи и артефактом tasks-document.
+# Критерий типа form (tasks.check@1) не даёт шагу завершиться, пока документ не
+# прошёл проверку формы; причина провала — в комментарии, задача возвращается
+# исполнителю. Задачи исполнения и сходимости по документу заводит правило
+# feature-expand на task.completed этого шага — тем же скиллом, руками их не заводят.
+#
+# repositories — карта «имя репозитория в документе → url и основная ветка»:
+# топология установки, поэтому url — переменные окружения. Та же карта — во входах
+# правила feature-expand (держит тест tools/tests/test_declarative_cycle_packages.py).
+apiVersion: taimen.ai/v1
+kind: TaskType
+key: feature-tasks
+spec:
+  displayName: Feature tasks
+  description: >-
+    Разбиение одобренного дизайна фичи на задачи (TAI-ADR-0047): документ задач
+    по форме шаблона задач со ссылками на FR/SC spec и критериями приёмки. spec и plan приходят входами от дизайна (CP-ADR-0072). Шаг принят,
+    когда документ прошёл tasks.check@1; задачи по нему заводит правило
+    feature-expand (TAI-ADR-0053). Заводится исходом ворот feature-design.
+  instructions: |-
+    Шаг «разбиение на задачи» цикла spec-driven разработки (TAI-ADR-0047).
+    Дизайн одобрен владельцем; spec и plan фичи — источник истины. Они — входы
+    этой задачи: файлы лежат в разделе «Входы» (скачай `cp_get_artifact_content`,
+    если файла нет). Фича, ветка и репозиторий — поля задачи `featureSlug`,
+    `branch`, `repository`; одобренный дизайн — `designTask`.
+
+    1. Прочитай входы `spec` и `plan`. Ничего в них не меняй: изменение смысла —
+       новый дизайн и новые ворота.
+    2. Напиши `specs/<featureSlug>/tasks.md` строго по шаблону
+       `specs/_templates/tasks.md` (форма — в комментарии шаблона): фазы
+       (контракты → реализация → документация), пункты `### <ID> — <название>`
+       со строками «Репозиторий» (ровно один), «Исполнитель» (`agent:<key>` или
+       `человек`), «Зависит от», «Требования», «Сделать», «Приёмка»; `[P]` —
+       параллельно с соседями фазы; раздел «Покрытие». Контракт между
+       компонентами — отдельным пунктом раньше его потребителей (статья V).
+       Задачи сходимости в документ не пиши — их заведёт правило.
+    3. Каждое FR и SC покрыто хотя бы одним пунктом; пункт без FR/SC —
+       признак лишней работы или пробела в spec. Один пункт — одна ветка одного
+       репозитория, в размер одного задания исполнителю.
+    4. Закоммить `tasks.md` в ветку фичи `branch` репозитория `repository`
+       рядом со spec и plan и опубликуй ветку: проверка формы читает документ
+       оттуда. Проверь форму сам — `tasks.check@1` (repository, ref = ветка
+       фичи, slug, repositories) должен вернуть `ok`.
+    5. В каждом репозитории компонента, который упомянут в документе, создай
+       ветку `feature/<slug>` от его основной ветки (`git push origin
+       <основная>:refs/heads/feature/<slug>`): ветки задач отводятся от неё.
+    6. Сдай выходы: `tasks.md` — `cp_create_artifact` с `file`, тип
+       `tasks-document`; входной файл spec — тем же способом, тип
+       `spec-document` (его получит входом сходимость).
+    7. Заверши задачу с отчётом: сколько пунктов, какие репозитории, что идёт
+       первым. Задачи исполнения и сходимости руками не заводи: после
+       завершения шага их заведёт правило feature-expand — по пункту на задачу
+       со связями depends_on, исполнителем из строки «Исполнитель» (пункт
+       «человек» получает исполнителя этого шага) и сходимость на каждый
+       репозиторий — тоже на исполнителя шага.
+       Документ с ошибкой формы шаг не закроет: причина придёт комментарием
+       провала проверки — исправь документ и сдай снова.
+  fieldSchema:
+    type: object
+    # Не обязательны: дизайн, заведённый на feature-design v2 (до customFields),
+    # передаёт их только текстом в description.
+    properties:
+      featureSlug: {type: string, pattern: "^[a-z0-9][a-z0-9-]{0,62}$"}
+      repository: {type: string, maxLength: 500}
+      branch: {type: string, maxLength: 200}
+      designTask: {type: string, maxLength: 100}
+    additionalProperties: false
+  artifactSchema:
+    inputs:
+      - {key: spec, type: spec-document, from: spawned_by, required: true}
+      - {key: plan, type: plan-document, from: spawned_by, required: true}
+    outputs:
+      - {key: tasks, type: tasks-document, required: true}
+      - {key: spec, type: spec-document, required: true}
+  lifecycleSchema:
+    statuses:
+      - {key: todo, category: active, displayName: To do}
+      - {key: in_progress, category: active, displayName: In progress}
+      - {key: blocked, category: blocked, displayName: Blocked}
+      - {key: done, category: terminal_success, displayName: Done}
+      - {key: cancelled, category: terminal_cancelled, displayName: Cancelled}
+    transitions:
+      - {from: todo, to: [in_progress, blocked, done, cancelled]}
+      - {from: in_progress, to: [todo, blocked, done, cancelled]}
+      - {from: blocked, to: [todo, in_progress, done, cancelled]}
+    initialStatus: todo
+    claimStatus: in_progress
+    releaseStatus: todo
+    completionStatus: done
+  acceptance:
+    - key: form
+      kind: deterministic
+      description: >-
+        Документ задач specs/<featureSlug>/tasks.md на ветке фичи прошёл проверку
+        формы tasks.check@1 (пункты, исполнители, зависимости без циклов,
+        репозиторий из карты установки, покрытие FR/SC spec).
+      spec:
+        skill: tasks.check@1
+        inputs:
+          repository: "$.task.customFields.repository!"
+          ref: "$.task.customFields.branch!"
+          slug: "$.task.customFields.featureSlug!"
+          repositories:
+            суперпроект: {url: "${SELFDEV_SUPERPROJECT_URL}", branch: main}
+            control-plane: {url: "${SELFDEV_CONTROL_PLANE_URL}", branch: main}
+            memory-service: {url: "${SELFDEV_MEMORY_SERVICE_URL}", branch: master}
+            iam-service: {url: "${SELFDEV_IAM_SERVICE_URL}", branch: main}
+            notification-service: {url: "${SELFDEV_NOTIFICATION_SERVICE_URL}", branch: main}
+        expect: {status: ok}

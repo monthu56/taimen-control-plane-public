@@ -6,10 +6,13 @@ concurrent deciders produce exactly one terminal outcome.
 
 Deciding requires BOTH: the ``approvals.decide`` API permission AND
 organizational eligibility (being the assigned principal, or holding the
-required role in the approval's workspace scope).
+required role in the approval's workspace scope) — and not being one of the
+approval's excluded principals (separation of duties, CP-ADR-0074 §7), which
+is refused here, on the one decision path every entry point goes through.
 """
 
 import uuid
+from collections.abc import Sequence
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -44,7 +47,13 @@ from control_plane.domain.errors import (
 from control_plane.domain.event_catalog import PAYLOAD_TEXT_LIMIT
 from control_plane.domain.redaction import redact_secret_material
 from control_plane.domain.work_item import TERMINAL_CATEGORIES
-from control_plane.infrastructure.db.models import Approval, Artifact, PrincipalRole, Task
+from control_plane.infrastructure.db.models import (
+    Approval,
+    Artifact,
+    Principal,
+    PrincipalRole,
+    Task,
+)
 
 
 def event_comment(comment: str | None) -> str | None:
@@ -69,12 +78,20 @@ async def request_approval(
     assigned_principal_id: uuid.UUID | None = None,
     comment: str = "",
     gate: bool = False,
+    excluded_principals: Sequence[uuid.UUID] = (),
 ) -> Approval:
     await authorize(ctx, Permission.APPROVALS_MANAGE)
     if (required_role_id is None) == (assigned_principal_id is None):
         raise ValidationError(
             "invalid_approval",
             "Exactly one of requiredRoleId or assignedPrincipalId must be set",
+        )
+    excluded = list(dict.fromkeys(excluded_principals))
+    if assigned_principal_id is not None and assigned_principal_id in excluded:
+        raise ValidationError(
+            "invalid_approval",
+            "The assigned principal is excluded from deciding: nobody could decide",
+            details={"assignedPrincipalId": str(assigned_principal_id)},
         )
     if gate and task_ref is None:
         raise ValidationError(
@@ -118,6 +135,19 @@ async def request_approval(
         await get_tenant_role(session, ctx, required_role_id)
     if assigned_principal_id is not None:
         await get_tenant_principal(session, ctx, assigned_principal_id)
+    if excluded:
+        known = set(
+            await session.scalars(
+                select(Principal.id).where(
+                    Principal.id.in_(excluded), Principal.tenant_id == ctx.tenant_id
+                )
+            )
+        )
+        missing = [principal_id for principal_id in excluded if principal_id not in known]
+        if missing:
+            raise NotFoundError(
+                "Excluded principal not found", details={"principalId": str(missing[0])}
+            )
 
     now = utcnow()
     approval = Approval(
@@ -133,6 +163,7 @@ async def request_approval(
         assigned_principal_id=assigned_principal_id,
         comment=comment,
         version=1,
+        excluded_principals=[str(principal_id) for principal_id in excluded],
         created_at=now,
         updated_at=now,
     )
@@ -162,6 +193,8 @@ async def request_approval(
             "taskTitle": task.title if task is not None else None,
             "requestedBy": str(ctx.principal_id),
             "comment": event_comment(comment),
+            # v3 (CP-ADR-0074 §7): whose decision the core refuses.
+            "excludedPrincipals": approval.excluded_principals,
         },
     )
     return approval
@@ -235,7 +268,16 @@ async def _get_locked_pending_approval(
 async def _require_decision_eligibility(
     session: AsyncSession, ctx: AuthContext, approval: Approval
 ) -> None:
-    """Organizational check: assigned principal, or holder of the required role."""
+    """Organizational check: not excluded, and the assigned principal or a
+    holder of the required role."""
+    if str(ctx.principal_id) in approval.excluded_principals:
+        # Separation of duties (CP-ADR-0074 §7): whoever the request comes
+        # through — engine, console, channel, MCP — and whatever role is held.
+        raise AuthorizationError(
+            "This principal is excluded from deciding the approval (separation of duties)",
+            code="separation_of_duties_violation",
+            details={"approvalId": str(approval.id)},
+        )
     if approval.assigned_principal_id is not None:
         if approval.assigned_principal_id != ctx.principal_id:
             raise AuthorizationError(
@@ -303,6 +345,11 @@ async def decide_approval(
         approval.outcome_status = OUTCOME_PENDING
         approval.decision_authority = await decision_authority(session, ctx)
         approval.outcome_next_attempt_at = now
+    elif approval.gate and approval.task_id is not None:
+        # A gate of a task may be the basis of an acceptance check's external
+        # write, made with the decider's authority (CP-ADR-0067, amendment
+        # 2026-09-27, B7): the snapshot is taken now, as for an outcome.
+        approval.decision_authority = await decision_authority(session, ctx)
     approval.version += 1
     approval.updated_at = now
     # A verification attempt waiting on this gate looks at it now (CP-ADR-0067).

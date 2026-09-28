@@ -1,0 +1,23 @@
+# yaml-language-server: $schema=../../schema/v1/object.schema.json
+# Проверка приёмки не пройдена несколько раз подряд, задача ждёт человека
+# (task.verification_failed, blocked = true) — владельцу задачи, иначе исполнителю.
+# Два правила на одно событие: условий внутри шаблона нет (ADR-0005 §8 сервиса).
+apiVersion: taimen.ai/v1
+kind: NotificationRule
+key: verification-blocked
+spec:
+  description: Проверка приёмки не пройдена несколько раз подряд, задача ждёт человека.
+  "on":
+    type: task.verification_failed
+    when: {eq: [{var: payload.blocked}, true]}
+  recipient: {kind: taskOwner, fallback: taskAssignee}
+  notification:
+    type: task.verification_failed
+    title: "Проверка не пройдена: {{task.publicId}} {{task.title}}"
+    body: |-
+      Попытка {{payload.attempt}}: не пройдена проверка «{{payload.failedCheck}}».
+      Причина: {{payload.reason}}
+      {{payload.consecutiveFailures}} неудачных попыток подряд — задача ждёт человека (статус {{payload.status}}).
+    links:
+      - {label: Открыть задачу, url: "${TASK_URL_BASE}/{{task.publicId}}"}
+  dedupKeyTemplate: "control-plane:event:{{event.id}}"

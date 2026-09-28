@@ -6,7 +6,12 @@ TAI-ADR-0036 «Вывод Work из состояния — наблюдения,
 `acceptance` у `ensure_work`, evidence решения в задаче, отложенное решение
 под claim (реализация — TASK-000395); амендмент 2026-09-25 (oss-sync,
 TASK-000456) — `fields.customFields` у заводящих действий; амендмент
-2026-09-25 (TASK-000444) — `request_decision` заводит gate-approval
+2026-09-25 (TASK-000444) — `request_decision` заводит gate-approval; амендмент
+2026-09-27 (declarative-cycle, C002 — TASK-000641) — личность правила, тип задачи
+на элемент, связи у `ensure_work`, `typeKey`/`typeVersion` задачи в фактах
+(Г1–Г6, реализация — C005); амендмент 2026-09-27 (process-packages, P012 —
+TASK-000728) — `fields.workspaceId` и назначение на роль `role:<slug>` у
+заводящих действий (Д1–Д3)
 
 Контекст: TAI-ADR-0036; ADR-0057 (внешние наблюдения — вход правил);
 ADR-0062 (origin `rule` + `ruleId` + evidence — выход правил); ADR-0056
@@ -409,7 +414,9 @@ ADR. Наблюдение не несёт списка затронутых ADR 
   Graph (задача, цель) и результат скилла. Факт памяти можно получить
   скиллом.
 - Правило не вызывает скиллы с внешней записью и не действует своим именем:
-  у него нет ни approval-основания, ни собственных прав.
+  у него нет ни approval-основания, ни собственных прав. (Амендмент
+  2026-09-27, Г1: правило может действовать от имени служебной личности —
+  агента реестра; внешней записи у правила по-прежнему нет.)
 - Отложенный (parked) курсор `work-rules` не выведен в операторские действия
   (`/operations`, ADR-0037): он сам повторяет пакет с backoff; ручной
   redrive — отдельное решение, если понадобится.
@@ -480,6 +487,8 @@ ADR. Наблюдение не несёт списка затронутых ADR 
 
 Отвергнуто: acceptance по умолчанию у типа задачи (новое поле версии типа
 ради одного пилота), наследование критериев от цели (контроллера целей нет).
+(Критерии типа введены позже, ADR-0067 амендмент 2026-09-27, В5; `acceptance`
+действия дописывается к ним, как acceptance любой задачи.)
 
 ### А3. Evidence решения — в задаче
 
@@ -675,6 +684,283 @@ staging одобренный approval задачи типа `invoice-payment` о
 зависело бы от версии типа, а не от правила; «ждёт ли работа решения» —
 решение автора правила, а не типа).
 
+## Амендмент 2026-09-27 (declarative-cycle): личность правила, тип на элемент, связи
+
+Фича `declarative-cycle` (spec/plan в суперпроекте, дизайн TASK-000638, ворота
+одобрены владельцем 2026-09-27; решения Р2 и Р5 plan, FR-005, FR-008, FR-014).
+Решение записано в C002 (TASK-000641), реализуется в C005. В документе задач
+фичи этот амендмент назван «А6». Буква `А` здесь уже занята амендментом
+2026-09-25, поэтому пункты нумеруются `Г`. Существующие правила работают без
+изменений: все новые поля необязательны.
+
+**Проблема.** (а) Правило действует полномочиями человека, который его включил.
+Поэтому автор работы, которую завело правило, — этот человек, и права правила
+равны его правам, а не тем, что правилу нужны. (б) Шаг разбиения фичи сдаёт
+документ задач, но завести по нему задачи исполнения правило не может. Одно
+действие заводит задачи одного типа, связей между заведёнными задачами нет, и
+задачи и их зависимости заводит человек. (в) Условие правила не может
+отличить задачу одного типа от другой: в представлении `task` нет типа.
+
+### Г1. `identity: {agent: <key>}` — правило действует от имени агента
+
+Документ правила (`POST /rules`, `PATCH /rules/{id}`, `RuleOut`, вид каталога
+`WorkRule`) получает необязательное поле **`identity`** — `{agent: <key>}`,
+ключ описания агента в реестре (CP-ADR-0073). В `PATCH` значение `null`
+снимает личность. `identity` меняет то, что правило делает, поэтому
+увеличивает `version`, как `action`.
+
+- **При записи** (`POST` и `PATCH`, проверки до записи):
+  - агент с таким ключом есть и не выведен из оборота. Иначе `422
+    unknown_agent`, `details: {field: identity.agent, agent}` — тот же код,
+    что у ссылки на агента в назначении (CP-ADR-0073 А1);
+  - `identity.kind` текущей ревизии — `agent` или `service`;
+  - пишущий вправе дать правилу права агента. Каждое право из
+    `identity.permissions` текущей ревизии должно быть у пишущего
+    (администратор — исключение), иначе `403 permission_escalation` с
+    `details.missing`. Это та же функция, что у ревизии агента (CP-ADR-0073
+    п.5) и `iam-bindings` (ADR-0053). Без этой проверки обладатель `rules.write`
+    получал бы через правило права любого агента.
+  - Связан ли агент (есть ли у него principal), при записи не проверяется:
+    пакет применяет описание агента и правило одной установкой, а связку
+    заводит `fleet-controller` позже (CP-ADR-0073 п.6).
+- **При оценке** правило с `identity` действует полномочиями principal'а
+  агента (`agents.principal_id`), а не того, кто его включил. `authority` —
+  снимок его активной IAM-связки. `authority_principal_id` — этот principal.
+  Каждая оценка, как и прежде, проверяет, что credential активен
+  (`require_active_credential`). Агент без principal, выведенный из оборота
+  (связка отозвана, principal `disabled`) или со связкой в статусе revoked —
+  оценка `failed: credential_inactive`, как при отзыве ключа автора. Новая
+  ревизия агента с другими правами меняет права правила на следующей оценке:
+  связка приводится к ревизии на месте (CP-ADR-0073 п.13).
+- **Автор работы** — principal агента: `created_by` заведённых задач, `actorId`
+  событий `work.derived`, `work.reconciled`, `task.created`, запросов решения и
+  артефакта `skill_result`. Условие «права правила не шире прав личности»
+  (FR-014) держится тем, что каждое действие проходит обычные проверки команд
+  полномочиями этой личности (п.6).
+- Хранение: колонка `work_rules.identity_agent_key` (C005, миграция в той же
+  цепочке). В `rule.created` и `rule.updated` поле `changes` называет
+  `identity`. Payload событий не меняется.
+- Правило без `identity` ведёт себя как прежде (п.6).
+
+Отвергнуто: список прав прямо в правиле (дублирует связку агента и обходит
+проверку ревизии ядром); личность — любой principal по id (FR-007 требует
+ссылаться на описание, а не на идентификатор личности; у описания есть
+история и вывод из оборота).
+
+### Г2. `ensure_work.taskTypes` — тип задачи на элемент
+
+У `ensure_work` поле `taskType` может быть **шаблоном** (п.2, например
+`{{item.type}}`), если рядом задан **`taskTypes`** — список допустимых ключей
+типов (1…20, без повторов).
+
+- При записи каждый ключ `taskTypes` должен существовать с активной версией
+  (`422 unknown_task_type`). Литеральный `taskType` при заданном `taskTypes`
+  должен входить в список (`422 invalid_rule_action`). Шаблонный `taskType` без
+  `taskTypes` — `422 invalid_rule_action`: ядро не заведёт задачу типа, который
+  факт назвал сам.
+- При исполнении отрендеренный `taskType` вне `taskTypes` — отказ элемента
+  `task_type_not_allowed` (Г5).
+- `request_decision` по-прежнему принимает только литеральный `taskType`: решение
+  заводится по одному типу с известными исходами (амендмент TASK-000444).
+
+### Г3. `fields.relations` — связи заводимой работы
+
+У `ensure_work` в `fields` появляется необязательный объект **`relations`**:
+
+- **`spawnedBy`** — шаблон, который даёт id или `publicId` задачи. Новая задача
+  получает связь `spawned_by` на неё (ADR-0046). Задача должна быть видна
+  полномочиям правила (`tasks.read`), иначе отказ элемента
+  `relation_target_not_found`;
+- **`dependsOn`** — шаблон или список (до 50) шаблонов **ключей
+  дедупликации**. Новая задача получает связь `depends_on` на задачу каждого
+  ключа и не выдаётся исполнителям, пока та не выполнена (ADR-0011). Строка,
+  целиком состоящая из одного шаблона, даёт сырое значение (п.2), поэтому
+  `"{{item.dependsOn}}"` может отрендериться в список ключей — так элемент
+  скилла несёт свои зависимости сам. Отрендеренные значения собираются в один
+  список ключей: `null`, `""` и пустой список дают «зависимостей нет», больше
+  50 ключей или не-строка — отказ элемента `invalid_relations`.
+
+Ключ `dependsOn` разрешается в задачу в таком порядке:
+
+1. среди элементов **той же оценки**. Оценка сначала вычисляет ключи всех своих
+   элементов (так она уже берёт advisory-lock'и, п.5), поэтому ссылка на элемент,
+   идущий в `forEach` позже, тоже разрешается;
+2. иначе — по журналу `rule_work_items` tenant'а, новейшей записью с этим ключом.
+   Ключ общий для tenant'а (п.5). Закрытая задача тоже подходит: выполненная
+   зависимость просто не держит работу, а связь остаётся для следа.
+
+Ключ, которого нет ни в оценке, ни в журнале, — отказ элемента
+`dependency_not_found` (Г5). Элемент, зависящий от отказанного элемента той же
+оценки, тоже отказан (`dependency_refused`). Цикл зависимостей среди элементов
+оценки — отказ всех элементов цикла (`dependency_cycle`). Связи с уже
+существующими задачами проверяет на цикл обычная команда связей.
+
+Связи пишутся после заведения всех задач оценки, полномочиями правила
+(`tasks.write` на обеих задачах), обычной командой связей с её событиями.
+Найденная по ключу открытая задача связей не получает («ensure», не upsert —
+как `acceptance`, А2, и `customFields`, Б1). Поэтому повторная оценка того же
+документа не дублирует ни задач, ни связей (FR-008).
+
+При записи правила проверяется форма: `relations` — объект только с
+`spawnedBy`/`dependsOn`, `spawnedBy` — строка-шаблон, `dependsOn` — строка-шаблон
+или список (до 50) строк-шаблонов, с допустимыми корнями стадии действия (как у
+вида каталога `WorkRule`, TAI-ADR-0053). Иначе `422 invalid_rule_action`, `details.field =
+action.fields.relations…`. `update_work`, `cancel_work`, `complete_work` и
+`request_decision` `relations` не берут.
+
+### Г4. `typeKey` и `typeVersion` в представлении `task`
+
+Представление задачи в корне `task` (п.2, А5) получает **`typeKey`** и
+**`typeVersion`** — ключ и версию типа, которые несёт задача (как в `TaskOut`).
+Так условие отличает, например, сданный документ задач от любой другой
+завершённой задачи: `{eq: [{var: task.typeKey}, feature-tasks]}`.
+
+### Г5. Отказ элемента
+
+До амендмента отказ любой команды откатывал всё действие, и оценка становилась
+`failed` (п.5). Для отказов Г2 и Г3 (`task_type_not_allowed`,
+`invalid_relations`, `relation_target_not_found`, `dependency_not_found`,
+`dependency_refused`, `dependency_cycle`) действует другое правило. Отказ касается одного элемента
+`forEach`, откатывает только то, что записано для него (savepoint элемента), и
+остальные элементы идут дальше. Элемент `work[]` оценки получает `{dedupKey,
+refused: <код>, detail}`. Оценка — `matched`, если хотя бы один элемент заведён
+или найден, и `failed` с кодом `work_items_refused`, если отказаны все.
+Остальные ошибки команд откатывают действие целиком, как и раньше.
+
+### Г6. Назначение по ссылке на агента
+
+`fields.assignee` у `ensure_work` и `request_decision` принимает `agent:<key>`.
+Разрешение и отказ описаны в CP-ADR-0073 амендмент А1: отрендеренная ссылка на
+неизвестного агента даёт отказ действия с кодом `unknown_agent`. Это ошибка
+команды, а не отказ элемента Г5.
+
+### Нейтральность и контракт до реализации
+
+Ядро не знает ни документов задач, ни фич, ни репозиториев: что станет
+элементом, какого он типа и от чего зависит, выдаёт скилл интерпретации
+(`tasks.check@1` пакета `sdd`) и шаблоны правила. Пробы `absent` раздела
+«Conformance» остаются в силе.
+
+`identity` опубликован в OpenAPI (`RuleCreateRequest`, `RuleUpdateRequest`,
+`RuleOut`) в C002. До C005 правило с `identity` — `501 not_implemented`
+(`details.field = identity`), без записи. `taskTypes`, шаблонный `taskType` и
+`fields.relations` — поля документа `action`, который OpenAPI описывает
+объектом без схемы. До C005 грамматика отвергает их как неизвестные ключи
+(`422 invalid_rule_action`). `typeKey`/`typeVersion` в `task` появляются с C005.
+
+### Реализация амендмента (C005, TASK-000644)
+
+- **Хранение.** Колонка `work_rules.identity_agent_key` (миграция
+  `a7c4e2d9b3f1`, после `5d2e8f1a7c63`) — ключ, не внешний ключ: строка
+  агента не удаляется, ключ выведенного агента не переиспользуется. `RuleOut.identity`
+  — `{agent}` или `null`. Заглушка `501` снята (модуль `pending_fields.py` удалён при слиянии C005 и C006).
+- **Запись** (`application/commands/work_rules.py`, `_check_identity`): агент
+  есть и `active`, иначе `422 unknown_agent` (`details: {field:
+  identity.agent, agent}`); права ревизии — через
+  `validate_binding_permissions`, ту же функцию, что у ревизии агента и
+  `iam-bindings` (`403 permission_escalation`, `details.missing`). Проверка
+  идёт при `POST` и при любом `PATCH`, после которого у правила есть
+  личность: изменённое действие правила исполняется правами агента, поэтому
+  правку описания или действия такого правила пишущий без прав агента не
+  сделает. Смена личности (в том числе `null`) — новая `version`, в
+  `rule.updated.changes` — `identity`.
+- **Сохранённый снимок `authority`** остаётся снимком пишущего (включившего):
+  он нужен, пока агент не связан (`enabled_has_authority`), и отвечает на
+  вопрос «кто включил». Полномочия, которыми идёт оценка, у правила с
+  личностью строятся заново на каждой оценке (`_agent_authority` в
+  `rule_evaluations.py`) из `agents.principal_id` и его IAM-связки; в
+  `RuleOut.authorityPrincipalId` поэтому остаётся включивший, а автор
+  работы и событий — principal агента. Агент без principal, выведенный или
+  без связки — оценка `failed: credential_inactive` (`details.agent`);
+  связка `revoked`/`disabled` и principal не `active` ловит прежняя
+  `require_active_credential`. Для записи такой оценки в журнал
+  (`rule.evaluated`) используется снимок включившего: личности, от имени
+  которой писать, нет.
+- **`taskTypes` и шаблонный `taskType`** — `domain/work_rules.py`
+  (`_normalize_task_types`); существование активной версии каждого ключа —
+  `_check_references` (`422 unknown_task_type`, `details.field =
+  action.taskTypes[i]`). Литеральный `taskType` рядом с `taskTypes` на
+  существование отдельно не проверяется: он обязан входить в список.
+- **Связи** (`_resolve_relations`, `_link_filed`): разрешение идёт до
+  заведения первой задачи, поэтому отказ элемента ничего не пишет и отдельный
+  savepoint ему не нужен. `spawnedBy` без видимой задачи —
+  `relation_target_not_found`; ключ `dependsOn` из журнала, чью задачу
+  полномочия правила не читают, — `dependency_not_found` (как у `_open_work`:
+  невидимое не отличается от отсутствующего). Повторы ключей в `dependsOn`
+  схлопываются. Связи пишет `add_relation` с событием `task.relation_added`.
+- **Итог оценки.** Отказанный элемент — `work[] {dedupKey, refused, detail}`;
+  в payload `rule.evaluated` — `refused`. Все элементы отказаны — `failed`,
+  `error.code = work_items_refused`, `details.refused` — отсортированные коды.
+- **`task.typeKey` / `typeVersion`** — из `task_types` по `tasks.type_id`, как в
+  `TaskOut`.
+- SDK: `create_rule(identity=…)`, `update_rule(identity=…)`.
+- Тесты: `tests/integration/test_rules_identity_relations.py`.
+
+## Амендмент 2026-09-27 (process-packages, P012): workspace работы и назначение на роль
+
+Основание: решения владельца 2026-09-27 по фиче `process-packages` (P012, P019;
+TAI-ADR-0054 п.5 и п.9, CP-ADR-0076 §7). Правило `regulation-drift` пакета
+`process-knowledge` — правило tenant'а: оно слышит `knowledge.changed` любого
+дерева, а задачу о расхождении кладёт **в workspace процесса** и адресует
+**владельцу процесса** (`owner` — цепочка назначения: principal, агент или
+роль). До амендмента работа правила шла только в workspace самого правила, а
+`fields.assignee` принимал id principal'а и `agent:<key>`: ядро отвергало такое
+правило при применении пакета как неизвестный ключ `fields.workspaceId`.
+
+### Д1. `fields.workspaceId`
+
+У `ensure_work` и `request_decision` в `fields` — необязательная строка-шаблон
+`workspaceId` (корни стадии действия: `item` при `forEach`, `payload`, `skill`…).
+
+- **Запись правила:** строка с допустимыми путями шаблона; у `update_work`,
+  `cancel_work`, `complete_work` — `422 invalid_rule_action`
+  (`details.field = action.fields.workspaceId`): работу, найденную по ключу,
+  правило не переносит.
+- **Заведение работы:** значение, отрендеренное в `null` или пустую строку, —
+  workspace правила (у правила tenant'а — без workspace), как до амендмента.
+  Не id — оценка `failed: invalid_rule_field` (`details.field`). Workspace
+  неизвестный или архивный — отказ `create_task`, как у задачи из API.
+- **Право.** Работу заводит `create_task` с полномочиями оценки — правами
+  личности правила (Г1) или включившего; `tasks.write` проверяется **на целевом
+  workspace**. Правило workspace A может завести работу в B, только если его
+  личность может писать задачи в B; отдельного права «правило пишет в чужой
+  workspace» нет.
+- **Ключ дедупликации** по-прежнему общий для tenant'а (п.5): одна и та же
+  работа не заводится дважды из-за того, что шаблон workspace дал разные значения.
+- `goalId` правила ставится работе как раньше; цель, которую нельзя связать с
+  целевым workspace, отказывает действие (`require_linkable_goal`).
+
+### Д2. `fields.assignee: "role:<slug>"`
+
+Отрендеренное `role:<slug>` — работа **роли**: задача без исполнителя с
+требованием роли `slug`, найденной в целевом workspace и выше по дереву
+(ближайшая), затем среди ролей tenant'а. Как у роли в выражении назначения
+процесса (CP-ADR-0074): взять работу может любой держатель роли. Роли нет —
+отказ действия `unknown_role` (`details: {field: action.fields.assignee,
+role}`), это ошибка команды, а не отказ элемента Г5. Пустой slug —
+`invalid_rule_field`. Прочие формы не меняются: id principal'а, `agent:<key>`
+(Г6), пусто — без исполнителя.
+
+### Д3. Чтение для правила
+
+Язык условий остаётся сравнениями над фактами (п.2), вызовов в нём нет.
+«Ключ документа есть среди `governedBy` опубликованных процессов» проверяет
+скилл интерпретации маршрутом `GET /process-definitions?governedBy=`
+(CP-ADR-0076 §7): последняя версия каждого процесса, где процесс, стадия, шаг,
+веха или таблица решений ссылается на документ. Элемент ответа несёт
+`workspaceId` и `owner` версии — из них скилл строит `fields.workspaceId` и
+`fields.assignee` задачи.
+
+### Реализация амендмента (P012, TASK-000728)
+
+- `domain/work_rules.py`: `WORKSPACE_FIELD` в `FIELD_KEYS`, запрет вне
+  заводящих действий; `ROLE_ASSIGNEE_PREFIX`.
+- `application/commands/rule_evaluations.py`: `_assignment` (id, агент или
+  роль → `RequirementSpec(roles=[slug])`), `workspace_id` работы из
+  `fields.workspaceId` или правила; `unknown_requirement` роли назначения
+  переводится в `unknown_role`.
+- Тесты: `tests/integration/test_rules_target_workspace.py`.
+
 ## Conformance
 
 Пробы для `adr.conformance_check` (пилот «саморазработка»):
@@ -701,4 +987,11 @@ staging одобренный approval задачи типа `invoice-payment` о
 - grep: {path: src/control_plane/application/commands/rule_evaluations.py, pattern: 'custom_fields=_custom_fields\(fields\)'}
 - grep: {path: tests/integration/test_rules_custom_fields.py, pattern: 'test_values_outside_the_field_schema_fail_the_evaluation_and_file_nothing'}
 - grep: {path: tests/integration/test_invoice_payment_package.py, pattern: 'test_an_invoice_the_type_does_not_accept_files_no_work'}
+- grep: {path: src/control_plane/infrastructure/db/models.py, pattern: 'identity_agent_key: Mapped'}
+- grep: {path: src/control_plane/application/commands/rule_evaluations.py, pattern: 'async def _agent_authority\('}
+- grep: {path: src/control_plane/application/commands/rule_evaluations.py, pattern: 'DEPENDENCY_CYCLE = "dependency_cycle"'}
+- grep: {path: tests/integration/test_rules_identity_relations.py, pattern: 'test_a_rule_whose_agent_lacks_a_right_fails_its_evaluation'}
+- grep: {path: tests/integration/test_rules_identity_relations.py, pattern: 'test_for_each_files_typed_related_work_once'}
+- grep: {path: src/control_plane/domain/work_rules.py, pattern: 'WORKSPACE_FIELD = "workspaceId"'}
+- grep: {path: tests/integration/test_rules_target_workspace.py, pattern: 'test_work_goes_to_the_workspace_and_the_role_the_item_names'}
 ```

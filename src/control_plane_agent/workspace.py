@@ -835,8 +835,8 @@ class ExecutionWorkspacePool:
         return "FETCH_HEAD"
 
     def _create(self, path: Path, branch: str, base_ref: str, base_branch: str) -> None:
-        exists = _git(
-            self.origin, "rev-parse", "--verify", "--quiet", f"refs/heads/{branch}", check=False
+        exists = self._has_ref(f"refs/heads/{branch}") or self._adopt_published(
+            branch, base_ref, base_branch
         )
         if exists:
             # The branch outlived its working copy (cleanup after success, or a
@@ -852,6 +852,55 @@ class ExecutionWorkspacePool:
             _git(self.origin, "config", f"{config}.{_BASE_BRANCH_KEY}", base_branch)
             head = _git(path, "rev-parse", "HEAD")
             _git(self.origin, "config", f"{config}.{_BASE_COMMIT_KEY}", head)
+
+    def _adopt_published(self, branch: str, base_ref: str, base_branch: str) -> bool:
+        """Take the task branch from the forge when this mirror does not have it.
+
+        A task returned by its verification (a rejected review, a merge that
+        failed) is taken again, possibly by another runner or after the mirror
+        was rebuilt. Its published branch is where the work and the review
+        history are: cutting a fresh one from the base would fork a second
+        line that the never-forced push then cannot publish. Best-effort like
+        the base refresh: a branch the forge lacks, or an unreachable forge,
+        leaves the copy to be cut from the base as before.
+        """
+        if not self.push_remote:
+            return False
+        local = f"refs/heads/{branch}"
+        # FETCH_HEAD may be the base this copy is about to be cut from.
+        result = subprocess.run(
+            [
+                "git",
+                "fetch",
+                "--quiet",
+                "--no-write-fetch-head",
+                self.push_remote,
+                f"{local}:{local}",
+            ],
+            cwd=self.origin,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if result.returncode != 0:
+            stderr = result.stderr.strip()
+            if "couldn't find remote ref" not in stderr:
+                logger.warning(
+                    "could not look for %s in %s: %s",
+                    branch,
+                    self.push_remote,
+                    redact_local_paths(stderr)[:200],
+                )
+            return False
+        # Recorded as if cut here, from the point it shares with the base, so
+        # a later change of base still sees the commits of its own.
+        config = f"branch.{branch}"
+        _git(self.origin, "config", f"{config}.{_BASE_BRANCH_KEY}", base_branch)
+        fork = _git(self.origin, "merge-base", local, base_ref, check=False)
+        if fork:
+            _git(self.origin, "config", f"{config}.{_BASE_COMMIT_KEY}", fork)
+        logger.info("continuing %s as published in %s", branch, self.push_remote)
+        return True
 
     def _verify(self, path: Path, branch: str) -> None:
         if not (path / ".git").exists():

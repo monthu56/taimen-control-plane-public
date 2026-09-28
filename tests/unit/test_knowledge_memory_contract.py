@@ -163,3 +163,61 @@ def test_manifest_with_identity_passes_pack_in(version: object) -> None:
     manifest = {"name": "selfdev", "version": version, "kinds": []}
     knowledge.require_pack_identity(manifest)
     _validate(_request_schema("/api/memory/packages", "post"), manifest)
+
+
+# --- the answer of reconcile the core reads (CP-ADR-0076 §7, MEM-ADR-020) ------------
+
+RECONCILE_ANSWER = CONTRACT["responses"]["reconcile"]
+
+
+def test_changed_keys_read_memorys_reconcile_changes() -> None:
+    example = RECONCILE_ANSWER["example"]
+    changes = example[RECONCILE_ANSWER["changesField"]]
+    _validate(RECONCILE_ANSWER["ReconcileChanges"], changes)
+    assert list(knowledge.CHANGE_LISTS) == RECONCILE_ANSWER["changeLists"]
+    assert set(knowledge.CHANGE_LISTS) <= set(RECONCILE_ANSWER["ReconcileChanges"]["properties"])
+    assert knowledge.changed_keys(example) == (
+        [{"kind": "ui_call", "key": "web-app:src/runs/page.tsx:38", "change": "opened"}],
+        False,
+    )
+
+
+def test_changed_keys_follow_the_lists_and_their_cut() -> None:
+    answer = {
+        "duplicate": False,
+        "changes": {
+            "opened": [{"kind": "regulation", "key": "regulation:new"}],
+            "changed": [{"kind": "regulation", "key": "regulation:procurement"}],
+            "closed": [{"kind": "regulation", "key": "regulation:old"}, "not an entry"],
+            "limit": 1000,
+            "truncated": True,
+        },
+    }
+    _validate(RECONCILE_ANSWER["ReconcileChanges"], {**answer["changes"], "closed": []})
+    changes, truncated = knowledge.changed_keys(answer)
+    assert [(c["key"], c["change"]) for c in changes] == [
+        ("regulation:new", "opened"),
+        ("regulation:procurement", "changed"),
+        ("regulation:old", "closed"),
+    ]
+    assert truncated is True
+
+
+@pytest.mark.parametrize(
+    "answer",
+    [
+        {},
+        {"changes": None},
+        {"changes": {"opened": [], "changed": [], "closed": [], "limit": 1000}},
+        # A repeated snapshot touched nothing, whatever the lists say.
+        {"duplicate": True, "changes": {"opened": [{"kind": "doc", "key": "d"}]}},
+    ],
+)
+def test_nothing_changed_is_no_keys(answer: dict[str, Any]) -> None:
+    assert knowledge.changed_keys(answer) == ([], False)
+
+
+def test_one_event_carries_a_bounded_list() -> None:
+    many = [{"kind": "doc", "key": f"d{i}"} for i in range(knowledge.MAX_EVENT_CHANGES + 5)]
+    changes, truncated = knowledge.changed_keys({"changes": {"opened": many}})
+    assert len(changes) == knowledge.MAX_EVENT_CHANGES and truncated is True

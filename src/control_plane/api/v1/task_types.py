@@ -20,6 +20,7 @@ from control_plane.api.v1.schemas import (
     TaskTypeOut,
     dump,
     page_body,
+    work_document,
 )
 from control_plane.api.write_flow import execute_write
 from control_plane.application.authorization import authorize
@@ -61,6 +62,7 @@ async def create_task_type(
             instructions=payload.instructions,
             completion_schema=payload.completion_schema,
             artifact_schema=payload.artifact_schema,
+            acceptance=work_document(payload.acceptance),
         )
         return 201, dump(TaskTypeOut, task_type)
 

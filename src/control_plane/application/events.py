@@ -25,6 +25,7 @@ from control_plane.infrastructure.db.models import (
     Event,
     Goal,
     OutboxRecord,
+    ProcessInstance,
     ProjectProfile,
     Role,
     Run,
@@ -56,6 +57,7 @@ _WORKSPACE_ENTITIES: dict[str, type[Any]] = {
     "run": Run,
     "claim": TaskClaim,
     "skill_invocation": SkillInvocation,
+    "process_instance": ProcessInstance,
 }
 
 

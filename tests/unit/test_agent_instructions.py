@@ -21,9 +21,11 @@ from control_plane.domain.agent_instructions import (
 from control_plane.domain.errors import ValidationError
 from control_plane.domain.project import validate_config_document
 from control_plane_agent.instructions import (
+    FEEDBACK_HEADING,
     HEADING,
     build_prompt,
     read_conventions,
+    render_feedback,
     render_instructions,
 )
 from control_plane_claude.adapter import ClaudeCodeAdapter
@@ -207,3 +209,104 @@ def test_type_without_instructions_keeps_the_prompt_shape() -> None:
         assert section in prompt
     assert prompt.index("### Platform contract") < prompt.index("# Task TASK-1")
     assert "RAW-CONFIG-MARKER" not in prompt
+
+
+# -- declarative-cycle C006: the last verification and "stopped, not done" ---------
+
+FAILED_ATTEMPT: dict[str, Any] = {
+    "id": "v-2",
+    "attempt": 2,
+    "status": "failed",
+    "results": [
+        {"key": "tests", "kind": "deterministic", "status": "passed", "reason": "ok"},
+        {
+            "key": "review",
+            "kind": "human",
+            "status": "failed",
+            "reason": "approval_rejected",
+            "message": "approval rejected: the migration\nhas no downgrade",
+        },
+    ],
+}
+
+
+def test_a_failed_verification_is_rendered_for_every_adapter() -> None:
+    task = {**TASK, "lastVerification": FAILED_ATTEMPT}
+    prompt = build_prompt(task, CONTEXT)
+
+    feedback = prompt[prompt.index(FEEDBACK_HEADING) :]
+    assert "attempt #2" in feedback
+    assert "- tests (deterministic): passed" in feedback
+    assert (
+        "- review (human): failed — approval_rejected: approval rejected: the migration has no "
+        "downgrade"
+    ) in feedback
+    # After the task, before the data that follows it.
+    section = prompt.index(FEEDBACK_HEADING)
+    assert prompt.index("Details.") < section < prompt.index("\n## Project\n")
+    claude = ClaudeCodeAdapter(ClaudeCodeCLI(binary="claude"))._build_prompt(task, CONTEXT)
+    codex = CodexAdapter(CodexCLI(binary="codex"))._build_prompt(task, CONTEXT)
+    assert FEEDBACK_HEADING in claude and FEEDBACK_HEADING in codex
+
+
+@pytest.mark.parametrize(
+    "attempt", [None, {**FAILED_ATTEMPT, "status": "passed"}, {"status": "failed"}]
+)
+def test_no_failed_verification_no_feedback(attempt: dict[str, Any] | None) -> None:
+    rendered = render_feedback(attempt)
+    if attempt is None or attempt["status"] != "failed":
+        assert rendered == ""
+        assert FEEDBACK_HEADING not in build_prompt({**TASK, "lastVerification": attempt}, CONTEXT)
+    else:
+        # An attempt without results still says the task came back.
+        assert rendered.startswith(FEEDBACK_HEADING)
+
+
+def test_the_platform_contract_names_the_blocked_signal() -> None:
+    assert "`blocked`" in PLATFORM_CONTRACT
+    assert "`executor_blocked`" in PLATFORM_CONTRACT
+    assert PLATFORM_CONTRACT_VERSION == 3
+
+
+def test_each_adapter_tells_its_executor_how_to_stop() -> None:
+    claude = _claude(CONTEXT, None)
+    codex = _codex(CONTEXT, None)
+    assert 'cp_checkpoint(kind="blocked"' in claude
+    assert "CONTROL_PLANE_BLOCKED_FILE" in codex
+
+
+class _VerificationClient:
+    def __init__(self, items: list[dict[str, Any]]) -> None:
+        self.items = items
+        self.asked = 0
+
+    async def list_task_verifications(self, task_ref: str, **params: Any) -> dict[str, Any]:
+        self.asked += 1
+        return {"items": self.items}
+
+
+@pytest.mark.parametrize(
+    ("brief", "items", "expected"),
+    [
+        # Returned by its verification: the attempt comes with the task.
+        ({"status": "failed", "attempt": 2}, [FAILED_ATTEMPT], FAILED_ATTEMPT),
+        # Nothing failed: nothing is read.
+        (None, [FAILED_ATTEMPT], None),
+        ({"status": "passed", "attempt": 1}, [FAILED_ATTEMPT], None),
+        # The brief is stale: a newer attempt is open.
+        ({"status": "failed", "attempt": 2}, [{**FAILED_ATTEMPT, "status": "running"}], None),
+    ],
+)
+async def test_the_daemon_adds_the_failed_attempt_to_the_task(
+    brief: dict[str, Any] | None, items: list[dict[str, Any]], expected: dict[str, Any] | None
+) -> None:
+    from control_plane_agent.main import Agent
+
+    agent = object.__new__(Agent)
+    agent.client = _VerificationClient(items)  # type: ignore[assignment]
+    task = {**TASK, "verification": brief}
+
+    enriched = await agent._with_feedback(task)
+
+    assert enriched.get("lastVerification") == expected
+    assert agent.client.asked == (1 if brief and brief["status"] == "failed" else 0)  # type: ignore[attr-defined]

@@ -39,6 +39,7 @@ from control_plane.domain.enums import (
 from control_plane.domain.errors import NotFoundError, ValidationError
 from control_plane.domain.project import validate_json_schema_document
 from control_plane.domain.task_execution import normalize_execution
+from control_plane.domain.work_graph import normalize_checks
 from control_plane.domain.work_item import (
     SYSTEM_TASK_LIFECYCLE,
     SYSTEM_TASK_TYPE_DISPLAY_NAME,
@@ -234,6 +235,16 @@ async def _check_artifact_types(
     check_against_artifact_types(schema, {key: list(media) for key, media in rows})
 
 
+async def _type_checks(
+    session: AsyncSession, ctx: AuthContext, acceptance: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    from control_plane.application.commands.verification import check_acceptance_skills
+
+    checks = normalize_checks(acceptance, field="acceptance")
+    await check_acceptance_skills(session, ctx, checks)
+    return checks
+
+
 async def create_task_type_version(
     session: AsyncSession,
     ctx: AuthContext,
@@ -249,6 +260,7 @@ async def create_task_type_version(
     instructions: str | None = None,
     completion_schema: dict[str, Any] | None = None,
     artifact_schema: dict[str, Any] | None = None,
+    acceptance: list[dict[str, Any]] | None = None,
 ) -> TaskType:
     """Create the next version of ``key`` — never an in-place edit."""
     await authorize(ctx, Permission.TASK_TYPES_MANAGE)
@@ -292,6 +304,10 @@ async def create_task_type_version(
     handoff = artifact_schema or {}
     io = parse_artifact_schema(handoff)
     await _check_artifact_types(session, ctx, io)
+    # Default checks of every task of the version (CP-ADR-0067, amendment
+    # 2026-09-27): the grammar and registries of a task's acceptance, now —
+    # the version is immutable, and its tasks would carry a check nobody can run.
+    checks = await _type_checks(session, ctx, acceptance or [])
 
     current_max = await session.scalar(
         select(func.max(TaskType.version)).where(
@@ -316,6 +332,7 @@ async def create_task_type_version(
         instructions=text,
         completion_schema=after_completion,
         artifact_schema=handoff,
+        acceptance=checks,
         status=TaskTypeStatus.ACTIVE,
         created_by=ctx.principal_id,
         created_at=now,

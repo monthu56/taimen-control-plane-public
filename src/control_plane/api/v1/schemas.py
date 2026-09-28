@@ -2,7 +2,7 @@
 
 import uuid
 from collections.abc import Sequence
-from datetime import datetime
+from datetime import date, datetime
 from typing import Annotated, Any, Literal
 
 from pydantic import AfterValidator, AwareDatetime, BaseModel, ConfigDict, Field, model_validator
@@ -144,12 +144,27 @@ class AcceptanceCheckSpec(ApiModel):
     ``{event?}``; ``human`` — ``{approver? | approverRole?}``; ``llm_judge`` —
     as ``human`` plus ``rubric?``. A spec outside it is
     ``422 invalid_acceptance_spec``. On a goal it is not interpreted.
+
+    ``when`` — ``$.task`` expressions (CP-ADR-0061 grammar) that must all
+    resolve to something when the attempt reaches the check; otherwise the
+    check is ``skipped`` with reason ``condition_unmet``. Not on a goal.
     """
 
     key: str = Field(min_length=1, max_length=63)
     kind: Literal["deterministic", "external_state", "human", "llm_judge"]
     description: str = Field(min_length=1, max_length=2000)
     spec: dict[str, Any] | None = None
+    # CP-ADR-0067 amendment 2026-09-27 (B6): $.task expressions that must all
+    # resolve to something for the check to run; unmet, it is ``skipped``.
+    when: list[Annotated[str, Field(min_length=1, max_length=500)]] | None = Field(
+        default=None, min_length=1, max_length=8
+    )
+
+
+# CP-ADR-0073 amendment A1: an assignment field names a principal by id or an
+# agent of the registry by key; the core resolves the key when it writes.
+AGENT_REFERENCE_PREFIX = "agent:"
+AgentReference = Annotated[str, Field(pattern=r"^agent:[a-z0-9][a-z0-9-]{0,62}$")]
 
 
 def work_document(value: ApiModel | Sequence[ApiModel] | None) -> Any:
@@ -171,7 +186,7 @@ class TaskCreateRequest(ApiModel):
     type_key: str | None = Field(default=None, min_length=1, max_length=63)
     type_version: int | None = Field(default=None, ge=1)
     owner_id: uuid.UUID | None = None
-    assignee_id: uuid.UUID | None = None
+    assignee_id: uuid.UUID | AgentReference | None = None
     workspace_id: uuid.UUID | None = None
     # v0.8: validated against the field_schema of the selected type version.
     custom_fields: dict[str, Any] = Field(default_factory=dict)
@@ -195,7 +210,7 @@ class TaskUpdateRequest(ApiModel):
     # never accepted from a client — it is derived from the key.
     status: str | None = Field(default=None, min_length=1, max_length=64)
     owner_id: uuid.UUID | None = None
-    assignee_id: uuid.UUID | None = None
+    assignee_id: uuid.UUID | AgentReference | None = None
     workspace_id: uuid.UUID | None = None
     # v0.8: whole-document replace (a merge could never remove a key); the
     # dates are nullable, so an explicit null clears a planned date.
@@ -528,10 +543,16 @@ class TaskOut(ApiModel):
 class TaskVerificationOut(ApiModel):
     """One attempt of the verification stage (CP-ADR-0067).
 
-    ``checks`` — the acceptance the attempt runs, as it was when it opened;
-    ``results`` — per check run so far: ``{key, kind, status, evidence,
-    reason, message?}``; ``cursor`` — the index of the check it is at. The
-    completer's credential snapshot stays internal.
+    ``checks`` — the checks the attempt runs, as they were when it opened,
+    each with its ``source``: ``output`` (a required output of the type),
+    ``type`` (declared by the task type version), ``task`` (the task's own
+    acceptance) or ``rule`` (the implicit check of a rule closing the work);
+    ``results`` — per check run so far: ``{key, kind, source, status,
+    evidence, reason, message?, details?}``, ``status`` ``passed | skipped |
+    failed | cancelled`` (``skipped`` — its ``when`` did not hold,
+    ``details.when`` names the expression); ``cursor`` — the index of the
+    check it is at. Attempts opened before 2026-09-27 carry no ``source``.
+    The completer's credential snapshot stays internal.
     """
 
     id: uuid.UUID
@@ -961,6 +982,14 @@ class ApprovalRequestRequest(ApiModel):
     assigned_principal_id: uuid.UUID | None = None
     comment: str = Field(default="", max_length=4000)
     gate: bool = False
+    # Separation of duties (CP-ADR-0074 §7): principals the core refuses a
+    # decision from, whoever asks.
+    excluded_principals: list[uuid.UUID] | None = Field(
+        default=None,
+        max_length=100,
+        description="Principals that may not decide this approval"
+        " (403 separation_of_duties_violation on their decision)",
+    )
 
 
 class ApprovalDecisionRequest(ApiModel):
@@ -1257,6 +1286,10 @@ class ApprovalOut(ApiModel):
     version: int
     # null | pending | deferred | executed | failed (CP-ADR-0061)
     outcome_status: str | None
+    excluded_principals: list[uuid.UUID] = Field(
+        default_factory=list,
+        description="Principals that may not decide this approval (CP-ADR-0074 §7)",
+    )
     created_at: datetime
     updated_at: datetime
 
@@ -1380,6 +1413,9 @@ class TaskTypeCreateRequest(ApiModel):
     # CP-ADR-0072 §7: artifacts a task of this version takes in and hands on
     # ({"inputs": [...], "outputs": [...]}); checked against the registry.
     artifact_schema: dict[str, Any] = Field(default_factory=dict)
+    # CP-ADR-0067 amendment 2026-09-27 (B5): checks every task of this version
+    # passes, after the required outputs and before the task's own acceptance.
+    acceptance: list[AcceptanceCheckSpec] = Field(default_factory=list, max_length=50)
 
 
 class TaskTypeOut(ApiModel):
@@ -1397,6 +1433,7 @@ class TaskTypeOut(ApiModel):
     instructions: str = ""
     completion_schema: dict[str, Any] = Field(default_factory=dict)
     artifact_schema: dict[str, Any] = Field(default_factory=dict)
+    acceptance: list[dict[str, Any]] = Field(default_factory=list)
     status: str
     created_by: uuid.UUID
     created_at: datetime
@@ -1626,6 +1663,13 @@ class GoalOut(ApiModel):
 # domain/work_rules.py, which also serves writers that do not pass through HTTP.
 
 
+class RuleIdentitySpec(ApiModel):
+    """Whose authority a rule acts with (CP-ADR-0063 amendment 2026-09-27, G1):
+    an agent of the registry, by key."""
+
+    agent: str = Field(min_length=1, max_length=63, pattern=r"^[a-z0-9][a-z0-9-]*$")
+
+
 class RuleCreateRequest(ApiModel):
     key: str = Field(min_length=1, max_length=128)
     description: str = Field(default="", max_length=2000)
@@ -1637,6 +1681,8 @@ class RuleCreateRequest(ApiModel):
     interpretation: dict[str, Any] | None = None
     action: dict[str, Any]
     status: Literal["enabled", "disabled"] = "enabled"
+    # Omitted: the rule acts with the authority of whoever enabled it.
+    identity: RuleIdentitySpec | None = None
 
 
 class RuleUpdateRequest(ApiModel):
@@ -1647,6 +1693,8 @@ class RuleUpdateRequest(ApiModel):
     interpretation: dict[str, Any] | None = None
     action: dict[str, Any] | None = None
     goal_id: uuid.UUID | None = None
+    # null removes the identity: the rule acts with its enabler's authority.
+    identity: RuleIdentitySpec | None = None
 
 
 class RuleOut(ApiModel):
@@ -1662,6 +1710,8 @@ class RuleOut(ApiModel):
     condition: Any
     interpretation: dict[str, Any] | None
     action: dict[str, Any]
+    # {agent: <key>} when the rule acts as an agent of the registry, else null.
+    identity: dict[str, Any] | None = None
     # Whose authority the rule acts with, and since when it sees facts.
     authority_principal_id: uuid.UUID | None
     enabled_at: datetime | None
@@ -1989,3 +2039,451 @@ class AgentStatusOut(ApiModel):
     observed_at: datetime | None
     reported_by: uuid.UUID | None
     updated_at: datetime | None
+
+
+# --- process-packages: processes, calendars, packages (CP-ADR-0074) ----------
+#
+# The contract lands before the implementation (constitution art. V): the
+# routes answer 501 until the steps of the feature that implement them. The
+# spec of a process is ``$defs.processSpec`` of the superproject catalog schema
+# (``packages/schema/v1/object.schema.json``); the core checks it by that
+# schema and then by the language (CP-ADR-0074 §2, CP-ADR-0075), so the body
+# here is the document as the catalog holds it. The calendar is small and
+# modelled field by field; a contract test keeps both sides together.
+
+PROCESS_KEY_PATTERN = r"^[a-z0-9][a-z0-9_-]*$"
+PROCESS_ELEMENT_PATTERN = r"^[a-z][a-z0-9-]{0,62}$"
+_PROCESS_KEY_FIELD = Field(min_length=1, max_length=63, pattern=PROCESS_KEY_PATTERN)
+_SHA256_PATTERN = r"^sha256:[0-9a-f]{64}$"
+PACKAGE_MAX_FILES = 1000
+PACKAGE_FILE_MAX_CHARS = 1_000_000
+REPLAY_MAX_INSTANCES = 200
+
+ProcessInstanceStatus = Literal["running", "suspended", "completed", "failed", "cancelled"]
+
+
+class ProcessProblemOut(ApiModel):
+    """One finding of a check: the same shape from every route and MCP tool."""
+
+    code: str = Field(description="Machine-readable class, e.g. unknown_data_field")
+    severity: Literal["error", "warning"]
+    path: str = Field(description="JSON pointer into the object, e.g. /spec/stages/0/steps/1")
+    file: str | None = Field(description="Package file, when the object came from one")
+    line: int | None
+    message: str
+    hint: str | None
+
+
+class ProcessDefinitionPublishRequest(ApiModel):
+    """``POST /process-definitions``: a catalog object of kind Process without its envelope."""
+
+    key: str = _PROCESS_KEY_FIELD
+    spec: dict[str, Any] = Field(
+        description="spec of a catalog object of kind Process ($defs.processSpec);"
+        " spec.version is the version being published"
+    )
+
+
+class ProcessDefinitionOut(ApiModel):
+    id: uuid.UUID
+    tenant_id: uuid.UUID
+    workspace_id: uuid.UUID | None
+    key: str
+    version: int
+    latest_version: int
+    display_name: str
+    definition_hash: str = Field(description="sha256:<hex> of the canonical JSON of spec")
+    identity_agent: str | None = Field(description="Agent key the process acts as")
+    owner: list[dict[str, Any]] | None = Field(
+        default=None,
+        description="spec.owner: the assignment chain tasks about the process itself go to"
+        " (regulation drift, failed instances); null when the process has none",
+    )
+    expression_profile: str = Field(description="CEL profile of its expressions, e.g. cp/1")
+    spec: dict[str, Any]
+    warnings: list[ProcessProblemOut] = Field(
+        default_factory=list, description="Findings that did not refuse the version"
+    )
+    created_by: uuid.UUID
+    created_at: datetime
+
+
+class ProcessVersionOut(ApiModel):
+    """An item of ``GET /process-definitions/{key}/versions``: a version without its spec."""
+
+    id: uuid.UUID
+    key: str
+    version: int
+    latest_version: int
+    workspace_id: uuid.UUID | None
+    display_name: str
+    definition_hash: str
+    identity_agent: str | None
+    expression_profile: str
+    warnings: list[ProcessProblemOut] = Field(default_factory=list)
+    created_by: uuid.UUID
+    created_at: datetime
+
+
+class ProcessReplayRequest(ApiModel):
+    """``POST /process-definitions/{key}:replay``: journals of real instances into a new version."""
+
+    spec: dict[str, Any] = Field(description="The candidate version, as for publishing")
+    instance_ids: list[uuid.UUID] | None = Field(
+        default=None,
+        max_length=REPLAY_MAX_INSTANCES,
+        description="Instances to replay; by default the latest ones of the current version",
+    )
+    limit: int = Field(default=50, ge=1, le=REPLAY_MAX_INSTANCES)
+
+
+class ProcessDivergenceOut(ApiModel):
+    journal_seq: int = Field(description="Entry of the instance journal where the paths part")
+    element: str | None
+    kind: str = Field(
+        description="decision or intent (the first that differs); input — the candidate"
+        " refused a recorded input; data, timer or state — every step matched, the final"
+        " state did not"
+    )
+    recorded: Any = Field(description="What the instance's version decided")
+    replayed: Any = Field(description="What the candidate decides on the same input")
+
+
+class ProcessReplayInstanceOut(ApiModel):
+    instance_id: uuid.UUID
+    instance_key: str
+    version: int
+    events: int = Field(description="Journal inputs fed to the candidate")
+    divergences: list[ProcessDivergenceOut]
+
+
+class ProcessReplayOut(ApiModel):
+    key: str
+    candidate_hash: str
+    replayed: int
+    diverged: int
+    problems: list[ProcessProblemOut]
+    instances: list[ProcessReplayInstanceOut]
+
+
+class ProcessStageStateOut(ApiModel):
+    id: str
+    state: Literal["available", "active", "completed", "terminated"]
+
+
+class ProcessOpenElementOut(ApiModel):
+    id: str
+    kind: str = Field(description="Step kind: human, approve, call, recall, listen, wait...")
+    since: datetime
+    task_id: uuid.UUID | None
+    approval_ids: list[uuid.UUID]
+
+
+class ProcessTimerOut(ApiModel):
+    id: uuid.UUID
+    element: str
+    due_at: datetime | None = Field(description="Null while frozen by a suspension")
+    state: Literal["pending", "frozen", "fired", "cancelled"]
+    provisional: bool = Field(description="Computed on a provisional calendar year")
+    remaining_seconds: int | None = Field(description="Kept while frozen (CP-ADR-0074 §6)")
+
+
+class ProcessInstanceOut(ApiModel):
+    id: uuid.UUID
+    tenant_id: uuid.UUID
+    workspace_id: uuid.UUID | None
+    definition_key: str
+    definition_version: int
+    instance_key: str
+    status: ProcessInstanceStatus
+    outcome: str | None
+    data: dict[str, Any]
+    stages: list[ProcessStageStateOut]
+    open_elements: list[ProcessOpenElementOut]
+    timers: list[ProcessTimerOut]
+    started_at: datetime
+    updated_at: datetime
+    completed_at: datetime | None
+
+
+class ProcessJournalEntryOut(ApiModel):
+    """One decision of the engine with its reason and author (FR-018)."""
+
+    seq: int
+    at: datetime = Field(description="Engine time of the input: the event's time, never now")
+    kind: str = Field(
+        description="input, transition, stage, milestone, timer, intent, vote, recall,"
+        " compensation, migration, error"
+    )
+    element: str | None
+    reason: str
+    actor_id: uuid.UUID | None = Field(description="Principal behind the input, if any")
+    event_id: uuid.UUID | None = Field(description="Journal event the input came from")
+    data: dict[str, Any]
+
+
+class ProcessInstanceStartRequest(ApiModel):
+    """``POST /process-instances``: an instance started without a trigger event (TAI-ADR-0055).
+
+    For a standing goal — a reconciling process without ``complete`` whose
+    milestones are reached and lost again. One instance per key: a key that
+    has one is ``409 process_instance_exists`` with its id.
+    """
+
+    process: str = _PROCESS_KEY_FIELD
+    key: str = Field(min_length=1, max_length=500, description="The instance key (start.key)")
+    data: dict[str, Any] | None = Field(
+        default=None, description="Initial data, checked against the data schema of the process"
+    )
+    workspace_id: uuid.UUID | None = Field(
+        default=None,
+        description="Workspace of an instance of a tenant-wide process; a process of a"
+        " workspace keeps its instances there",
+    )
+
+
+class ProcessSuspendRequest(ApiModel):
+    reason: str = Field(min_length=1, max_length=500)
+
+
+class ProcessResumeRequest(ApiModel):
+    reason: str | None = Field(default=None, max_length=500)
+
+
+class ProcessCancelRequest(ApiModel):
+    reason: str = Field(min_length=1, max_length=500)
+    compensate: bool = Field(
+        default=True, description="Run the compensations of completed steps first"
+    )
+
+
+def _unique_dates(items: list[date]) -> list[date]:
+    if len(set(items)) != len(items):
+        raise ValueError("dates must be unique")
+    return items
+
+
+_CalendarDates = Annotated[list[date], AfterValidator(_unique_dates)]
+
+
+class CalendarYear(ApiModel):
+    year: int = Field(ge=2000, le=2100)
+    provisional: bool | None = None
+    source: str | None = Field(default=None, max_length=500)
+    holidays: _CalendarDates | None = None
+    workdays: _CalendarDates | None = Field(
+        default=None, description="Working days moved onto a weekend"
+    )
+    short_days: _CalendarDates | None = None
+
+
+def _unique_weekdays(items: list[int]) -> list[int]:
+    if len(set(items)) != len(items):
+        raise ValueError("weekend days must be unique")
+    return items
+
+
+class CalendarSpec(ApiModel):
+    """``$defs.calendarSpec`` of the catalog schema."""
+
+    display_name: str = Field(min_length=1, max_length=200)
+    timezone: str = Field(max_length=64)
+    weekend: (
+        Annotated[list[Annotated[int, Field(ge=1, le=7)]], AfterValidator(_unique_weekdays)] | None
+    ) = Field(default=None, description="ISO weekdays, 1 is Monday; [6, 7] by default")
+    years: list[CalendarYear] = Field(min_length=1)
+
+
+class CalendarPublishRequest(ApiModel):
+    key: str = _PROCESS_KEY_FIELD
+    spec: CalendarSpec
+
+
+class CalendarOut(ApiModel):
+    id: uuid.UUID
+    tenant_id: uuid.UUID
+    key: str
+    version: int
+    latest_version: int
+    calendar_hash: str
+    spec: dict[str, Any]
+    provisional_years: list[int]
+    created_by: uuid.UUID
+    created_at: datetime
+
+
+def _package_path(path: str) -> str:
+    parts = path.split("/")
+    if "\\" in path or "\x00" in path or ".." in parts or "" in parts:
+        raise ValueError("a relative path inside the package, without .. and empty parts")
+    return path
+
+
+class PackageFile(ApiModel):
+    path: Annotated[str, AfterValidator(_package_path)] = Field(
+        min_length=1,
+        max_length=500,
+        description="Path inside the package, e.g. processes/tender.yaml",
+    )
+    content: str = Field(max_length=PACKAGE_FILE_MAX_CHARS, description="YAML 1.2 text")
+
+
+class PackageSource(ApiModel):
+    """The files of one package as the author has them (CP-ADR-0074 §10)."""
+
+    files: list[PackageFile] = Field(min_length=1, max_length=PACKAGE_MAX_FILES)
+
+    @model_validator(mode="after")
+    def _unique_paths(self) -> "PackageSource":
+        paths = [item.path for item in self.files]
+        if len(set(paths)) != len(paths):
+            raise ValueError("file paths must be unique")
+        return self
+
+
+class PackageTestRequest(ApiModel):
+    package: PackageSource
+    tests: list[str] | None = Field(
+        default=None, max_length=500, description="Test files to run; all by default"
+    )
+    workspace_id: uuid.UUID | None = Field(
+        default=None, description="Workspace whose roles, calendars and instances the run reads"
+    )
+
+
+class PackageTestFailureOut(ApiModel):
+    step: int = Field(description="Index of the test step, 0-based")
+    message: str
+    expected: Any = None
+    actual: Any = None
+
+
+class PackageTestResultOut(ApiModel):
+    file: str
+    name: str
+    process: str
+    status: Literal["passed", "failed", "error"]
+    duration_ms: int
+    failures: list[PackageTestFailureOut]
+
+
+class CoverageCounterOut(ApiModel):
+    covered: int
+    total: int
+    missing: list[str] = Field(description="Ids of what no test reached")
+
+
+class ProcessCoverageOut(ApiModel):
+    process: str
+    version: int
+    elements: CoverageCounterOut
+    transitions: CoverageCounterOut
+    decision_rows: CoverageCounterOut
+    handlers: CoverageCounterOut
+
+
+class PackageTestOut(ApiModel):
+    status: Literal["passed", "failed", "invalid"]
+    check_only: bool
+    problems: list[ProcessProblemOut]
+    tests: list[PackageTestResultOut]
+    coverage: list[ProcessCoverageOut]
+    duration_ms: int
+
+
+_OVERWRITE_CONSOLE = Field(
+    default=False,
+    description="Overwrite the fields a person changed since the last apply (owner console);"
+    " by default they are kept. Part of the plan: apply with the flag the plan was built with",
+)
+
+
+class PackagePlanRequest(ApiModel):
+    package: PackageSource
+    workspace_id: uuid.UUID | None = Field(
+        default=None,
+        description="Workspace an install variable ${...} of spec.workspaceId stands for",
+    )
+    replay_limit: int = Field(
+        default=50, ge=0, le=REPLAY_MAX_INSTANCES, description="Instances replayed per process"
+    )
+    overwrite_console: bool = _OVERWRITE_CONSOLE
+
+
+class PlanFieldOut(ApiModel):
+    path: str
+    before: Any
+    after: Any
+    owner: Literal["package", "console"] = Field(
+        description="console: a person changed the field since the last apply"
+    )
+    applies: bool = Field(description="False when a console-owned field is kept")
+
+
+class PlanChangeOut(ApiModel):
+    kind: str
+    key: str
+    action: Literal["create", "update", "rename", "retire", "unchanged"]
+    renamed_from: str | None
+    fields: list[PlanFieldOut]
+
+
+class PlanReplayOut(ApiModel):
+    replayed: int
+    diverged: int
+    instance_ids: list[uuid.UUID] = Field(description="Diverged instances, at most 20")
+
+
+class PlanInstancesOut(ApiModel):
+    version: int
+    open: int
+    fate: Literal["pin", "migrate", "unaffected"]
+    migration_required: bool = Field(
+        description="An element they stand on is gone and no migration covers it"
+    )
+
+
+class PlanProcessOut(ApiModel):
+    key: str
+    from_version: int | None
+    to_version: int
+    behaviour: PlanReplayOut | None
+    instances: list[PlanInstancesOut]
+
+
+class RegulationCoverageOut(ApiModel):
+    document: str
+    found: bool = Field(description="The document is in memory")
+    covered: dict[str, list[str]] = Field(description="Section -> element ids governed by it")
+    uncovered: list[str] = Field(description="Sections no element is governed by")
+
+
+class PackagePlanOut(ApiModel):
+    plan_hash: str = Field(description="sha256 over package, catalog etag and the plan body")
+    catalog_etag: str
+    package: dict[str, Any] = Field(description="{key, version} of the package")
+    changes: list[PlanChangeOut]
+    processes: list[PlanProcessOut]
+    regulation_coverage: list[RegulationCoverageOut]
+    problems: list[ProcessProblemOut]
+    created_at: datetime
+
+
+class PackageApplyRequest(ApiModel):
+    package: PackageSource
+    plan_hash: str = Field(pattern=_SHA256_PATTERN)
+    workspace_id: uuid.UUID | None = None
+    overwrite_console: bool = _OVERWRITE_CONSOLE
+
+
+class PackageAppliedOut(ApiModel):
+    kind: str
+    key: str
+    action: Literal["create", "update", "rename", "retire", "unchanged"]
+    version: int | None
+
+
+class PackageApplyOut(ApiModel):
+    plan_hash: str
+    catalog_etag: str = Field(description="Etag of the catalog after the apply")
+    applied: list[PackageAppliedOut]

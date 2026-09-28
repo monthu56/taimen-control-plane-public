@@ -22,7 +22,9 @@ The worker drives three loops, each in its own short transactions:
 
 **Authority.** Every evaluation acts as the principal whose credential last
 enabled the rule (a snapshot, checked for being still active on every
-evaluation — the approval-outcome rule). Reading the facts needs
+evaluation — the approval-outcome rule). A rule with ``identity: {agent}``
+acts as that agent's principal instead, with its IAM binding as it stands at
+the evaluation (CP-ADR-0063 amendment 2026-09-27, G1). Reading the facts needs
 ``events.read`` where the rule lives; every write goes through the ordinary
 command (``create_task``, ``update_task``, ``request_approval``) and its checks.
 
@@ -52,10 +54,15 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from control_plane.application.authorization import AuthContext, ResourceRef, authorize
 from control_plane.application.commands._artifact_content import artifact_event_fields
-from control_plane.application.commands.approval_outcomes import require_active_credential
+from control_plane.application.commands.agent_assignees import is_agent_reference
+from control_plane.application.commands.approval_outcomes import (
+    authority_snapshot,
+    require_active_credential,
+)
 from control_plane.application.commands.approvals import request_approval
+from control_plane.application.commands.eligibility import RequirementSpec
 from control_plane.application.commands.goals import get_readable_goal
-from control_plane.application.commands.relations import resolve_task
+from control_plane.application.commands.relations import add_relation, resolve_task
 from control_plane.application.commands.runs import request_cancel_run
 from control_plane.application.commands.skill_invocations import (
     CANCELLED_BY_SYSTEM,
@@ -84,10 +91,12 @@ from control_plane.application.event_cursor import EventPosition
 from control_plane.application.events import record_event
 from control_plane.application.queries.events import JournalEvent, fetch_events_after
 from control_plane.domain.enums import (
+    AgentStatus,
     Permission,
     RunStatus,
     SkillInvocationStatus,
     TaskPriority,
+    TaskRelationType,
 )
 from control_plane.domain.errors import (
     AuthorizationError,
@@ -107,15 +116,21 @@ from control_plane.domain.work_item import TERMINAL_CATEGORIES, WorkItemStatusCa
 from control_plane.domain.work_rules import (
     CREATING_ACTIONS,
     CUSTOM_FIELDS,
+    MAX_DEPENDENCIES,
     MAX_FOR_EACH_ITEMS,
     MAX_TEXT_FIELD_LENGTH,
     MAX_TITLE_LENGTH,
+    RELATION_DEPENDS_ON,
+    RELATION_SPAWNED_BY,
+    RELATIONS,
+    ROLE_ASSIGNEE_PREFIX,
     ROOT_GOAL,
     ROOT_ITEM,
     ROOT_PAYLOAD,
     ROOT_SKILL,
     ROOT_TASK,
     ROOT_TRIGGER,
+    WORKSPACE_FIELD,
     ActionKind,
     ConditionError,
     EvaluationStatus,
@@ -132,16 +147,20 @@ from control_plane.domain.work_rules import (
     walk,
 )
 from control_plane.infrastructure.db.models import (
+    Agent,
     Artifact,
     Event,
     EventArchive,
     EventConsumerCursor,
+    IamPrincipalBinding,
+    Principal,
     RuleEvaluation,
     RuleWorkItem,
     Run,
     Skill,
     SkillInvocation,
     Task,
+    TaskType,
     WorkRule,
 )
 
@@ -182,18 +201,38 @@ IMPLICIT_CHECK: dict[str, Any] = {
     "kind": CheckKind.EXTERNAL_STATE.value,
     "description": "The fact the rule closed the work on",
 }
+# An evaluation whose every item was refused (amendment 2026-09-27, G5).
+WORK_ITEMS_REFUSED = "work_items_refused"
+# Refusals of one forEach item: the other items go on (G5).
+TASK_TYPE_NOT_ALLOWED = "task_type_not_allowed"
+INVALID_RELATIONS = "invalid_relations"
+RELATION_TARGET_NOT_FOUND = "relation_target_not_found"
+DEPENDENCY_NOT_FOUND = "dependency_not_found"
+DEPENDENCY_REFUSED = "dependency_refused"
+DEPENDENCY_CYCLE = "dependency_cycle"
 
 
 def rule_context(
-    rule: WorkRule, *, trace_run_id: str, causation_id: str | None = None
+    rule: WorkRule,
+    *,
+    trace_run_id: str,
+    causation_id: str | None = None,
+    authority: dict[str, Any] | None = None,
 ) -> AuthContext:
-    """The authority a rule acts with: the snapshot taken when it was enabled."""
-    authority = rule.authority or {}
-    assert rule.authority_principal_id is not None
+    """The authority a rule acts with: the snapshot taken when it was enabled.
+
+    ``authority`` overrides the stored snapshot (the rule's agent, G1).
+    """
+    if authority is None:
+        authority = rule.authority or {}
+        assert rule.authority_principal_id is not None
+        principal_id = rule.authority_principal_id
+    else:
+        principal_id = uuid.UUID(str(authority["principalId"]))
     iam = authority.get("iamPrincipalId")
     return AuthContext(
         tenant_id=rule.tenant_id,
-        principal_id=rule.authority_principal_id,
+        principal_id=principal_id,
         principal_kind=str(authority.get("principalKind") or "human"),
         api_key_id=uuid.UUID(str(authority["credentialId"])),
         permissions=frozenset(authority.get("permissions") or ()),
@@ -203,6 +242,94 @@ def rule_context(
         trace_run_id=trace_run_id,
         iam_principal_id=uuid.UUID(iam) if iam else None,
     )
+
+
+async def _agent_authority(session: AsyncSession, rule: WorkRule) -> dict[str, Any]:
+    """The snapshot of the rule's agent: its principal and IAM binding, as they stand now.
+
+    Read on every evaluation, so a new revision of the agent (its binding
+    brought to it in place) changes what the rule may do from the next one.
+    An agent that is gone, retired or not linked yet has no authority to
+    lend: ``credential_inactive``, as for a revoked key of an enabler.
+    """
+    assert rule.identity_agent_key is not None
+    return await agent_authority(session, rule.tenant_id, rule.identity_agent_key)
+
+
+async def agent_authority(
+    session: AsyncSession, tenant_id: uuid.UUID, key: str, *, acting: str = "the rule"
+) -> dict[str, Any]:
+    """The authority snapshot of agent ``key``: its principal and IAM binding now.
+
+    Shared by rules and processes (CP-ADR-0074 §14): whatever acts as an
+    agent acts with the binding as it stands at the moment it acts.
+    """
+    agent = await session.scalar(
+        select(Agent).where(Agent.tenant_id == tenant_id, Agent.key == key)
+    )
+    binding = None
+    principal = None
+    if agent is not None and agent.status == AgentStatus.ACTIVE and agent.principal_id:
+        binding = await session.scalar(
+            select(IamPrincipalBinding).where(
+                IamPrincipalBinding.principal_id == agent.principal_id,
+                IamPrincipalBinding.issuer == agent.iam_issuer,
+                IamPrincipalBinding.iam_principal_id == agent.iam_principal_id,
+            )
+        )
+        principal = await session.get(Principal, agent.principal_id)
+    if agent is None or binding is None or principal is None:
+        raise AuthorizationError(
+            f"The agent {key!r} {acting} acts as has no active identity",
+            code="credential_inactive",
+            details={"agent": key},
+        )
+    return {
+        "principalId": str(principal.id),
+        "principalKind": principal.kind,
+        "credentialId": str(binding.id),
+        "permissions": sorted(binding.permissions or ()),
+        "iamPrincipalId": str(binding.iam_principal_id),
+    }
+
+
+@dataclass
+class _Acting:
+    """Whose authority an evaluation runs with, or why it cannot run.
+
+    ``refusal`` is set when the rule's agent has no identity to act with; the
+    context is then the enabler's, only to record the failed evaluation.
+    """
+
+    ctx: AuthContext
+    refusal: DomainError | None = None
+
+    async def require_standing(self, session: AsyncSession) -> None:
+        if self.refusal is not None:
+            raise self.refusal
+        await require_active_credential(
+            session,
+            authority=authority_snapshot(self.ctx),
+            principal_id=self.ctx.principal_id,
+            subject="the rule acts with",
+        )
+
+
+async def _acting(
+    session: AsyncSession, rule: WorkRule, *, trace_run_id: str, causation_id: str | None
+) -> _Acting:
+    if rule.identity_agent_key is not None:
+        try:
+            authority = await _agent_authority(session, rule)
+        except AuthorizationError as exc:
+            ctx = rule_context(rule, trace_run_id=trace_run_id, causation_id=causation_id)
+            return _Acting(ctx, exc)
+        return _Acting(
+            rule_context(
+                rule, trace_run_id=trace_run_id, causation_id=causation_id, authority=authority
+            )
+        )
+    return _Acting(rule_context(rule, trace_run_id=trace_run_id, causation_id=causation_id))
 
 
 # --- facts ----------------------------------------------------------------------
@@ -277,10 +404,17 @@ def _schedule_facts(rule: WorkRule, trigger_ref: str, scheduled_at: datetime) ->
     return Facts(trigger=trigger, payload={}, evidence=[])
 
 
-def _task_view(task: Task, verification: dict[str, Any] | None = None) -> dict[str, Any]:
+def _task_view(
+    task: Task,
+    verification: dict[str, Any] | None = None,
+    task_type: TaskType | None = None,
+) -> dict[str, Any]:
     return {
         "id": str(task.id),
         "publicId": task.public_id,
+        # The type the task carries, as in TaskOut (amendment 2026-09-27, G4).
+        "typeKey": task_type.key if task_type is not None else None,
+        "typeVersion": task_type.version if task_type is not None else None,
         "title": task.title,
         "status": task.status,
         "systemStatusCategory": task.system_status_category,
@@ -322,6 +456,7 @@ async def _load_views(
         facts.task = _task_view(
             task,
             {"status": attempt.status, "attempt": attempt.attempt} if attempt else None,
+            await session.get(TaskType, task.type_id),
         )
     facts.views.update({ROOT_GOAL, ROOT_TASK})
 
@@ -354,7 +489,7 @@ async def _finish(
     work = [
         {
             k: w[k]
-            for k in ("dedupKey", "taskId", "created", "skipped", "failed", "reason")
+            for k in ("dedupKey", "taskId", "created", "skipped", "failed", "reason", "refused")
             if k in w
         }
         for w in (row.result or {}).get("work", [])
@@ -431,6 +566,29 @@ def _custom_fields(fields: dict[str, Any]) -> dict[str, Any] | None:
     rendered = fields.get(CUSTOM_FIELDS) or {}
     kept = {name: value for name, value in rendered.items() if value is not None and value != ""}
     return kept or None
+
+
+def _assignment(fields: dict[str, Any]) -> tuple[uuid.UUID | str | None, RequirementSpec | None]:
+    """``fields.assignee`` as ``create_task`` takes it: an id, an agent, or a role.
+
+    ``role:<slug>`` leaves the work unassigned and requires the role, which
+    is looked up in the workspace of the work and its ancestors: any holder
+    may take it, as with a role in a process's assignment chain.
+    """
+    value = fields.get("assignee")
+    if isinstance(value, str) and value.startswith(ROLE_ASSIGNEE_PREFIX):
+        slug = value.removeprefix(ROLE_ASSIGNEE_PREFIX).strip()
+        if not slug:
+            raise ValidationError(
+                "invalid_rule_field",
+                "action.fields.assignee rendered to a role without a slug",
+                details={"field": "action.fields.assignee"},
+            )
+        return None, RequirementSpec(roles=[slug])
+    # An id, or an agent of the registry by key (CP-ADR-0073, A1).
+    if is_agent_reference(value):
+        return str(value), None
+    return _uuid_field(fields, "assignee"), None
 
 
 async def _lock_keys(session: AsyncSession, ctx: AuthContext, dedup_keys: set[str]) -> None:
@@ -513,7 +671,7 @@ async def _work_event(
     )
 
 
-@dataclass(frozen=True)
+@dataclass
 class _Planned:
     """The action for one item, its templates filled."""
 
@@ -523,6 +681,36 @@ class _Planned:
     acceptance: Any = None
     # The check ``complete_work`` ties its evidence to.
     check: str | None = None
+    # The task type a creating action files the work as.
+    task_type: str | None = None
+    # ``fields.relations`` rendered: a task ref, dedup keys (G3).
+    spawned_by: str | None = None
+    depends_on: list[str] = field(default_factory=list)
+    # Where each ``dependsOn`` key resolved: this evaluation's item, or a task.
+    dependency_items: list[int] = field(default_factory=list)
+    dependency_tasks: list[uuid.UUID] = field(default_factory=list)
+    spawned_by_task: uuid.UUID | None = None
+    # ``(code, detail)`` of a refusal of this item alone (G5).
+    refused: tuple[str, str] | None = None
+
+
+def _dependency_keys(value: Any) -> list[str] | None:
+    """Rendered ``dependsOn``: a flat list of keys; ``None`` if it is not one.
+
+    Each template may render to a key or to a list of keys (an exact
+    placeholder keeps a list); nothing (null, "", []) means no dependency.
+    """
+    keys: list[str] = []
+    for entry in value if isinstance(value, list) else [value]:
+        for key in entry if isinstance(entry, list) else [entry]:
+            if key is None or key == "":
+                continue
+            if not isinstance(key, str):
+                return None
+            normalized = key.strip()
+            if normalized and normalized not in keys:
+                keys.append(normalized)
+    return keys if len(keys) <= MAX_DEPENDENCIES else None
 
 
 def _render_item(rule: WorkRule, facts: Facts, item: Any) -> _Planned:
@@ -549,12 +737,158 @@ def _render_item(rule: WorkRule, facts: Facts, item: Any) -> _Planned:
                 f"action.check rendered to {check[:100]!r}, which is not a check key",
                 details={"field": "action.check"},
             )
-    return _Planned(
-        dedup_key=dedup_key,
-        fields=render(action.get("fields") or {}, resolve, roots=roots),
-        acceptance=acceptance,
-        check=check,
-    )
+    fields = render(action.get("fields") or {}, resolve, roots=roots)
+    planned = _Planned(dedup_key=dedup_key, fields=fields, acceptance=acceptance, check=check)
+    if action["kind"] in CREATING_ACTIONS:
+        task_type = render(action["taskType"], resolve, roots=roots)
+        planned.task_type = task_type if isinstance(task_type, str) else None
+        allowed = action.get("taskTypes")
+        if allowed is not None and planned.task_type not in allowed:
+            planned.refused = (
+                TASK_TYPE_NOT_ALLOWED,
+                f"action.taskType rendered to {str(task_type)[:100]!r}, not one of {allowed}",
+            )
+    relations = fields.pop(RELATIONS, None)
+    if relations is not None and planned.refused is None:
+        spawned_by = relations.get(RELATION_SPAWNED_BY)
+        if spawned_by is not None and spawned_by != "":
+            if isinstance(spawned_by, str | int | float) and not isinstance(spawned_by, bool):
+                planned.spawned_by = str(spawned_by)
+            else:
+                planned.refused = (INVALID_RELATIONS, "relations.spawnedBy is not a task id")
+        keys = _dependency_keys(relations.get(RELATION_DEPENDS_ON))
+        if keys is None:
+            planned.refused = planned.refused or (
+                INVALID_RELATIONS,
+                f"relations.dependsOn must render to at most {MAX_DEPENDENCIES} dedup keys",
+            )
+        else:
+            planned.depends_on = keys
+    return planned
+
+
+async def _resolve_relations(
+    session: AsyncSession, ctx: AuthContext, planned: list[_Planned]
+) -> None:
+    """Resolve ``spawnedBy`` and ``dependsOn`` of every item, refusing what cannot be (G3, G5).
+
+    A key names an item of this evaluation first, then the newest work any
+    rule of the tenant filed under it (closed work too: a dependency that is
+    done just does not hold the work). An item depending on a refused item
+    is refused; items that depend on each other in a circle are all refused.
+    """
+    by_key: dict[str, int] = {}
+    for index, item in enumerate(planned):
+        by_key.setdefault(item.dedup_key, index)
+    for item in planned:
+        if item.refused is not None:
+            continue
+        if item.spawned_by is not None:
+            try:
+                target = await resolve_task(session, ctx, item.spawned_by)
+                await authorize(
+                    ctx, Permission.TASKS_READ, resource=ResourceRef("task", str(target.id))
+                )
+            except (NotFoundError, AuthorizationError):
+                item.refused = (
+                    RELATION_TARGET_NOT_FOUND,
+                    f"relations.spawnedBy {item.spawned_by[:100]!r} names no visible task",
+                )
+                continue
+            item.spawned_by_task = target.id
+        for key in item.depends_on:
+            if key in by_key:
+                item.dependency_items.append(by_key[key])
+                continue
+            task_id = await session.scalar(
+                select(RuleWorkItem.task_id)
+                .where(RuleWorkItem.tenant_id == ctx.tenant_id, RuleWorkItem.dedup_key == key)
+                .order_by(RuleWorkItem.created_at.desc(), RuleWorkItem.id.desc())
+                .limit(1)
+            )
+            visible = task_id is not None
+            if visible:
+                try:
+                    await authorize(
+                        ctx, Permission.TASKS_READ, resource=ResourceRef("task", str(task_id))
+                    )
+                except AuthorizationError:
+                    visible = False
+            if not visible:
+                item.refused = (DEPENDENCY_NOT_FOUND, f"no work is known by the key {key[:100]!r}")
+                break
+            assert task_id is not None
+            item.dependency_tasks.append(task_id)
+
+    # Items on a cycle among this evaluation's items (a self-reference too).
+    for index in _on_cycles([item.dependency_items for item in planned]):
+        if planned[index].refused is None:
+            planned[index].refused = (
+                DEPENDENCY_CYCLE,
+                "the items of this evaluation depend on each other in a circle",
+            )
+    changed = True
+    while changed:
+        changed = False
+        for item in planned:
+            if item.refused is not None:
+                continue
+            refused = [i for i in item.dependency_items if planned[i].refused is not None]
+            if refused:
+                item.refused = (
+                    DEPENDENCY_REFUSED,
+                    f"depends on {planned[refused[0]].dedup_key[:100]!r}, which was refused",
+                )
+                changed = True
+
+
+def _on_cycles(edges: list[list[int]]) -> set[int]:
+    """Nodes of a directed graph (adjacency lists) that lie on a cycle."""
+    on_cycle: set[int] = set()
+    for start in range(len(edges)):
+        # Reachable from start's successors; start is on a cycle iff it is reachable.
+        seen: set[int] = set()
+        stack = list(edges[start])
+        while stack:
+            node = stack.pop()
+            if node == start:
+                on_cycle.add(start)
+                break
+            if node in seen:
+                continue
+            seen.add(node)
+            stack.extend(edges[node])
+    return on_cycle
+
+
+async def _link_filed(
+    session: AsyncSession, ctx: AuthContext, planned: list[_Planned], work: list[dict[str, Any]]
+) -> None:
+    """Relations of the work this evaluation filed, once all of it exists (G3).
+
+    Work found by its key gets none: ``ensure``, not upsert, so evaluating
+    the same document again adds neither work nor relations.
+    """
+    for item, outcome in zip(planned, work, strict=True):
+        if not outcome.get("created"):
+            continue
+        task_ref = outcome["taskId"]
+        targets: list[tuple[str, str]] = []
+        if item.spawned_by_task is not None:
+            targets.append((str(item.spawned_by_task), TaskRelationType.SPAWNED_BY.value))
+        depends = [work[i]["taskId"] for i in item.dependency_items]
+        depends += [str(task_id) for task_id in item.dependency_tasks]
+        for target in dict.fromkeys(depends):
+            if target != task_ref:
+                targets.append((target, TaskRelationType.DEPENDS_ON.value))
+        for target, relation_type in targets:
+            await add_relation(
+                session,
+                ctx,
+                from_task_ref=task_ref,
+                to_task_ref=target,
+                relation_type=relation_type,
+            )
 
 
 async def _apply(
@@ -580,27 +914,42 @@ async def _apply(
                 "created": False,
             }
         title = _text_field(fields, "title", MAX_TITLE_LENGTH) or ""
-        task = await create_task(
-            session,
-            ctx,
-            title=title,
-            description=_text_field(fields, "description", MAX_TEXT_FIELD_LENGTH) or "",
-            priority=_text_field(fields, "priority", 32) or TaskPriority.MEDIUM,
-            type_key=action["taskType"],
-            assignee_id=_uuid_field(fields, "assignee"),
-            workspace_id=rule.workspace_id,
-            # Checked against the fieldSchema of the type here: a misfit fails
-            # the evaluation with custom_fields_invalid, and no work is filed.
-            custom_fields=_custom_fields(fields),
-            goal_id=rule.goal_id,
-            origin={
-                "kind": "rule",
-                "ruleId": str(rule.id),
-                "ref": f"rule_evaluation:{row.id}",
-                "evidence": list(row.evidence or []),
-            },
-            acceptance=planned.acceptance,
-        )
+        assignee, requirements = _assignment(fields)
+        try:
+            task = await create_task(
+                session,
+                ctx,
+                title=title,
+                description=_text_field(fields, "description", MAX_TEXT_FIELD_LENGTH) or "",
+                priority=_text_field(fields, "priority", 32) or TaskPriority.MEDIUM,
+                type_key=planned.task_type,
+                assignee_id=assignee,
+                assignee_field="action.fields.assignee",
+                # The work's own workspace (a template), else the rule's; the
+                # rule's identity is authorized to file work there, as anyone's.
+                workspace_id=_uuid_field(fields, WORKSPACE_FIELD) or rule.workspace_id,
+                # Checked against the fieldSchema of the type here: a misfit fails
+                # the evaluation with custom_fields_invalid, and no work is filed.
+                custom_fields=_custom_fields(fields),
+                requirements=requirements,
+                goal_id=rule.goal_id,
+                origin={
+                    "kind": "rule",
+                    "ruleId": str(rule.id),
+                    "ref": f"rule_evaluation:{row.id}",
+                    "evidence": list(row.evidence or []),
+                },
+                acceptance=planned.acceptance,
+            )
+        except ValidationError as exc:
+            if requirements is None or exc.code != "unknown_requirement":
+                raise
+            raise ValidationError(
+                "unknown_role",
+                f"action.fields.assignee: no role {requirements.roles[0]!r}"
+                " in the workspace of the work or above it",
+                details={"field": "action.fields.assignee", "role": requirements.roles[0][:100]},
+            ) from exc
         session.add(
             RuleWorkItem(
                 id=new_uuid(),
@@ -941,8 +1290,18 @@ async def _act(
         return EvaluationStatus.NOT_MATCHED, {**selection, "work": []}
     planned = [_render_item(rule, facts, entry) for entry in items]
     await _lock_keys(session, ctx, {item.dedup_key for item in planned})
-    work = [await _apply(session, ctx, rule, row, item) for item in planned]
+    if action["kind"] == ActionKind.ENSURE_WORK:
+        await _resolve_relations(session, ctx, planned)
+    work = [
+        await _apply(session, ctx, rule, row, item)
+        if item.refused is None
+        else {"dedupKey": item.dedup_key, "refused": item.refused[0], "detail": item.refused[1]}
+        for item in planned
+    ]
+    await _link_filed(session, ctx, planned, work)
     row.created_task_ids = [w["taskId"] for w in work if w.get("created")]
+    if all(w.get("refused") for w in work):
+        return EvaluationStatus.FAILED, {**selection, "work": work}
     if any(w.get("waiting") for w in work):
         # A closing decision on work under a live claim (amendment A4).
         return EvaluationStatus.WAITING, {
@@ -1004,6 +1363,23 @@ async def _run_action(
         return
     if status == EvaluationStatus.WAITING:
         _keep_waiting(row, result, check_seconds)
+        return
+    if status == EvaluationStatus.FAILED:
+        # Every item was refused on its own (G5); nothing was written.
+        refused = [w["refused"] for w in result["work"]]
+        await _finish(
+            session,
+            ctx,
+            rule,
+            row,
+            status,
+            result=result,
+            error={
+                "code": WORK_ITEMS_REFUSED,
+                "message": f"all {len(refused)} items were refused",
+                "details": {"refused": sorted(set(refused))},
+            },
+        )
         return
     await _finish(session, ctx, rule, row, status, result=result)
 
@@ -1072,18 +1448,15 @@ async def evaluate_trigger(
     )
     if row is None:
         return None
-    ctx = rule_context(
+    acting = await _acting(
+        session,
         rule,
         trace_run_id=trace_run_id,
         causation_id=str(trigger_event_id) if trigger_event_id else None,
     )
+    ctx = acting.ctx
     try:
-        await require_active_credential(
-            session,
-            authority=rule.authority or {},
-            principal_id=ctx.principal_id,
-            subject="the rule was enabled with",
-        )
+        await acting.require_standing(session)
         await authorize(ctx, Permission.EVENTS_READ, resource=rule_scope(rule.workspace_id))
         await _load_views(session, ctx, rule, facts)
         matched = evaluate(
@@ -1164,14 +1537,15 @@ async def record_internal_failure(
     )
     if row is None:
         return None
-    ctx = rule_context(
+    acting = await _acting(
+        session,
         rule,
         trace_run_id=trace_run_id,
         causation_id=str(trigger_event_id) if trigger_event_id else None,
     )
     await _finish(
         session,
-        ctx,
+        acting.ctx,
         rule,
         row,
         EvaluationStatus.FAILED,
@@ -1311,11 +1685,13 @@ async def resume_evaluation(
         if row.skill_invocation_id is not None
         else None
     )
-    ctx = rule_context(
+    acting = await _acting(
+        session,
         rule,
         trace_run_id=trace_run_id,
         causation_id=str(row.trigger_event_id) if row.trigger_event_id else None,
     )
+    ctx = acting.ctx
 
     # What decided to ask is gone: the answer would be applied by a rule
     # nobody wrote (a new version) or nobody runs (disabled, archived).
@@ -1346,7 +1722,7 @@ async def resume_evaluation(
     if (row.result or {}).get("waitingFor") == WAITING_FOR_CLAIM:
         return await _resume_claimed(
             session,
-            ctx,
+            acting,
             rule,
             row,
             claim_wait_seconds=claim_wait_seconds,
@@ -1375,12 +1751,7 @@ async def resume_evaluation(
         },
     }
     try:
-        await require_active_credential(
-            session,
-            authority=rule.authority or {},
-            principal_id=ctx.principal_id,
-            subject="the rule was enabled with",
-        )
+        await acting.require_standing(session)
     except DependencyUnavailableError:
         raise
     except DomainError as exc:
@@ -1444,7 +1815,7 @@ async def resume_evaluation(
 
 async def _resume_claimed(
     session: AsyncSession,
-    ctx: AuthContext,
+    acting: _Acting,
     rule: WorkRule,
     row: RuleEvaluation,
     *,
@@ -1460,13 +1831,9 @@ async def _resume_claimed(
     is left as it is (``already_closed``). A claim that outlives
     ``claim_wait_seconds`` fails the decision (``claim_not_released``).
     """
+    ctx = acting.ctx
     try:
-        await require_active_credential(
-            session,
-            authority=rule.authority or {},
-            principal_id=ctx.principal_id,
-            subject="the rule was enabled with",
-        )
+        await acting.require_standing(session)
     except DependencyUnavailableError:
         raise
     except DomainError as exc:

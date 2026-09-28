@@ -3,11 +3,10 @@
 A principal bound to an agent reads its description with ``GET /agents/me``
 and works by the current revision: which work it takes, which executor with
 which parameters and instructions, which working copy with which neighbours,
-whether its work goes to review, which skills it runs itself, how long a run
-may take to drain. Environment variables keep what belongs to the host and
-not to the agent — paths, binaries, local logs, the credential — and, for a
-principal that is no agent, the whole configuration as before (the env mode
-of local debugging).
+which skills it runs itself, how long a run may take to drain. Environment
+variables keep what belongs to the host and not to the agent — paths,
+binaries, local logs, the credential — and, for a principal that is no agent,
+the whole configuration as before (the env mode of local debugging).
 
 The revision is fixed for the life of the process. Between runs the daemon
 reads ``/agents/me`` again; a newer revision ends the process with
@@ -31,12 +30,6 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
 
-from control_plane_agent.review import (
-    DEFAULT_REVIEW_TYPE,
-    DEFAULT_REVIEWED_TYPES,
-    REVIEW_MODES,
-    ReviewPolicy,
-)
 from control_plane_agent.skills import (
     ENV_AUDIENCES,
     ENV_CONCURRENCY,
@@ -178,8 +171,6 @@ class RevisionSettings:
     include_subprojects: bool = False
     only_assigned: bool = True
     task_types: frozenset[str] = field(default_factory=frozenset)
-    review_policy: ReviewPolicy | None = None
-    review_type: str = DEFAULT_REVIEW_TYPE
     drain_seconds: float | None = DEFAULT_DRAIN_SECONDS
 
     def agent_kwargs(self) -> dict[str, Any]:
@@ -189,20 +180,24 @@ class RevisionSettings:
             "include_subprojects": self.include_subprojects,
             "only_assigned": self.only_assigned,
             "task_types": self.task_types,
-            "review_policy": self.review_policy,
-            "review_type": self.review_type,
             "drain_seconds": self.drain_seconds,
         }
 
 
 def settings_of(revision: AgentRevision) -> RevisionSettings:
-    """``work``, ``workingCopy.review`` and ``placement.drainSeconds`` of a revision.
+    """``work`` and ``placement.drainSeconds`` of a revision.
 
     Defaults are the schema's, not the env mode's: ``onlyAssigned`` is true
     unless the spec says otherwise — an agent takes only work meant for it.
+    ``workingCopy.review`` is read by nobody: review is an acceptance check
+    of the task type now (CP-ADR-0073, amendment A2), and a revision that
+    still carries the section is run without it.
     """
     work = revision.section("work")
-    policy, review_type = review_policy_of(revision)
+    if revision.section("workingCopy").get("review") is not None:
+        logger.warning(
+            "%s: workingCopy.review is ignored; the task type declares review", revision.label
+        )
     project = work.get("project")
     return RevisionSettings(
         workspace_id=revision.workspace_id,
@@ -210,8 +205,6 @@ def settings_of(revision: AgentRevision) -> RevisionSettings:
         include_subprojects=bool(work.get("includeSubprojects", False)),
         only_assigned=bool(work.get("onlyAssigned", True)),
         task_types=frozenset(str(t) for t in work.get("taskTypes") or []),
-        review_policy=policy,
-        review_type=review_type,
         drain_seconds=drain_seconds_of(revision),
     )
 
@@ -228,38 +221,6 @@ def drain_seconds_of(revision: AgentRevision) -> float | None:
     if not isinstance(placement, Mapping):
         return float(DEFAULT_DRAIN_SECONDS)
     return float(placement.get("drainSeconds", DEFAULT_DRAIN_SECONDS))
-
-
-def review_policy_of(revision: AgentRevision) -> tuple[ReviewPolicy | None, str]:
-    """The auto-review policy (``review.py``) and the review type this agent recognises.
-
-    No ``review`` or ``mode: none`` — no review requested. A mode that needs a
-    reviewer without one is a :class:`RevisionError`: the env mode would have
-    silently skipped review, and a revision is explicit about wanting it.
-    """
-    review = revision.section("workingCopy").get("review")
-    if not isinstance(review, Mapping):
-        return None, DEFAULT_REVIEW_TYPE
-    review_type = str(review.get("taskType") or DEFAULT_REVIEW_TYPE)
-    mode = str(review.get("mode") or "agent")
-    if mode == "none":
-        return None, review_type
-    if mode not in REVIEW_MODES:
-        raise RevisionError(f"workingCopy.review.mode {mode!r} is not one of human, agent, none")
-    reviewer = str(review.get("reviewer") or "").strip()
-    if not reviewer:
-        raise RevisionError(f"workingCopy.review.mode {mode} needs a reviewer")
-    types = frozenset(str(t) for t in review.get("taskTypes") or DEFAULT_REVIEWED_TYPES)
-    return (
-        ReviewPolicy(
-            reviewer_principal_id=reviewer,
-            reviewed_types=types,
-            review_type=review_type,
-            base_branch=str(review.get("base") or "main"),
-            mode=mode,
-        ),
-        review_type,
-    )
 
 
 # -- skills ----------------------------------------------------------------------
@@ -421,7 +382,6 @@ __all__ = [
     "drain_seconds_of",
     "mirror",
     "my_agent",
-    "review_policy_of",
     "settings_of",
     "skills_environ",
     "skills_of",

@@ -1,0 +1,70 @@
+# A small valid process: the base of the negative fixtures in invalid/ (P006).
+# Each of them changes one thing and says, in its "# expect:" lines, which
+# finding (code and JSON pointer) the check has to give.
+apiVersion: taimen.ai/v1
+kind: Process
+key: sample
+spec:
+  version: 1
+  displayName: Sample
+  identity: {agent: sample-process}
+  owner: [{role: lead}]
+  calendar: ru
+  governedBy: [{document: "regulation:sample"}]
+  data:
+    type: object
+    properties:
+      number: {type: string}
+      amount: {type: number}
+      decision: {type: string}
+      level: {type: integer}
+      deadline: {type: string, format: date-time}
+      history: {type: array}
+      summary: {type: string}
+  start:
+    on: {observation: sample.opened}
+    key: event.payload.number
+    set:
+      number: string(event.payload.number)
+      amount: double(event.payload.amount)
+      deadline: timestamp(event.payload.deadline)
+  memory:
+    case: {key: "'sample:' + data.number"}
+    facts: {decision: data.decision}
+  decisions:
+    - id: level
+      hitPolicy: first
+      inputs: [{id: amount, expr: data.amount, type: number}]
+      outputs: [{id: level, type: number}]
+      rules:
+        - {when: {amount: "[0..1000)"}, then: {level: 1}}
+        - {when: {amount: "-"}, then: {level: 2}}
+  stages:
+    - id: review
+      steps:
+        - id: history
+          recall:
+            anchors: [{case: true}]
+            timeout: PT1M
+          output: {as: {history: step.result.nodes}}
+        - id: choose-level
+          decide: {table: level}
+          output: {as: {level: int(step.result.level)}}
+        - id: decide
+          human:
+            taskType: review
+            assign: [{role: lead}]
+            due: {at: "cal.addWorkdays(data.deadline, -2)"}
+            context: {anchors: [{case: true}]}
+          output: {as: {decision: step.result.decision}}
+      exit: data.decision != ''
+    - id: report
+      entry: stage.review.completed
+      steps:
+        - id: summarize
+          call:
+            skill: text.summarize@1
+            input: {text: "data.number + ': ' + data.decision"}
+          output: {as: {summary: step.result.summary}}
+        - id: done
+          complete: {outcome: done}

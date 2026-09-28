@@ -30,8 +30,8 @@ V08_TYPES = "c8a51d70b394"
 # Second revision of the v0.8 line: custom fields and planned dates (ADR-0049).
 V08_FIELDS = "a1c7e94b2f60"
 # The current head of the chain the v0.8 tests upgrade back to (the last
-# revision adds the agent registry, CP-ADR-0073).
-V08_HEAD = "439255fb8627"
+# revision records what package applies wrote, CP-ADR-0074 §11).
+V08_HEAD = "d7f2a9c4e1b8"
 # The revision right before the agent registry.
 BEFORE_AGENT_REGISTRY = "c3f8a2d6e1b7"
 # The revision right before attention feedback (CP-ADR-0068 approval workspaces).
@@ -311,6 +311,60 @@ async def test_agent_registry_revision_is_additive_and_reversible(
     response = await client.get(f"/api/v1/tasks/{task['id']}", headers=auth(admin_key))
     assert response.status_code == 200
     assert (await client.get("/api/v1/agents", headers=auth(admin_key))).status_code == 200
+
+
+# Separation of duties on an approval (CP-ADR-0074 §7) and the revision right
+# before it.
+BEFORE_EXCLUDED_PRINCIPALS = "b8e3f1c6d2a9"
+
+
+async def test_excluded_principals_revision_is_additive_and_reversible(
+    client: httpx.AsyncClient, sync_engine: Engine, v08_alembic_config: Config
+) -> None:
+    admin_key = (await do_bootstrap(client))["apiKey"]["key"]
+    decider, _ = await create_agent_with_key(client, admin_key, name="decider")
+    task = await create_task(client, admin_key, title="Kept")
+    created = await client.post(
+        "/api/v1/approvals",
+        json={"task": task["id"], "assignedPrincipalId": decider["id"]},
+        headers=auth(admin_key),
+    )
+    assert created.status_code == 201, created.text
+
+    alembic_command.downgrade(v08_alembic_config, BEFORE_EXCLUDED_PRINCIPALS)
+    columns = {c["name"] for c in inspect(sync_engine).get_columns("approvals")}
+    assert "excluded_principals" not in columns
+    alembic_command.upgrade(v08_alembic_config, V08_HEAD)
+
+    # An approval from before the revision excludes nobody.
+    read = await client.get(f"/api/v1/approvals/{created.json()['id']}", headers=auth(admin_key))
+    assert read.status_code == 200, read.text
+    assert read.json()["excludedPrincipals"] == []
+
+
+# The recall queue and the step context profile (CP-ADR-0076 §4, §6) and the
+# revision right before them.
+BEFORE_PROCESS_RECALLS = "e3b7c1d9a4f2"
+
+
+async def test_process_recalls_revision_is_additive_and_reversible(
+    client: httpx.AsyncClient, sync_engine: Engine, v08_alembic_config: Config
+) -> None:
+    admin_key = (await do_bootstrap(client))["apiKey"]["key"]
+    task = await create_task(client, admin_key, title="Kept")
+
+    alembic_command.downgrade(v08_alembic_config, BEFORE_PROCESS_RECALLS)
+    assert "process_recalls" not in inspect(sync_engine).get_table_names()
+    columns = {c["name"] for c in inspect(sync_engine).get_columns("tasks")}
+    assert "context_profile" not in columns
+    alembic_command.upgrade(v08_alembic_config, V08_HEAD)
+
+    # A task from before the revision keeps the profile of its type.
+    with sync_engine.connect() as connection:
+        profile = connection.execute(
+            text("SELECT context_profile FROM tasks WHERE id = :id"), {"id": task["id"]}
+        ).scalar_one()
+    assert profile is None
 
 
 async def test_head_matches_code(sync_engine: Engine) -> None:

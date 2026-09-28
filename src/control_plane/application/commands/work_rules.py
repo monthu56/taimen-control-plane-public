@@ -9,6 +9,13 @@ Every document is validated by ``domain/work_rules.py`` on write; the names a
 rule refers to (a task type key, a pinned skill) must exist when it is
 written, and a skill with ``external_write`` side effects is refused: a rule
 has no approval to cite as the basis of an external action (ADR-0056 §4).
+
+A rule may instead act as an agent of the registry (``identity: {agent}``,
+CP-ADR-0063 amendment 2026-09-27, G1): it is then evaluated with the
+authority of that agent's principal. Whoever writes such a rule must hold
+every permission the agent's current revision declares — the check a
+revision itself passes (CP-ADR-0073 §5) — or ``rules.write`` would lend the
+rights of any agent.
 """
 
 import uuid
@@ -19,11 +26,13 @@ from sqlalchemy import func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from control_plane.application.authorization import AuthContext, ResourceRef, authorize
+from control_plane.application.commands.agents import revision_of
 from control_plane.application.commands.approval_outcomes import authority_snapshot
 from control_plane.application.commands.goals import require_linkable_goal
+from control_plane.application.commands.iam_bindings import validate_binding_permissions
 from control_plane.application.common import new_uuid, utcnow
 from control_plane.application.events import record_event
-from control_plane.domain.enums import Permission, SkillSideEffects
+from control_plane.domain.enums import AgentStatus, Permission, SkillSideEffects
 from control_plane.domain.errors import ConflictError, NotFoundError, ValidationError
 from control_plane.domain.work_rules import (
     RuleSpec,
@@ -33,7 +42,7 @@ from control_plane.domain.work_rules import (
     normalize_rule_key,
     normalize_rule_spec,
 )
-from control_plane.infrastructure.db.models import Skill, TaskType, WorkRule
+from control_plane.infrastructure.db.models import Agent, Skill, TaskType, WorkRule
 
 _UNSET: Any = object()
 
@@ -66,6 +75,11 @@ async def ensure_rule_cursor(session: AsyncSession, tenant_id: uuid.UUID) -> Non
     never looks at the past it was not enabled for (``enabled_at``), so
     replaying the tenant's history would only be work that matches nothing.
     """
+    await ensure_consumer_cursor(session, tenant_id, RULES_CONSUMER)
+
+
+async def ensure_consumer_cursor(session: AsyncSession, tenant_id: uuid.UUID, name: str) -> None:
+    """A journal cursor ``name`` of the tenant, created at the present (see above)."""
     await session.execute(
         text(
             """
@@ -87,14 +101,34 @@ async def ensure_rule_cursor(session: AsyncSession, tenant_id: uuid.UUID) -> Non
             ON CONFLICT (name, tenant_id) DO NOTHING
             """
         ),
-        {"name": RULES_CONSUMER, "tenant": tenant_id},
+        {"name": name, "tenant": tenant_id},
     )
 
 
 async def _check_references(session: AsyncSession, ctx: AuthContext, spec: RuleSpec) -> None:
-    """The task type and the skill a rule names exist now (typos fail early)."""
+    """The task types and the skill a rule names exist now (typos fail early)."""
+    allowed = spec.action.get("taskTypes")
+    if allowed is not None:
+        active = set(
+            (
+                await session.scalars(
+                    select(TaskType.key).where(
+                        TaskType.tenant_id == ctx.tenant_id,
+                        TaskType.key.in_(allowed),
+                        TaskType.status == "active",
+                    )
+                )
+            ).all()
+        )
+        for index, key in enumerate(allowed):
+            if key not in active:
+                raise ValidationError(
+                    "unknown_task_type",
+                    f"Task type {key!r} has no active version",
+                    details={"field": f"action.taskTypes[{index}]", "taskType": key},
+                )
     type_key = spec.action.get("taskType")
-    if type_key is not None:
+    if type_key is not None and allowed is None:
         found = await session.scalar(
             select(func.count())
             .select_from(TaskType)
@@ -127,6 +161,56 @@ async def _check_references(session: AsyncSession, ctx: AuthContext, spec: RuleS
                 "(it has no approval to cite as the basis)",
                 details={"field": "interpretation.skill", "skill": ref},
             )
+
+
+async def check_identity(
+    session: AsyncSession, ctx: AuthContext, agent_key: str, *, invalid_code: str = "invalid_rule"
+) -> None:
+    """The agent a rule (or a process) is to act as exists, and the writer may lend its rights.
+
+    Whether the agent is linked (has a principal yet) is not asked: a package
+    applies the agent and its rules together, and the placement service links
+    the identity later (CP-ADR-0073 §6). Until then the rule's evaluations
+    fail ``credential_inactive``.
+    """
+    agent = await session.scalar(
+        select(Agent).where(Agent.tenant_id == ctx.tenant_id, Agent.key == agent_key)
+    )
+    if agent is None or agent.status != AgentStatus.ACTIVE:
+        raise ValidationError(
+            "unknown_agent",
+            f"No active agent {agent_key!r} in the registry",
+            details={"field": "identity.agent", "agent": agent_key},
+        )
+    revision = await revision_of(session, agent, agent.current_revision)
+    assert revision is not None
+    identity = revision.spec.get("identity") or {}
+    kind = identity.get("kind", "agent")
+    if kind not in ("agent", "service"):
+        raise ValidationError(
+            invalid_code,
+            f"A rule or a process acts as an agent or a service; {agent_key!r} is {kind!r}",
+            details={"field": "identity.agent", "agent": agent_key, "kind": kind},
+        )
+    validate_binding_permissions(
+        ctx, permissions=list(identity.get("permissions") or ()), principal_kind=kind
+    )
+
+
+def _identity_key(identity: Any) -> str | None:
+    """``{agent: key}`` (or ``None``) as the stored key; the API has checked its form."""
+    if identity is None:
+        return None
+    if not isinstance(identity, dict) or set(identity) != {"agent"}:
+        raise ValidationError(
+            "invalid_rule", "identity must be {agent: <key>}", details={"field": "identity"}
+        )
+    key = identity["agent"]
+    if not isinstance(key, str) or not key:
+        raise ValidationError(
+            "invalid_rule", "identity.agent must be an agent key", details={"field": "identity"}
+        )
+    return key
 
 
 def _validate_status(status: Any) -> str:
@@ -220,6 +304,7 @@ async def create_rule(
     workspace_id: uuid.UUID | None = None,
     goal_id: uuid.UUID | None = None,
     status: str = RuleStatus.ENABLED,
+    identity: dict[str, Any] | None = None,
 ) -> WorkRule:
     from control_plane.application.commands.workspaces import require_active_workspace
 
@@ -230,11 +315,14 @@ async def create_rule(
         trigger=trigger, condition=condition, interpretation=interpretation, action=action
     )
     rule_status = _validate_status(status)
+    agent_key = _identity_key(identity)
     if workspace_id is not None:
         await require_active_workspace(session, ctx, workspace_id)
     if goal_id is not None:
         await require_linkable_goal(session, ctx, goal_id, workspace_id=workspace_id)
     await _check_references(session, ctx, spec)
+    if agent_key is not None:
+        await check_identity(session, ctx, agent_key)
     await _require_free_key(session, ctx, rule_key)
 
     now = utcnow()
@@ -253,6 +341,7 @@ async def create_rule(
         action=spec.action,
         authority=None,
         authority_principal_id=None,
+        identity_agent_key=agent_key,
         enabled_at=None,
         next_run_at=None,
         created_by=ctx.principal_id,
@@ -282,12 +371,15 @@ async def update_rule(
     interpretation: dict[str, Any] | Any | None = _UNSET,
     action: dict[str, Any] | Any = _UNSET,
     goal_id: uuid.UUID | Any | None = _UNSET,
+    identity: dict[str, Any] | Any | None = _UNSET,
 ) -> WorkRule:
-    """Change what a rule does; the key and the workspace are its identity.
+    """Change what a rule does; the key and the workspace are what it is.
 
     A change of an enabled rule moves its authority to the writer: whoever
     decided what the rule does now answers for it. A PATCH that restates the
-    current values is not a change (no new version, no event).
+    current values is not a change (no new version, no event). A rule that
+    acts as an agent after the change has the writer checked against that
+    agent's rights, whichever field changed: a new action is done with them.
     """
     await authorize(ctx, Permission.RULES_WRITE)
     rule = await get_tenant_rule(session, ctx, rule_id, for_update=True)
@@ -305,7 +397,7 @@ async def update_rule(
         )
     provided = [
         v
-        for v in (description, trigger, condition, interpretation, action, goal_id)
+        for v in (description, trigger, condition, interpretation, action, goal_id, identity)
         if v is not _UNSET
     ]
     if not provided:
@@ -329,10 +421,15 @@ async def update_rule(
         if goal_id is not None:
             await require_linkable_goal(session, ctx, goal_id, workspace_id=rule.workspace_id)
         changes["goal_id"] = goal_id
+    if identity is not _UNSET:
+        changes["identity_agent_key"] = _identity_key(identity)
     changes = {k: v for k, v in changes.items() if getattr(rule, k) != v}
     if not changes:
         return rule
     await _check_references(session, ctx, spec)
+    agent_key = changes.get("identity_agent_key", rule.identity_agent_key)
+    if agent_key is not None:
+        await check_identity(session, ctx, agent_key)
 
     for field_name, value in changes.items():
         setattr(rule, field_name, value)
@@ -349,12 +446,14 @@ async def update_rule(
         ctx,
         rule,
         "rule.updated",
-        {"changes": sorted(_camel(k) for k in changes), **_summary(rule)},
+        {"changes": sorted(_change_name(k) for k in changes), **_summary(rule)},
     )
     return rule
 
 
-def _camel(name: str) -> str:
+def _change_name(name: str) -> str:
+    if name == "identity_agent_key":
+        return "identity"
     head, *rest = name.split("_")
     return head + "".join(part.capitalize() for part in rest)
 

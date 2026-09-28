@@ -1,0 +1,93 @@
+# yaml-language-server: $schema=../../schema/v1/object.schema.json
+# Сходимость фичи (TAI-ADR-0047 амендмент 2026-09-25): ветка фичи одного
+# репозитория вливается в его основную ветку целиком — после того как все задачи
+# фичи в этом репозитории влиты в ветку фичи. Одна задача на репозиторий.
+# Ворота — approval владельца: approve вливает ровно указанный коммит ветки фичи
+# скиллом git.merge@1 (пакет selfdev), reject — назад в работу с комментарием.
+apiVersion: taimen.ai/v1
+kind: TaskType
+key: feature-converge
+spec:
+  displayName: Feature converge
+  description: >-
+    Вливание ветки фичи одного репозитория в основную ветку после того, как все
+    задачи фичи в нём сделаны: подтянуть основную ветку, прогнать проверки,
+    сверить код со spec, запросить ворота; approve вливает ветку фичи.
+  instructions: |-
+    Шаг «сходимость фичи» цикла spec-driven разработки (TAI-ADR-0047). Поля
+    задачи: `featureSlug`, `repository` (репозиторий компонента), `branch` (ветка
+    фичи), `targetBranch` (основная ветка репозитория), `commit` — заполняешь
+    ты перед воротами.
+
+    1. Убедись, что все задачи фичи в этом репозитории закрыты и влиты в ветку
+       фичи (связи depends_on этой задачи).
+    2. Подтяни `targetBranch` в ветку фичи (merge), разреши конфликты. Миграции:
+       одна цепочка — при двух головах перенеси миграции фичи на актуальную
+       голову (`migrations.check` должен быть чист).
+    3. Прогони полный набор проверок репозитория, как в CI.
+    4. Сверь код со spec фичи — вход `spec` (раздел «Входы»; `tasks` — там же):
+       каждое FR и SC из tasks реализовано в этом репозитории или явно в другом;
+       расхождения — задачей до ворот. У сходимости, заведённой до входов
+       (без связи spawned_by), spec — в ветке фичи суперпроекта.
+    5. Опубликуй ветку фичи, запиши её голову в поле `commit`, запроси ворота у
+       владельца с отчётом: что вливается, итоги проверок, отступления.
+
+    Не вливай сам: вливание — исход ворот (git.merge@1 ровно коммита `commit`).
+  fieldSchema:
+    type: object
+    required: [featureSlug, repository, branch, targetBranch]
+    properties:
+      featureSlug: {type: string, pattern: "^[a-z0-9][a-z0-9-]{0,62}$"}
+      repository: {type: string, maxLength: 500}
+      branch: {type: string, maxLength: 200}
+      targetBranch: {type: string, maxLength: 200}
+      commit: {type: string, maxLength: 100}
+    additionalProperties: false
+  artifactSchema:
+    inputs:
+      # необязательные: сходимость, заведённую руками или до CP-ADR-0072, claim не отвергает
+      - {key: spec, type: spec-document, from: spawned_by, required: false}
+      - {key: tasks, type: tasks-document, from: spawned_by, required: false}
+  lifecycleSchema:
+    statuses:
+      - {key: todo, category: active, displayName: To do}
+      - {key: in_progress, category: active, displayName: In progress}
+      - {key: blocked, category: blocked, displayName: Blocked}
+      - {key: in_review, category: active, displayName: In review}
+      - {key: done, category: terminal_success, displayName: Done}
+      - {key: cancelled, category: terminal_cancelled, displayName: Cancelled}
+    transitions:
+      - {from: todo, to: [in_progress, blocked, in_review, done, cancelled]}
+      - {from: in_progress, to: [todo, blocked, in_review, done, cancelled]}
+      - {from: blocked, to: [todo, in_progress, in_review, done, cancelled]}
+      - {from: in_review, to: [todo, in_progress, blocked, done, cancelled]}
+    initialStatus: todo
+    claimStatus: in_progress
+    releaseStatus: todo
+    completionStatus: done
+  approvalSchema:
+    gates:
+      default:
+        outcomes:
+          approved:
+            - invokeSkill:
+                skill: git.merge@1
+                inputs:
+                  repository: "$.task.customFields.repository!"
+                  branch: "$.task.customFields.branch!"
+                  commit: "$.task.customFields.commit!"
+                  target: "$.task.customFields.targetBranch!"
+                  message: "Merge feature $.task.customFields.featureSlug! ($.task.publicId)"
+                expect: {merged: true}
+                onSuccess:
+                  - completeTask: {}
+                onFailure:
+                  - comment:
+                      body: |-
+                        Сходимость одобрена, но ветка фичи не влита: $.invocation.output.reason$.invocation.error.code. Подтяни $.task.customFields.targetBranch!, разреши конфликты, обнови commit и запроси ворота снова.
+                        $.invocation.output.details|truncate:2000$.invocation.error.message
+                  - transition: {status: in_progress}
+          rejected:
+            - comment:
+                body: "Сходимость отклонена: $.approval.comment"
+            - transition: {status: in_progress}

@@ -1,0 +1,45 @@
+# yaml-language-server: $schema=../../schema/v1/object.schema.json
+# Открытая поставка догоняет суперпроект (TAI-ADR-0043, амендмент 2026-09-25): на
+# коммит суперпроекта oss.check@1 сверяет закреплённые ревизии компонентов перечня
+# deploy/oss/components.yaml с их ветками поставки; каждая готовая — работа
+# oss-publish исполнителю скиллов. Дедуп по компоненту и ревизии: одна публикация
+# на ревизию. Пара правил oss-check-red / oss-check-resolved ведёт то, что не
+# публикуется.
+apiVersion: taimen.ai/v1
+kind: WorkRule
+key: oss-sync
+spec:
+  description: Закреплённая ревизия компонента чиста — опубликовать в открытой поставке
+  workspaceId: ${SELFDEV_WORKSPACE_ID}
+  identity: {agent: selfdev-rules}
+  trigger: {kind: observation, type: repo.commit_observed}
+  condition: {eq: [{var: payload.data.repo}, project-taimen-ai]}
+  interpretation:
+    skill: oss.check@1
+    inputs:
+      superproject: ${SELFDEV_SUPERPROJECT_URL}
+      ref: "{{payload.data.sha}}"
+  action:
+    kind: ensure_work
+    taskType: oss-publish
+    forEach: skill.output.ready
+    dedupKeyTemplate: "oss-publish:{{item.component}}:{{item.sha}}"
+    fields:
+      title: "Опубликовать {{item.component}} {{item.sha}} в {{item.ossBranch}}"
+      priority: medium
+      assignee: ${SELFDEV_SKILLS_EXECUTOR}
+      description: |
+        Коммит суперпроекта {{skill.output.ref}} закрепил {{item.component}} на {{item.sha}};
+        oss.check@1 — публикуемо. Ветка {{item.ossBranch}} перематывается на эту ревизию,
+        сабмодуль в umbrella сдвигается (скилл oss.publish@1).
+      customFields:
+        component: "{{item.component}}"
+        sha: "{{item.sha}}"
+        repository: "{{item.repository}}"
+        ossBranch: "{{item.ossBranch}}"
+        umbrella: "{{item.umbrella}}"
+        umbrellaBranch: "{{item.umbrellaBranch}}"
+        superproject: "{{item.superproject}}"
+        superprojectRef: "{{skill.output.ref}}"
+        # пусто у компонента без зеркала — поле тогда опускается (CP-ADR-0063, Б1)
+        mirror: "{{item.mirror}}"

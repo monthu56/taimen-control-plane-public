@@ -1,0 +1,28 @@
+# The expressions of the memory projection, recall and context are typed too.
+# expect: expression_type_error /spec/memory/case/key
+# expect: expression_type_error /spec/memory/facts/decision
+# expect: expression_type_error /spec/stages/0/steps/0/recall/anchors/0/key
+# expect: expression_type_error /spec/stages/0/steps/1/human/context/anchors/0/key
+apiVersion: taimen.ai/v1
+kind: Process
+key: sample
+spec:
+  version: 1
+  displayName: Sample
+  identity: {agent: sample-process}
+  owner: [{role: lead}]
+  data: {type: object, properties: {number: {type: string}, customer: {type: string}}}
+  start: {on: {observation: sample.opened}, key: event.payload.number, set: {number: "'1'", customer: "'c'"}}
+  memory:
+    case: {key: "'sample:' + data.numbr"}
+    facts: {decision: data.desicion}
+  stages:
+    - id: work
+      steps:
+        - id: recall
+          recall: {anchors: [{kind: customer, key: data.custmer}]}
+        - id: ask
+          human:
+            taskType: review
+            assign: [{role: lead}]
+            context: {anchors: [{kind: customer, key: data.cusomer}]}

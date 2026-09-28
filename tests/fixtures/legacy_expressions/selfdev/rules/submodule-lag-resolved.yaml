@@ -1,0 +1,28 @@
+# yaml-language-server: $schema=../../schema/v1/object.schema.json
+# Пара к submodule-lag: на каждом коммите суперпроекта сверка указателей; сабмодуль,
+# чей указатель теперь на голове ветки, — его открытое решение submodule-bump (или
+# задача devops, заведённая прежней версией правила) закрывается как выполненное
+# (complete_work по тому же ключу submodule-lag:<path>, CP-ADR-0063 амендмент M1.6:
+# внешнее состояние подтверждает работу — done и verified, а не отмена).
+# Решение, которое ещё ждёт ворот (gate открыт), правило закрыть не может —
+# approval_required, как любой :complete под gate; его закроет следующий коммит
+# суперпроекта после решения. Так же закрывается решение, чей скилл ответил
+# already_current (указатель уже на одобренной ревизии).
+apiVersion: taimen.ai/v1
+kind: WorkRule
+key: submodule-lag-resolved
+spec:
+  description: Указатель сабмодуля догнал компонент — решение «сдвинуть указатель» закрывается
+  workspaceId: ${SELFDEV_WORKSPACE_ID}
+  identity: {agent: selfdev-rules}
+  trigger: {kind: observation, type: repo.commit_observed}
+  condition: {eq: [{var: payload.data.repo}, project-taimen-ai]}
+  interpretation:
+    skill: submodule.lag_check@1
+    inputs:
+      repository: ${SELFDEV_SUPERPROJECT_URL}
+      ref: "{{payload.data.sha}}"
+  action:
+    kind: complete_work
+    forEach: skill.output.current
+    dedupKeyTemplate: "submodule-lag:{{item.path}}"

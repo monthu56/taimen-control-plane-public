@@ -12,6 +12,9 @@ into the text an executor reads:
 * the repository conventions file of this executor (``CONTROL_PLANE_*_PROMPT_FILE``),
   the fourth layer, which only the executor knows;
 * the task itself and the project's status line;
+* the feedback of the task's last verification, when it failed and the task
+  came back to its executor (CP-ADR-0067 §5, amendment 2026-09-27: B8) —
+  ``lastVerification``, which the daemon adds to the task;
 * the task's inputs (CP-ADR-0072 §8) — artifacts of other tasks, with the
   local files the daemon downloaded — rendered by
   :mod:`control_plane_agent.inputs` as data, not instructions;
@@ -44,6 +47,8 @@ PREAMBLE = (
 )
 CONVENTIONS_TITLE = "Repository conventions"
 _SOURCE_TITLES = {"platform": "Platform contract", "project": "Project", "taskType": "Task type"}
+FEEDBACK_HEADING = "## Замечания последней проверки"
+MAX_FEEDBACK_MESSAGE_CHARS = 4000
 
 
 def prompt_file_from_environment(variable: str) -> Path | None:
@@ -93,6 +98,38 @@ def render_instructions(block: Any, conventions: str = "") -> str:
     return "\n".join(lines).rstrip()
 
 
+def render_feedback(attempt: Any) -> str:
+    """Why the last verification of the task failed, check by check.
+
+    The reviewer's decision comment and the failed merge travel in the
+    ``message`` of their check. What was not run yet is not listed: it will
+    run on the next hand-in.
+    """
+    if not isinstance(attempt, dict) or attempt.get("status") != "failed":
+        return ""
+    lines = [
+        FEEDBACK_HEADING,
+        "",
+        f"Verification attempt #{attempt.get('attempt')} of this task failed and the task "
+        "came back to you. Address what it says before handing the work in again; the "
+        "work continues on the same branch, and handing it in starts a new verification.",
+        "",
+    ]
+    results = attempt.get("results")
+    for result in results if isinstance(results, list) else []:
+        if not isinstance(result, dict):
+            continue
+        line = f"- {result.get('key')} ({result.get('kind')}): {result.get('status')}"
+        if result.get("status") == "failed":
+            reason = str(result.get("reason") or "")
+            message = " ".join(str(result.get("message") or "").split())
+            detail = ": ".join(part for part in (reason, message) if part)
+            if detail:
+                line += f" — {detail[:MAX_FEEDBACK_MESSAGE_CHARS]}"
+        lines.append(line)
+    return "\n".join(lines).rstrip()
+
+
 def build_prompt(
     task: dict[str, Any],
     context: dict[str, Any],
@@ -121,6 +158,9 @@ def build_prompt(
         "",
         str(task.get("description") or "(no description)"),
     ]
+    section = render_feedback(task.get("lastVerification"))
+    if section:
+        lines += ["", section]
     project = (context.get("operational") or {}).get("project")
     if isinstance(project, dict) and project:
         lines += [

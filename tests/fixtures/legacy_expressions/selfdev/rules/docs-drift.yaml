@@ -1,0 +1,41 @@
+# yaml-language-server: $schema=../../schema/v1/object.schema.json
+# Документация как цель цикла (TAI-ADR-0046, слой 3): каждый наблюдённый коммит
+# суперпроекта сверяет руководство guide/ с кодом скиллом docs.drift_check@2,
+# и каждая страница с расхождениями становится задачей. Дедуп по странице:
+# повторные коммиты не плодят дублей, а вернувшееся после закрытия расхождение —
+# новая работа (CP-ADR-0063 §5).
+apiVersion: taimen.ai/v1
+kind: WorkRule
+key: docs-drift
+spec:
+  description: Руководство guide/ сверяется с кодом на каждом коммите суперпроекта; страница с расхождениями — задача
+  # Задачи — в workspace проекта установки (топология: из окружения, не из пакета)
+  workspaceId: ${SELFDEV_WORKSPACE_ID}
+  identity: {agent: selfdev-rules}
+  trigger: {kind: observation, type: repo.commit_observed}
+  condition: {eq: [{var: payload.data.repo}, project-taimen-ai]}
+  interpretation:
+    skill: docs.drift_check@2
+    inputs:
+      repository: ${SELFDEV_SUPERPROJECT_URL}
+      ref: "{{payload.data.sha}}"
+  action:
+    kind: ensure_work
+    taskType: coding-task
+    # одна задача на страницу: расхождения одной страницы правятся одной правкой
+    forEach: skill.output.pages
+    dedupKeyTemplate: "docs-drift:{{item.page}}"
+    fields:
+      title: "Документация расходится с кодом: {{item.page}}"
+      priority: medium
+      description: |
+        Сверка руководства с кодом (docs.drift_check@2, TAI-ADR-0046) на коммите {{payload.data.sha}}
+        нашла расхождения на странице guide/docs/{{item.page}}:
+
+        {{item.text}}
+
+        Что сделать: исправить страницу (или код, если неправ код). Если упоминание
+        намеренно указывает на то, чего нет в коде этого репозитория, пометьте строку
+        `<!-- drift:external причина -->`. Задача заведена правилом docs-drift
+        автоматически; пока она открыта, новые расхождения этой страницы новых задач
+        не заводят — проверьте страницу целиком (`make docs-drift`).

@@ -1,0 +1,14 @@
+# expect: unknown_skill /spec/stages/0/steps/0/call/skill
+apiVersion: taimen.ai/v1
+kind: Process
+key: sample
+spec:
+  version: 1
+  displayName: Sample
+  identity: {agent: sample-process}
+  owner: [{role: lead}]
+  data: {type: object, properties: {number: {type: string}}}
+  start: {on: {observation: sample.opened}, key: event.payload.number, set: {number: "'1'"}}
+  stages:
+    - id: work
+      steps: [{id: send, call: {skill: "text.translate@1", input: {text: data.number}}}]

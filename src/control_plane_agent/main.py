@@ -23,6 +23,14 @@ a task — artifacts of other tasks its type declares — are downloaded into
 working copy, and handed to an adapter whose ``execute`` takes ``inputs``
 (``inputs.py``). An adapter written before that keeps its four arguments.
 
+Acceptance (CP-ADR-0067): the daemon hands work in and nothing more — review
+and merge are checks the task type declares, run by the core. A task its
+verification returned is taken again with the failed attempt in the prompt
+(``lastVerification``) and on its branch ``task/<publicId>``; a task waiting
+for a person (category ``blocked``) is left alone. An executor that says it
+could not do the work (``blocked.py``) fails its run ``executor_blocked`` and
+hands the task to a person instead of completing it.
+
 Restart recovery: on startup the agent consults /harness/context; a still-
 live claim+run is finished honestly (fail with reason=restart_recovery) so
 the task frees up deterministically — a reference policy, not the only one.
@@ -56,19 +64,12 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Protocol
 
+from control_plane_agent.blocked import BLOCKED_CATEGORY, FAILURE_REASON, blocked_reason
 from control_plane_agent.inputs import (
     LocalInput,
     discard_inputs,
     fetch_inputs,
     task_runtime_dir,
-)
-from control_plane_agent.review import (
-    ReviewPolicy,
-    build_review_task,
-    parse_verdict,
-    published_commit,
-    review_policy_from_env,
-    summary_of,
 )
 from control_plane_agent.revision import (
     ENV_CONFIG_MODE,
@@ -252,8 +253,6 @@ class Agent:
         max_cycles: int | None = None,
         workspaces: ExecutionWorkspacePool | None = None,
         only_assigned: bool = False,
-        review_policy: ReviewPolicy | None = None,
-        review_type: str = "code-review",
         skills: SkillExecutor | None = None,
         supervision: SupervisionSettings | None = None,
         runtime_dir: Path | None = None,
@@ -289,19 +288,9 @@ class Agent:
         # Work, and Work whose type is executed by a skill.
         self.skills = skills
         self._executions: dict[str, dict[str, Any] | None] = {}
-        # Type id -> does the version declare work after completion
-        # (CP-ADR-0061, amendment 2026-09-25)? Versions are immutable.
-        self._completion_work: dict[str, bool] = {}
         self._unreadable_types: set[str] = set()
         self._session_lock = asyncio.Lock()
         self._skills_stop = asyncio.Event()
-        # Auto-review (review.py): with a policy, every finished task of a
-        # reviewed type with a published branch spawns a code-review task for
-        # the configured reviewer. review_type is what THIS runner recognises
-        # as a review when it is the reviewer itself — then the verdict in the
-        # summary is copied into the task's fields.
-        self.review_policy = review_policy
-        self.review_type = review_type
         self.poll_interval = poll_interval
         self.workspace_id = workspace_id
         self.project_id = project_id
@@ -526,7 +515,6 @@ class Agent:
                 raise _TypeUnreadable(type_id) from exc
             self._unreadable_types.discard(type_id)
             self._executions[type_id] = task_type.get("execution")
-            self._completion_work[type_id] = bool(task_type.get("completionSchema"))
         return self._executions[type_id]
 
     async def _takes(self, execution: dict[str, Any] | None) -> bool:
@@ -561,6 +549,11 @@ class Agent:
         execution: dict[str, Any] | None = None
         for item in page["items"]:
             if self.task_types and item.get("typeKey") not in self.task_types:
+                continue
+            if item.get("systemStatusCategory") == BLOCKED_CATEGORY:
+                # Claimable, but waiting for a person (an executor stopped on
+                # it, or its verification failed too often): the status says
+                # so, and a runner takes it only once a person returns it.
                 continue
             try:
                 execution = await self._execution_of(item)
@@ -626,6 +619,7 @@ class Agent:
                         await self.client.fail_run(str(run["id"]), failure_reason="workspace_busy")
                     return False
                 inputs = await self._fetch_inputs(task, run)
+                task = await self._with_feedback(task)
                 supervisor = RunSupervisor(
                     self.client,
                     str(run["id"]),
@@ -644,37 +638,21 @@ class Agent:
                     with contextlib.suppress(ControlPlaneError):
                         await self.client.fail_run(str(run["id"]), failure_reason="lease_lost")
                     return False
+                blocked = await blocked_reason(self.client, str(run["id"]))
+                if blocked is not None:
+                    # Stopped, not done: the report goes out, the working copy
+                    # stays as it is for whoever continues, nothing is committed.
+                    await self._publish(task, run, artifacts)
+                    await self._settle_blocked(task, run, claim, blocked)
+                    return True
                 if workspace is not None:
                     artifacts = [*artifacts, *await self._commit_evidence(task, run, workspace)]
-                for spec in artifacts:
-                    # Nothing leaves the host that names this host: an adapter
-                    # that put a local path or a credential in an artifact is
-                    # stopped here, not discovered later by a reader.
-                    assert_portable(
-                        {
-                            "name": spec.name,
-                            "uri": spec.uri,
-                            "content": spec.content,
-                            "metadata": spec.metadata,
-                        },
-                        where="artifact",
-                    )
-                    await self.client.create_artifact(
-                        type=spec.type,
-                        name=spec.name,
-                        task_ref=task["id"],
-                        run_id=str(run["id"]),
-                        uri=spec.uri,
-                        content=spec.content,
-                        metadata=spec.metadata,
-                    )
-                await self._record_verdict(task, artifacts, claim)
+                await self._publish(task, run, artifacts)
                 await self.client.succeed_run(str(run["id"]))
                 outcome = "succeeded"
                 if self.runtime_dir is not None:
                     await discard_inputs(task_runtime_dir(self.runtime_dir, task))
                 logger.info("completed %s", task["publicId"])
-                await self._request_review(task, artifacts)
                 return True
             except ExecutionStopped as stop:
                 # Asked to stop, or stuck: the adapter is stopped; close the run
@@ -722,7 +700,7 @@ class Agent:
 
         The ``skill_result`` artifact is written by the core when the call
         succeeds; the run carries only references to it. No workspace, no
-        adapter, no review: the skill is the whole execution, and what it did
+        adapter: the skill is the whole execution, and what it did
         is decided by its contract, not by this daemon.
         """
         run_id = str(run["id"])
@@ -773,169 +751,113 @@ class Agent:
         logger.info("completed %s through %s", task["publicId"], summary["skill"])
         return True
 
-    # -- execution workspace ---------------------------------------------------
-
-    async def _request_review(self, task: dict[str, Any], artifacts: list[ArtifactSpec]) -> None:
-        """Coder side of auto-review: spawn a code-review task for the reviewer.
-
-        Runs AFTER the run succeeded on purpose: a review that could not be
-        requested must never undo finished work, so failures here are logged
-        and left in a comment for a human, not raised.
-        """
-        policy = self.review_policy
-        if policy is None or not policy.applies_to(task):
-            return
-        if await self._type_declares_completion_work(task):
-            # The type files its own follow-up once the task is completed, and
-            # it already has (in the same transaction as succeed_run): a review
-            # from here would be the second one.
-            logger.info(
-                "type of %s declares work after completion; review left to it", task["publicId"]
-            )
-            return
-        commit = published_commit(artifacts)
-        if commit is None:
-            logger.info("no published commit for %s; review not requested", task["publicId"])
-            return
-        try:
-            review = await self._create_review(build_review_task(task, commit, policy))
-            await self.client.add_task_relation(
-                str(review["id"]), to_task=str(task["id"]), relation_type="spawned_by"
-            )
-            if policy.human:
-                await self._request_review_approval(review, task, commit, policy)
-            logger.info("review %s requested for %s", review["publicId"], task["publicId"])
-        except ControlPlaneError as exc:
-            logger.warning("could not request review for %s: %s", task["publicId"], exc.code)
-            with contextlib.suppress(ControlPlaneError):
-                await self.client.add_task_comment(
-                    str(task["id"]),
-                    body=(
-                        f"Автоматическое ревью не заведено ({exc.code}); "
-                        "ревью нужно назначить руками."
-                    ),
-                )
-
-    async def _type_declares_completion_work(self, task: dict[str, Any]) -> bool:
-        """Does the task's type version declare ``completionSchema``?
-
-        Read with the type (see :meth:`_execution_of`). Unreadable — the
-        behaviour before the declaration existed: a review missing is worse
-        than a duplicate one, which a human can see and close.
-        """
-        type_id = str(task.get("typeId") or "")
-        if not type_id:
-            return False
-        if type_id not in self._completion_work:
-            try:
-                task_type = await self.client.get_task_type(type_id)
-            except ControlPlaneError as exc:
-                logger.warning(
-                    "type %s of %s unreadable (%s); falling back to the runner's review",
-                    type_id,
-                    task.get("publicId"),
-                    exc.code,
-                )
-                return False
-            self._completion_work[type_id] = bool(task_type.get("completionSchema"))
-        return self._completion_work[type_id]
-
-    async def _create_review(self, spec: dict[str, Any]) -> dict[str, Any]:
-        """Create the review task; without its custom fields if the type refuses them.
-
-        A review type whose ``field_schema`` predates the merge fields
-        (``repository``, ``branch``, ``commit``, ``targetBranch``) and forbids
-        extra ones would otherwise refuse every review. The review is still
-        worth having: a human can read the branch in the description, and an
-        outcome that needs the fields fails visibly (``unresolved_expression``)
-        instead of merging by guess (CP-ADR-0061 §11).
-        """
-        try:
-            return await self.client.create_task(**spec)
-        except ControlPlaneError as exc:
-            if exc.code != "custom_fields_invalid" or "custom_fields" not in spec:
-                raise
-            logger.warning(
-                "review type refuses the merge fields (%s); review created without them", exc.code
-            )
-            return await self.client.create_task(
-                **{k: v for k, v in spec.items() if k != "custom_fields"}
-            )
-
-    async def _request_review_approval(
-        self,
-        review: dict[str, Any],
-        task: dict[str, Any],
-        commit: dict[str, Any],
-        policy: ReviewPolicy,
+    async def _publish(
+        self, task: dict[str, Any], run: dict[str, Any], artifacts: list[ArtifactSpec]
     ) -> None:
-        """Human review mode: the gate approval on the review task IS the verdict.
+        for spec in artifacts:
+            # Nothing leaves the host that names this host: an adapter that put
+            # a local path or a credential in an artifact is stopped here, not
+            # discovered later by a reader.
+            assert_portable(
+                {
+                    "name": spec.name,
+                    "uri": spec.uri,
+                    "content": spec.content,
+                    "metadata": spec.metadata,
+                },
+                where="artifact",
+            )
+            await self.client.create_artifact(
+                type=spec.type,
+                name=spec.name,
+                task_ref=task["id"],
+                run_id=str(run["id"]),
+                uri=spec.uri,
+                content=spec.content,
+                metadata=spec.metadata,
+            )
 
-        Keyed by the review task, so a retried run never opens a second
-        decision. A failure leaves the review task in place and says so on it:
-        the human can still review, only the gate is missing.
+    async def _settle_blocked(
+        self, task: dict[str, Any], run: dict[str, Any], claim: dict[str, Any], reason: str
+    ) -> None:
+        """The executor stopped without doing the work (``blocked.py``).
+
+        The run fails ``executor_blocked`` and the task goes, under our claim,
+        to the first ``blocked`` status its lifecycle allows from where it is
+        — the verification stage's way to hand a task to a person (CP-ADR-0067
+        §5) — with the reason in a comment; then the claim is released, which
+        leaves a status the claim did not set alone. Each step is best-effort
+        after the run is failed: what could not be done is logged, and a task
+        its lifecycle cannot block goes back to the queue as after any failure.
         """
+        run_id, task_id = str(run["id"]), str(task["id"])
+        logger.warning("%s stopped by the executor: %s", task["publicId"], reason)
+        await self.client.fail_run(run_id, failure_reason=FAILURE_REASON, output={"reason": reason})
+        status: str | None = None
         try:
-            await self.client.request_approval(
-                task_ref=str(review["id"]),
-                assigned_principal_id=policy.reviewer_principal_id,
-                gate=True,
-                comment=(
-                    f"Code review {task['publicId']}: ветка {commit['branch']}, "
-                    f"коммит {commit['commit']}. approve — принято, reject — нужны правки."
+            targets = (await self.client.get_task_transitions(task_id)).get("targets") or []
+            status = next(
+                (
+                    str(t["status"])
+                    for t in targets
+                    if t.get("systemStatusCategory") == BLOCKED_CATEGORY
+                    and t.get("route") == "update"
                 ),
-                idempotency_key=f"code-review-approval:{review['id']}",
+                None,
             )
-        except ControlPlaneError as exc:
-            logger.warning(
-                "could not request review approval for %s: %s", review["publicId"], exc.code
-            )
-            with contextlib.suppress(ControlPlaneError):
-                await self.client.add_task_comment(
-                    str(review["id"]),
-                    body=(
-                        f"Approval ревью не заведён ({exc.code}); решение оформите "
-                        "approval'ом вручную или комментарием."
-                    ),
+            if status is None:
+                logger.warning("the lifecycle of %s has no blocked status", task["publicId"])
+            else:
+                fresh = await self.client.get_task(task_id)
+                await self.client.update_task(
+                    task_id,
+                    expected_version=int(fresh["version"]),
+                    status=status,
+                    claim_id=str(claim["id"]),
+                    fencing_token=int(claim["fencingToken"]),
                 )
+        except ControlPlaneError as exc:
+            logger.warning("could not block %s: %s", task["publicId"], exc.code)
+            status = None
+        with contextlib.suppress(ControlPlaneError):
+            await self.client.add_task_comment(
+                task_id,
+                body=(
+                    f"The executor stopped without doing the work ({FAILURE_REASON}): {reason}\n"
+                    + (
+                        f"The task waits for a person in {status!r}; return it to work "
+                        "to have it taken again."
+                        if status is not None
+                        else "The task could not be moved to a blocked status."
+                    )
+                ),
+                run_id=run_id,
+            )
+        with contextlib.suppress(ControlPlaneError):
+            await self.client.release_claim(str(claim["id"]), reason=FAILURE_REASON)
 
-    async def _record_verdict(
-        self, task: dict[str, Any], artifacts: list[ArtifactSpec], claim: dict[str, Any]
-    ) -> None:
-        """Reviewer side of auto-review: verdict from the summary into task fields.
+    async def _with_feedback(self, task: dict[str, Any]) -> dict[str, Any]:
+        """The task with ``lastVerification`` when its newest attempt failed.
 
-        Before succeed_run, because a completed task may refuse field updates,
-        and WITH our claim: the server rejects a PATCH on a claimed task unless
-        the holder presents claimId + fencingToken (seen as ``task_claimed`` on
-        the first BidOps review). A missing or unparsable verdict is reported
-        in a comment so a human knows the review needs reading.
+        A task returned by its verification (a rejected review, a failed merge)
+        is taken again by the same executor; what the reviewer or the check
+        said is rendered into the prompt (``instructions.py``). Only the brief
+        of the attempt comes with the task, so the attempt itself is read here.
         """
-        if task.get("typeKey") != self.review_type:
-            return
-        verdict, notes = parse_verdict(summary_of(artifacts))
+        brief = task.get("verification")
+        if not isinstance(brief, dict) or brief.get("status") != "failed":
+            return task
         try:
-            if verdict is None:
-                await self.client.add_task_comment(
-                    str(task["id"]),
-                    body=(
-                        "Ревьюер не оформил вердикт первой строкой summary — "
-                        "прочитать отчёт и выставить verdict руками."
-                    ),
-                )
-                return
-            fresh = await self.client.get_task(str(task["id"]))
-            fields = dict(fresh.get("customFields") or {})
-            fields.update({"verdict": verdict, "notes": notes})
-            await self.client.update_task(
-                str(task["id"]),
-                expected_version=int(fresh["version"]),
-                custom_fields=fields,
-                claim_id=str(claim["id"]),
-                fencing_token=int(claim["fencingToken"]),
-            )
-            logger.info("verdict for %s: %s", task["publicId"], verdict)
+            page = await self.client.list_task_verifications(str(task["id"]), limit=1)
         except ControlPlaneError as exc:
-            logger.warning("could not record verdict for %s: %s", task["publicId"], exc.code)
+            logger.info("verification of %s not readable: %s", task["publicId"], exc.code)
+            return task
+        items = page.get("items") or []
+        if not items or items[0].get("status") != "failed":
+            return task
+        return {**task, "lastVerification": items[0]}
+
+    # -- execution workspace ---------------------------------------------------
 
     async def _fetch_inputs(
         self, task: dict[str, Any], run: dict[str, Any]
@@ -1000,9 +922,9 @@ class Agent:
 
         remote = self.workspaces.push_remote if self.workspaces is not None else ""
         published = False
-        # Where the branch lives and what it is meant to be merged into: an
-        # approval outcome of the review hands both to a merge skill
-        # (CP-ADR-0061), which cannot guess them.
+        # Where the branch lives and what it is meant to be merged into: the
+        # acceptance of the task type hands both to a merge skill (CP-ADR-0067,
+        # amendment 2026-09-27), which cannot guess them.
         location: dict[str, str] = {}
         pool = self.workspaces
         if remote and pool is not None:
@@ -1144,8 +1066,6 @@ def _agent_from_environment(
         include_subprojects=os.environ.get("CONTROL_PLANE_AGENT_SUBPROJECTS") == "1",
         only_assigned=os.environ.get("CONTROL_PLANE_AGENT_ONLY_ASSIGNED") == "1",
         poll_interval=float(os.environ.get("CONTROL_PLANE_AGENT_POLL", "5")),
-        review_policy=review_policy_from_env(),
-        review_type=os.environ.get("CONTROL_PLANE_AGENT_REVIEW_TYPE") or "code-review",
         drain_seconds=float(drain) if drain else None,
     )
 

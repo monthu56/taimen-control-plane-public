@@ -1,0 +1,22 @@
+# yaml-language-server: $schema=../../schema/v1/object.schema.json
+# Пара к oss-check-red: компонент опубликован (его закреплённая ревизия уже в ветке
+# поставки) — работа «ствол не публикуется» закрывается как выполненная
+# (complete_work, CP-ADR-0063 амендмент M1.6).
+apiVersion: taimen.ai/v1
+kind: WorkRule
+key: oss-check-resolved
+spec:
+  description: Компонент опубликован — работа «ствол не публикуется» выполнена
+  workspaceId: ${SELFDEV_WORKSPACE_ID}
+  identity: {agent: selfdev-rules}
+  trigger: {kind: observation, type: repo.commit_observed}
+  condition: {eq: [{var: payload.data.repo}, project-taimen-ai]}
+  interpretation:
+    skill: oss.check@1
+    inputs:
+      superproject: ${SELFDEV_SUPERPROJECT_URL}
+      ref: "{{payload.data.sha}}"
+  action:
+    kind: complete_work
+    forEach: skill.output.current
+    dedupKeyTemplate: "oss-check:{{item.component}}"

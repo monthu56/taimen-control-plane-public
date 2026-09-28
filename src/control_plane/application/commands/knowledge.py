@@ -11,6 +11,12 @@ Memory Service is awaited: ``prepare_*`` runs in one transaction (authorization
 and resolution), the provider call runs outside, and the journal event (a
 reconciled snapshot, a registered pack, a namespace's enabled packs) is
 appended in a second transaction.
+
+A snapshot that opened, changed or closed nodes is also journaled as
+``knowledge.changed`` with their natural keys (CP-ADR-0076 §7): the event a
+rule reacts to when a regulation changes. The keys come from Memory's answer
+(``changes``, amendment MEM-ADR-020); an empty reconciliation, a repeated
+snapshot and an answer without ``changes`` write no such event.
 """
 
 import logging
@@ -51,6 +57,12 @@ logger = logging.getLogger(__name__)
 # Counters copied from the Memory answer into the journal event: numbers only,
 # never snapshot content.
 _MAX_COUNTERS = 32
+# ``changes`` of Memory's reconcile answer (MEM-ADR-020): the lists in the
+# order the event names them, and the core's own bound on what one event
+# carries (Memory's limit is per list and configurable).
+CHANGE_LISTS = ("opened", "changed", "closed")
+MAX_EVENT_CHANGES = 200
+_MAX_CHANGE_TEXT = 512
 
 
 @dataclass(frozen=True)
@@ -152,6 +164,8 @@ def _counters(answer: dict[str, Any]) -> dict[str, int]:
             counters[key] = value
 
     for key, value in answer.items():
+        if key == "changes":
+            continue  # keys, not counters: knowledge.changed carries them
         if isinstance(value, dict):
             for inner, inner_value in value.items():
                 take(f"{key}.{inner}", inner_value)
@@ -213,7 +227,68 @@ async def record_snapshot_reconciled(
             "counters": _counters(answer),
         },
     )
+    changes, truncated = changed_keys(answer)
+    if changes:
+        await record_event(
+            session,
+            tenant_id=ctx.tenant_id,
+            event_type="knowledge.changed",
+            entity_type="workspace",
+            entity_id=target.workspace_id,
+            actor_id=ctx.principal_id,
+            request_id=ctx.request_id,
+            correlation_id=ctx.correlation_id,
+            causation_id=ctx.causation_id,
+            trace_run_id=ctx.trace_run_id,
+            payload={
+                "snapshotId": snapshot.get("snapshotId"),
+                "pack": snapshot.get("pack"),
+                "source": snapshot.get("source"),
+                "observedAt": snapshot.get("observedAt"),
+                "workspaceId": str(target.workspace_id),
+                "rootWorkspaceId": str(target.root_workspace_id),
+                "namespace": target.namespace,
+                "changes": changes,
+                "truncated": truncated,
+                "counters": _counters(answer),
+            },
+        )
     return event.id
+
+
+def changed_keys(answer: dict[str, Any]) -> tuple[list[dict[str, str]], bool]:
+    """``[{kind, key, change}]`` of the nodes a reconciliation touched, and whether cut.
+
+    Read from ``answer.changes`` (MEM-ADR-020: ``{opened, changed, closed:
+    [{kind, key}], limit, truncated}``): opened first, then changed, then
+    closed, each in Memory's order. A duplicate snapshot touched nothing. A
+    malformed entry is skipped; the list is cut at :data:`MAX_EVENT_CHANGES`,
+    and ``truncated`` says Memory or the core cut it.
+    """
+    raw = answer.get("changes")
+    if not isinstance(raw, dict) or answer.get("duplicate") is True:
+        return [], False
+    changes: list[dict[str, str]] = []
+    truncated = raw.get("truncated") is True
+    seen: set[tuple[str, str, str]] = set()
+    for change in CHANGE_LISTS:
+        entries = raw.get(change)
+        for entry in entries if isinstance(entries, list) else ():
+            if not isinstance(entry, dict):
+                continue
+            kind, key = entry.get("kind"), entry.get("key")
+            if not isinstance(kind, str) or not isinstance(key, str) or not key:
+                continue
+            if len(kind) > _MAX_CHANGE_TEXT or len(key) > _MAX_CHANGE_TEXT:
+                truncated = True  # a key the event cannot carry whole is not guessed at
+                continue
+            if (kind, key, change) in seen:
+                continue
+            if len(changes) >= MAX_EVENT_CHANGES:
+                return changes, True
+            seen.add((kind, key, change))
+            changes.append({"kind": kind, "key": key, "change": change})
+    return changes, truncated
 
 
 # --- domain packs ----------------------------------------------------------

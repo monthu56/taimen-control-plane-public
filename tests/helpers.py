@@ -307,9 +307,17 @@ def knowledge_snapshot(**overrides: Any) -> dict[str, Any]:
 class FakeKnowledge:
     """Records what the core forwards to Memory; answers or fails on demand."""
 
-    def __init__(self, *, fail_status: int | None = None, retryable: bool = False) -> None:
+    def __init__(
+        self,
+        *,
+        fail_status: int | None = None,
+        retryable: bool = False,
+        changes: dict[str, Any] | None = None,
+    ) -> None:
         self.fail_status = fail_status
         self.retryable = retryable
+        # ``changes`` of Memory's reconcile answer (MEM-ADR-020), when given.
+        self.changes = changes
         self.calls: list[tuple[str, dict[str, Any]]] = []
 
     def _maybe_fail(self) -> None:
@@ -323,12 +331,15 @@ class FakeKnowledge:
     async def reconcile_snapshot(self, **kwargs: Any) -> dict[str, Any]:
         self.calls.append(("reconcile", kwargs))
         self._maybe_fail()
-        return {
+        answer: dict[str, Any] = {
             "snapshotId": kwargs["snapshot"]["snapshotId"],
             "duplicate": False,
             "entities": {"created": 1, "updated": 0, "deleted": 0},
             "relations": {"created": 1, "deleted": 0},
         }
+        if self.changes is not None:
+            answer["changes"] = self.changes
+        return answer
 
     async def register_package(self, **kwargs: Any) -> dict[str, Any]:
         self.calls.append(("package", kwargs))

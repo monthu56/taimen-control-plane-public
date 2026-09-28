@@ -166,28 +166,35 @@ _APPROVAL_REQUESTED_V1 = {
     "assignedPrincipalId": described(UUID_N, "Set when one principal decides"),
     "gate": described(BOOL, "A gate holds the task's claim and completion until decided"),
 }
+_APPROVAL_REQUESTED_V2 = {
+    **_APPROVAL_REQUESTED_V1,
+    "workspaceId": described(UUID_N, "The approval's workspace, else its task's workspace"),
+    "taskPublicId": described(STR_N, "Public id of the task, e.g. TASK-000123"),
+    "taskTitle": STR_N,
+    "requestedBy": described(UUID, "Principal who requested the decision"),
+    "comment": described(
+        {"type": "string", "maxLength": PAYLOAD_TEXT_LIMIT},
+        "Request comment; credential-shaped material redacted, cut to the limit",
+    ),
+}
 _register(
     "approval.requested",
     "approval",
     "A decision was requested from a principal or from the holders of a role.",
     data(_APPROVAL_REQUESTED_V1),
+    (data(_APPROVAL_REQUESTED_V2), "workspaceId, taskPublicId, taskTitle, requestedBy, comment"),
     (
         data(
             {
-                **_APPROVAL_REQUESTED_V1,
-                "workspaceId": described(
-                    UUID_N, "The approval's workspace, else its task's workspace"
-                ),
-                "taskPublicId": described(STR_N, "Public id of the task, e.g. TASK-000123"),
-                "taskTitle": STR_N,
-                "requestedBy": described(UUID, "Principal who requested the decision"),
-                "comment": described(
-                    {"type": "string", "maxLength": PAYLOAD_TEXT_LIMIT},
-                    "Request comment; credential-shaped material redacted, cut to the limit",
+                **_APPROVAL_REQUESTED_V2,
+                "excludedPrincipals": described(
+                    {"type": "array", "items": UUID},
+                    "Principals whose decision the core refuses"
+                    " (separation of duties, CP-ADR-0074); empty when nobody is excluded",
                 ),
             }
         ),
-        "workspaceId, taskPublicId, taskTitle, requestedBy, comment",
+        "excludedPrincipals",
     ),
 )
 
@@ -589,6 +596,40 @@ _register(
     "workspace",
     "The knowledge packs of a workspace tree were configured.",
     data({"workspaceId": UUID, "namespace": STR, "packs": ARR, "strict": BOOL}),
+)
+_KNOWLEDGE_CHANGE: JsonSchema = {
+    "type": "object",
+    "required": ["kind", "key", "change"],
+    "properties": {
+        "kind": described(STR, "Kind of the memory node, e.g. regulation"),
+        "key": described(STR, "Natural key of the node"),
+        "change": {"type": "string", "enum": ["opened", "changed", "closed"]},
+    },
+}
+_register(
+    "knowledge.changed",
+    "workspace",
+    "A knowledge snapshot opened, changed or closed documents in memory"
+    " (CP-ADR-0076 §6); an empty reconciliation writes no event.",
+    data(
+        {
+            "snapshotId": ANY,
+            "pack": ANY,
+            "source": ANY,
+            "observedAt": ANY,
+            "workspaceId": UUID,
+            "rootWorkspaceId": UUID,
+            "namespace": STR,
+            "changes": described(
+                {"type": "array", "items": _KNOWLEDGE_CHANGE},
+                "Natural keys the memory service reported for the snapshot",
+            ),
+            "truncated": described(
+                BOOL, "The memory service cut the list; the counters stay complete"
+            ),
+            "counters": OBJ,
+        }
+    ),
 )
 _register(
     "project.created",
@@ -1353,6 +1394,280 @@ _register(
     "task",
     "A rule updated, cancelled or completed the work it derived earlier.",
     data({**_WORK, "changes": ARR}, {"verificationId": UUID, "check": ANY}),
+)
+
+# --- processes (CP-ADR-0074, CP-ADR-0076) -----------------------------------
+#
+# The engine's own decision journal is process_instance_events (CP-ADR-0074
+# §5); these events tell the rest of the platform what happened to a case.
+# The case projection (``memory``) carries only the fields the process
+# declares for memory, evaluated by the core (CP-ADR-0076 §2).
+
+_PROCESS_HASH: JsonSchema = {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"}
+_PROCESS_INSTANCE = {
+    "instanceId": UUID,
+    "definitionKey": STR,
+    "version": described(INT, "Version of the process the instance is pinned to"),
+    "instanceKey": described(STR, "Value of start.key; unique per definition key"),
+}
+
+
+def _instance_data(
+    required: Mapping[str, JsonSchema], optional: Mapping[str, JsonSchema] | None = None
+) -> JsonSchema:
+    # The application adds the workspace when it records the event; the
+    # engine's own intents (its replayed journal) do not carry it.
+    workspace = described(UUID_N, "Workspace of the instance: the scope of its case in memory")
+    return data(required, {"workspaceId": workspace, **(optional or {})})
+
+
+_CASE_PROJECTION = described(
+    nullable(OBJ),
+    "Case projection {case, facts, entities, documents} evaluated from the"
+    " process's memory section; null when the process declares none",
+)
+_PROCESS_ERROR: JsonSchema = {
+    "type": "object",
+    "required": ["type"],
+    "properties": {"type": STR, "status": INT_N, "detail": STR_N},
+}
+_REASON = described(
+    {"type": "string", "maxLength": PAYLOAD_TEXT_LIMIT},
+    "Reason given; credential-shaped material redacted, cut to the limit",
+)
+_register(
+    "process.definition_published",
+    "process_definition",
+    "A new immutable version of a process was published (CP-ADR-0074 §3).",
+    data(
+        {
+            "key": STR,
+            "version": INT,
+            "definitionHash": _PROCESS_HASH,
+            "previousVersion": described(INT_N, "Null for the first version of the key"),
+            "workspaceId": UUID_N,
+            "identityAgent": described(STR_N, "Agent key the process acts as"),
+            "displayName": STR,
+            "governedBy": described(
+                ARR, "Regulations of the process as a whole: {document, section}"
+            ),
+            "elements": described(
+                ARR,
+                "Stages, steps, milestones and decision tables: {id, kind, parent,"
+                " displayName, governedBy} — what the memory projection of the"
+                " version is built from (CP-ADR-0076 §3)",
+            ),
+        }
+    ),
+)
+_register(
+    "process.started",
+    "process_instance",
+    "A process instance started from its start trigger.",
+    _instance_data(
+        {
+            **_PROCESS_INSTANCE,
+            "triggerEventId": described(UUID_N, "Journal event that started it"),
+            "triggerType": STR,
+            "memory": _CASE_PROJECTION,
+        }
+    ),
+)
+_register(
+    "process.correlated",
+    "process_instance",
+    "An event matched start.key or a correlate rule of a running instance.",
+    _instance_data(
+        {
+            **_PROCESS_INSTANCE,
+            "triggerEventId": UUID_N,
+            "triggerType": STR,
+            "changedFields": described(ARR, "Data paths the event changed"),
+        }
+    ),
+)
+_register(
+    "process.data_changed",
+    "process_instance",
+    "Instance data changed; timers depending on the fields were recomputed.",
+    _instance_data(
+        {
+            **_PROCESS_INSTANCE,
+            "changedFields": described(ARR, "Data paths that changed"),
+            "element": described(STR_N, "Element whose output or set changed them"),
+            "memory": _CASE_PROJECTION,
+        }
+    ),
+)
+for _moment in ("entered", "exited"):
+    _register(
+        f"process.stage_{_moment}",
+        "process_instance",
+        f"A stage of the case was {_moment}.",
+        _instance_data({**_PROCESS_INSTANCE, "stage": STR}),
+    )
+_register(
+    "process.milestone_reached",
+    "process_instance",
+    "A milestone of the case was reached.",
+    _instance_data({**_PROCESS_INSTANCE, "milestone": STR, "stage": STR_N}),
+)
+_register(
+    "process.milestone_lost",
+    "process_instance",
+    "A reached milestone stopped holding: its guard is false again (a standing goal"
+    " is no longer met); it is reached again when the guard holds again.",
+    _instance_data({**_PROCESS_INSTANCE, "milestone": STR, "stage": STR_N}),
+)
+_register(
+    "process.timer_fired",
+    "process_instance",
+    "A timer of the instance fired; the engine takes it as its next event.",
+    _instance_data({**_PROCESS_INSTANCE, "timerId": UUID, "element": STR, "dueAt": TIME}),
+)
+_register(
+    "process.timer_rescheduled",
+    "process_instance",
+    "A pending timer moved: data or a calendar it reads changed, or on resume.",
+    _instance_data(
+        {
+            **_PROCESS_INSTANCE,
+            "timerId": UUID,
+            "element": STR,
+            "previousDueAt": TIME,
+            "dueAt": TIME,
+            "provisional": described(BOOL, "Computed on a provisional calendar year"),
+            "cause": described(STR, "data_changed, calendar_changed or resumed"),
+            "changedFields": ARR,
+        }
+    ),
+)
+_register(
+    "process.escalated",
+    "process_instance",
+    "An escalation level of a step fired.",
+    _instance_data(
+        {
+            **_PROCESS_INSTANCE,
+            "element": STR,
+            "level": described(INT, "1-based escalation level of the step"),
+            "action": described(STR, "remind, reassign, notify or raise"),
+            "taskId": UUID_N,
+            "to": described(ARR, "Resolved principals the action addresses"),
+        }
+    ),
+)
+_register(
+    "process.suspended",
+    "process_instance",
+    "The instance was suspended; its timers froze.",
+    _instance_data(
+        {
+            **_PROCESS_INSTANCE,
+            "cause": described(STR, "event (a suspend block) or operator"),
+            "reason": _REASON,
+        }
+    ),
+)
+_register(
+    "process.resumed",
+    "process_instance",
+    "The instance was resumed; frozen timers got their remaining time back.",
+    _instance_data({**_PROCESS_INSTANCE, "cause": described(STR, "event or operator")}),
+)
+_register(
+    "process.compensated",
+    "process_instance",
+    "Compensations of completed steps ran in reverse order.",
+    _instance_data(
+        {
+            **_PROCESS_INSTANCE,
+            "scope": described(STR, "all, or the id of the scope compensated"),
+            "steps": described(ARR, "Ids of the steps compensated, in the order run"),
+        }
+    ),
+)
+_register(
+    "process.recall_completed",
+    "process_instance",
+    "Memory answered a recall step; the answer is in the instance journal (CP-ADR-0076 §4).",
+    _instance_data(
+        {
+            **_PROCESS_INSTANCE,
+            "step": STR,
+            "recallId": described(UUID, "Id of the recall intent"),
+            "asOf": TIME,
+            "nodeCount": INT,
+            "edgeCount": INT,
+            "truncated": BOOL,
+            "resultHash": _PROCESS_HASH,
+        }
+    ),
+)
+_register(
+    "process.recall_timed_out",
+    "process_instance",
+    "A recall step got no answer in time; the step's onTimeout runs.",
+    _instance_data(
+        {
+            **_PROCESS_INSTANCE,
+            "step": STR,
+            "recallId": UUID,
+            "reason": described(STR, "timeout, memory_unavailable or memory_disabled"),
+        }
+    ),
+)
+_register(
+    "process.migrated",
+    "process_instance",
+    "The instance moved to another version by the process's migration map.",
+    _instance_data(
+        {
+            **_PROCESS_INSTANCE,
+            "fromVersion": INT,
+            "map": described(OBJ, "Old element id -> new element id"),
+            "policy": STR,
+        }
+    ),
+)
+_register(
+    "process.completed",
+    "process_instance",
+    "The instance completed with an outcome.",
+    _instance_data({**_PROCESS_INSTANCE, "outcome": STR, "memory": _CASE_PROJECTION}),
+)
+_register(
+    "process.cancelled",
+    "process_instance",
+    "An operator cancelled the instance.",
+    _instance_data(
+        {
+            **_PROCESS_INSTANCE,
+            "reason": _REASON,
+            "compensated": described(BOOL, "Compensations ran before the cancel"),
+        }
+    ),
+)
+_register(
+    "process.failed",
+    "process_instance",
+    "An error reached the top of the instance without a handler.",
+    _instance_data({**_PROCESS_INSTANCE, "error": _PROCESS_ERROR, "element": STR_N}),
+)
+_register(
+    "calendar.published",
+    "calendar",
+    "A new version of a working-day calendar was published (CP-ADR-0074 §9).",
+    data(
+        {
+            "key": STR,
+            "version": INT,
+            "calendarHash": _PROCESS_HASH,
+            "previousVersion": INT_N,
+            "years": ARR,
+            "provisionalYears": ARR,
+        }
+    ),
 )
 
 # --- attention ---------------------------------------------------------------

@@ -55,25 +55,16 @@ def _revision(name: str, **overrides: Any) -> AgentRevision:
     )
 
 
-# --- work, review, drain -----------------------------------------------------------
+# --- work, drain -----------------------------------------------------------
 
 
-def test_the_coder_example_takes_its_work_and_asks_a_human_to_review() -> None:
+def test_the_coder_example_takes_its_work() -> None:
     settings = settings_of(_revision("coder.yaml"))
 
     assert settings.workspace_id == "22222222-2222-2222-2222-222222222222"
     assert (settings.only_assigned, settings.include_subprojects) == (True, False)
     assert settings.task_types == frozenset({"coding-task"})
     assert settings.drain_seconds == 14400
-    policy = settings.review_policy
-    assert policy is not None
-    assert (policy.mode, policy.review_type, policy.reviewer_principal_id) == (
-        "human",
-        "code-review-merge",
-        "${SELFDEV_REVIEWER_PRINCIPAL}",
-    )
-    assert policy.reviewed_types == frozenset({"coding-task"})
-    assert settings.review_type == "code-review-merge"
 
 
 def test_defaults_are_the_schemas_not_the_env_modes() -> None:
@@ -82,7 +73,6 @@ def test_defaults_are_the_schemas_not_the_env_modes() -> None:
 
     assert settings.only_assigned is True
     assert settings.task_types == frozenset()
-    assert settings.review_policy is None
     assert settings.drain_seconds == DEFAULT_DRAIN_SECONDS
     assert settings_of(_revision("process-bridge.yaml")).drain_seconds is None
 
@@ -98,15 +88,27 @@ def test_no_placement_is_placed_with_the_defaults() -> None:
     assert isinstance(adapter, ClaudeCodeAdapter)
 
 
-def test_review_none_and_review_without_a_reviewer() -> None:
-    none = _revision("coder.yaml")
-    none.spec["workingCopy"]["review"] = {"mode": "none", "taskType": "code-review"}
-    assert settings_of(none).review_policy is None
+@pytest.mark.parametrize(
+    "review",
+    [
+        {"mode": "human", "taskType": "code-review-merge", "reviewer": "someone"},
+        {"mode": "none"},
+        # Once a reviewer was required; now nothing reads the section.
+        {"mode": "agent"},
+    ],
+)
+def test_working_copy_review_is_ignored(review: dict[str, Any]) -> None:
+    """Review is an acceptance check of the task type (CP-ADR-0073, amendment A2).
 
-    missing = _revision("coder.yaml")
-    missing.spec["workingCopy"]["review"] = {"mode": "agent"}
-    with pytest.raises(RevisionError, match="reviewer"):
-        settings_of(missing)
+    A revision published with the section still runs, without an auto-review.
+    """
+    revision = _revision("coder.yaml")
+    revision.spec["workingCopy"]["review"] = review
+    without = _revision("coder.yaml")
+    del without.spec["workingCopy"]["review"]
+
+    assert settings_of(revision) == settings_of(without)
+    assert "review_policy" not in settings_of(revision).agent_kwargs()
 
 
 def test_config_mode() -> None:

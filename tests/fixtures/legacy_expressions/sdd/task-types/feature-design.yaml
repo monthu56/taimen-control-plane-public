@@ -1,0 +1,119 @@
+# yaml-language-server: $schema=../../schema/v1/object.schema.json
+apiVersion: taimen.ai/v1
+kind: TaskType
+key: feature-design
+spec:
+  displayName: Feature design
+  description: >-
+    Дизайн фичи по конституции (docs/constitution.md): spec.md («что и зачем») и
+    plan.md («как», проверка по статьям) в specs/<featureSlug>/ на ветке фичи, по
+    шаблонам specs/_templates/. Исполняет харнесс владельца (TAI-ADR-0047). Одни
+    ворота — approval после plan: approve запускает feature.design_check и при
+    чистой форме заводит feature-tasks; иначе дизайн возвращается в работу.
+    spec и plan сдаются ещё и артефактами (CP-ADR-0072): следующий шаг получает
+    их входами, а не ищет по пути в git.
+  instructions: |-
+    Шаг «дизайн фичи» цикла spec-driven разработки (TAI-ADR-0047). Результат — два
+    документа на ветке фичи, а не код.
+
+    1. Прочитай `docs/constitution.md` целиком и запомни её версию. Прочитай ADR,
+       задачи и наблюдения, на которые ссылается описание задачи.
+    2. Возьми ветку `customFields.branch` в `customFields.repository`, каталог
+       `specs/<featureSlug>/`. Создай `spec.md` из `specs/_templates/spec.md`:
+       «что и зачем» без стека и путей. Сценарии с приоритетами P1…, требования
+       `**FR-###**`, критерии успеха `**SC-###**` — измеримые, без технологий.
+       Неизвестное помечай `[NEEDS CLARIFICATION: вопрос]` — не догадкой.
+    3. Закрой маркеры: спроси владельца или найди ответ в ADR/коде; запиши ответ в
+       spec. `spec.check@1` должен вернуть `ok` до перехода к plan.
+    4. Создай `plan.md` из `specs/_templates/plan.md`: технический контекст,
+       исследование (решение → обоснование → отвергнутые альтернативы), дизайн,
+       проверка результата для каждого SC. В строке `Конституция:` — версия, по
+       которой проверялся plan.
+    5. Проверка конституции: на каждую статью I–IX — свой ответ на её «проверку
+       плана», не копия шаблона. «⚠️» только с отступлением в таблице
+       «Отступления» и объяснением, почему нельзя проще. «❌» — план не готов.
+    6. Прогони `feature.design_check@1` (repository, ref, slug) и добейся `ok`.
+       Закоммить и опубликуй ветку.
+    6a. Сдай оба документа выходами задачи: `cp_create_artifact` с `file` —
+       `spec.md` типом `spec-document`, `plan.md` типом `plan-document`
+       (`metadata.featureSlug`). Их получит входами шаг `feature-tasks`; без них
+       задача не пройдёт проверку. Правил документы после сдачи — сдай заново
+       (`supersedesArtifactId`), входом всегда идёт последняя ревизия.
+    7. Переведи задачу в `in_review` и запроси ворота (approval) у владельца.
+       В комментарии к задаче: ссылка на ветку, ключевые решения, отступления.
+       Смысл решает человек; скилл проверяет только форму (статья IV).
+
+    Не пиши код реализации и не заводи coding-task: после одобрения шаг
+    `feature-tasks` пишет документ задач, а задачи по нему заводит правило
+    `feature-expand`. Отклонённый дизайн возвращается в `in_progress` с
+    комментарием — исправь и запроси ворота снова.
+  fieldSchema:
+    type: object
+    required: [featureSlug, repository, branch]
+    properties:
+      featureSlug: {type: string, pattern: "^[a-z0-9][a-z0-9-]{0,62}$"}
+      repository: {type: string, maxLength: 500}
+      branch: {type: string, maxLength: 200}
+    additionalProperties: false
+  lifecycleSchema:
+    statuses:
+      - {key: backlog, category: backlog, displayName: Backlog}
+      - {key: todo, category: active, displayName: To do}
+      - {key: in_progress, category: active, displayName: In progress}
+      - {key: blocked, category: blocked, displayName: Blocked}
+      - {key: in_review, category: active, displayName: In review}
+      - {key: done, category: terminal_success, displayName: Done}
+      - {key: cancelled, category: terminal_cancelled, displayName: Cancelled}
+    transitions:
+      - {from: backlog, to: [todo, in_progress, blocked, in_review, done, cancelled]}
+      - {from: todo, to: [backlog, in_progress, blocked, in_review, done, cancelled]}
+      - {from: in_progress, to: [backlog, todo, blocked, in_review, done, cancelled]}
+      - {from: blocked, to: [backlog, todo, in_progress, in_review, done, cancelled]}
+      - {from: in_review, to: [backlog, todo, in_progress, blocked, done, cancelled]}
+    initialStatus: todo
+    claimStatus: in_progress
+    releaseStatus: todo
+    completionStatus: done
+  artifactSchema:
+    outputs:
+      - {key: spec, type: spec-document, required: true}
+      - {key: plan, type: plan-document, required: true}
+  approvalSchema:
+    gates:
+      default:
+        outcomes:
+          approved:
+            - invokeSkill:
+                skill: feature.design_check@1
+                inputs:
+                  repository: "$.task.customFields.repository!"
+                  ref: "$.task.customFields.branch!"
+                  slug: "$.task.customFields.featureSlug!"
+                expect: {status: ok}
+                onSuccess:
+                  - ensureWork:
+                      type: feature-tasks
+                      key: "feature-tasks:$.task.customFields.featureSlug!"
+                      title: "Разбить фичу $.task.customFields.featureSlug! на задачи"
+                      assignee: "$.task.assigneeId"
+                      priority: "$.task.priority"
+                      workspace: "$.task.workspaceId"
+                      relation: {spawned_by: "$.task.id!"}
+                      customFields:
+                        featureSlug: "$.task.customFields.featureSlug!"
+                        repository: "$.task.customFields.repository!"
+                        branch: "$.task.customFields.branch!"
+                        designTask: "$.task.publicId!"
+                      description: |-
+                        Дизайн $.task.publicId одобрен. Разбей plan фичи $.task.customFields.featureSlug! на задачи: spec и plan — входы этой задачи (раздел «Входы»), результат — документ tasks выходом; фазы, зависимости, [P] для параллельного, у каждой задачи ссылки на FR/SC spec и критерии приёмки: документ задач по форме шаблона (инструкции шага) — коммитом в ветку фичи и выходом tasks-document. Задачи исполнения и сходимости заведёт правило feature-expand после завершения шага. Репозиторий $.task.customFields.repository!, ветка фичи $.task.customFields.branch!.
+                  - completeTask: {}
+                onFailure:
+                  - comment:
+                      body: |-
+                        Дизайн одобрен, но не прошёл проверку формы (feature.design_check): исправь и запроси ворота снова.
+                        $.invocation.output.text$.invocation.error.message
+                  - transition: {status: in_progress}
+          rejected:
+            - comment:
+                body: "Дизайн отклонён: $.approval.comment"
+            - transition: {status: in_progress}

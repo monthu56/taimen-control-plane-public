@@ -1,0 +1,284 @@
+# Recorded facts the expressions of selfdev, sdd and notify are evaluated on,
+# once in their earlier syntax and once translated into CEL (CP-ADR-0075 §7).
+#
+# events — journal events in the shapes the event catalog records
+# (observation.recorded of the git connector, task.completed,
+# task.verification_failed), with what a work rule reads next to them: the
+# task view, the interpreting skill's invocation and the forEach items.
+# Some lack fields on purpose: a missing value must read the same way.
+#
+# decisions — what an approval outcome, an acceptance check or a context
+# anchor reads: the task (with the newest artifact per type), the task it was
+# spawned by, the decided approval and the skill invocation an
+# onSuccess/onFailure reacts to.
+events:
+  - name: commit on the superproject
+    event:
+      id: 5f0c1c52-0a51-4a8e-9a0e-3f3f6f1d0a01
+      type: observation.recorded
+      time: "2026-09-27T08:15:02.114Z"
+      entityType: observation
+      entityId: 0d9f2c4e-7c55-4bb4-8f52-2b0d8a7e1c11
+      payload:
+        kind: repo.commit_observed
+        source: git-connector
+        observedAt: "2026-09-27T08:15:01Z"
+        dedupKey: project-taimen-ai@8c4e1f0b
+        data:
+          repo: project-taimen-ai
+          branch: main
+          sha: 8c4e1f0b9d2a4b7e6f1a3c5d7e9f0a2b4c6d8e0f
+          url: https://git.example.org/taimen/project-taimen-ai.git
+    skill:
+      invocationId: 9b1a7c2e-3d4f-4a5b-8c6d-7e8f9a0b1c21
+      skill: oss.check@1
+      status: succeeded
+      output:
+        failing: [control-plane]
+        current: [memory-service]
+        ready: [control-plane, iam-service]
+        pages: [docs/adr/0075-cel-expression-profile.md]
+        lagging: []
+  - name: commit on control-plane
+    event:
+      id: 5f0c1c52-0a51-4a8e-9a0e-3f3f6f1d0a02
+      type: observation.recorded
+      time: "2026-09-27T09:40:11.500Z"
+      entityType: observation
+      entityId: 0d9f2c4e-7c55-4bb4-8f52-2b0d8a7e1c12
+      payload:
+        kind: repo.commit_observed
+        source: git-connector
+        observedAt: "2026-09-27T09:40:10Z"
+        data:
+          repo: control-plane
+          branch: main
+          sha: fe26b21c0a1b2c3d4e5f60718293a4b5c6d7e8f9
+          url: https://git.example.org/taimen/control-plane.git
+    skill:
+      invocationId: 9b1a7c2e-3d4f-4a5b-8c6d-7e8f9a0b1c22
+      skill: migrations.check@1
+      status: succeeded
+      output:
+        failing: []
+  - name: commit on iam-service without a url
+    event:
+      id: 5f0c1c52-0a51-4a8e-9a0e-3f3f6f1d0a03
+      type: observation.recorded
+      time: "2026-09-27T10:02:44Z"
+      entityType: observation
+      entityId: 0d9f2c4e-7c55-4bb4-8f52-2b0d8a7e1c13
+      payload:
+        kind: repo.commit_observed
+        source: git-connector
+        observedAt: "2026-09-27T10:02:43Z"
+        data:
+          repo: iam-service
+          branch: main
+          sha: 1234567890abcdef1234567890abcdef12345678
+    skill:
+      invocationId: 9b1a7c2e-3d4f-4a5b-8c6d-7e8f9a0b1c23
+      skill: submodule.lag_check@1
+      status: failed
+      output: {}
+  - name: an observation without data
+    event:
+      id: 5f0c1c52-0a51-4a8e-9a0e-3f3f6f1d0a04
+      type: observation.recorded
+      time: "2026-09-27T10:05:00Z"
+      entityType: observation
+      entityId: 0d9f2c4e-7c55-4bb4-8f52-2b0d8a7e1c14
+      payload:
+        kind: repo.commit_observed
+        content: heartbeat
+        observedAt: "2026-09-27T10:05:00Z"
+  - name: CI red on main
+    event:
+      id: 5f0c1c52-0a51-4a8e-9a0e-3f3f6f1d0a05
+      type: observation.recorded
+      time: "2026-09-24T21:10:09Z"
+      entityType: observation
+      entityId: 0d9f2c4e-7c55-4bb4-8f52-2b0d8a7e1c15
+      payload:
+        kind: ci.run_observed
+        source: git-connector
+        observedAt: "2026-09-24T21:10:08Z"
+        data:
+          repo: project-taimen-ai
+          branch: main
+          workflow: ci
+          conclusion: failure
+          sha: 8c4e1f0b9d2a4b7e6f1a3c5d7e9f0a2b4c6d8e0f
+          url: https://git.example.org/taimen/project-taimen-ai/actions/runs/1
+          failedJobs: [control-plane, bidops, memory-service]
+    items: [control-plane, bidops, memory-service]
+  - name: CI green on a feature branch
+    event:
+      id: 5f0c1c52-0a51-4a8e-9a0e-3f3f6f1d0a06
+      type: observation.recorded
+      time: "2026-09-25T07:00:00Z"
+      entityType: observation
+      entityId: 0d9f2c4e-7c55-4bb4-8f52-2b0d8a7e1c16
+      payload:
+        kind: ci.run_observed
+        source: git-connector
+        observedAt: "2026-09-25T06:59:58Z"
+        data:
+          repo: project-taimen-ai
+          branch: feature/process-packages
+          workflow: ci
+          conclusion: success
+          failedJobs: []
+  - name: feature-tasks step completed
+    event:
+      id: 5f0c1c52-0a51-4a8e-9a0e-3f3f6f1d0a07
+      type: task.completed
+      time: "2026-09-27T06:30:00Z"
+      entityType: task
+      entityId: 3c2b1a09-8f7e-4d6c-b5a4-938271605f41
+      payload: {publicId: TASK-000716, status: done, systemStatusCategory: terminal_success,
+                version: 7, verificationId: 6e5d4c3b-2a19-4807-b6f5-e4d3c2b1a091, attempt: 1}
+    task:
+      id: 3c2b1a09-8f7e-4d6c-b5a4-938271605f41
+      publicId: TASK-000716
+      typeKey: feature-tasks
+      typeVersion: 3
+      title: Разбить фичу process-packages на задачи
+      status: done
+      systemStatusCategory: terminal_success
+      priority: normal
+      workspaceId: 7a6b5c4d-3e2f-4a1b-9c8d-7e6f5a4b3c21
+      assigneeId: 2b3c4d5e-6f7a-4b8c-9d0e-1f2a3b4c5d61
+      customFields: {featureSlug: process-packages, repository: https://git.example.org/taimen/project-taimen-ai.git,
+                     branch: feature/process-packages}
+    skill:
+      invocationId: 9b1a7c2e-3d4f-4a5b-8c6d-7e8f9a0b1c27
+      skill: tasks.check@1
+      status: succeeded
+      output:
+        items:
+          - {type: coding-task, dedupKey: "feature:process-packages:P005", title: P005 — профиль CEL}
+          - {type: feature-converge, dedupKey: "feature:process-packages:converge:control-plane"}
+  - name: coding-task completed
+    event:
+      id: 5f0c1c52-0a51-4a8e-9a0e-3f3f6f1d0a08
+      type: task.completed
+      time: "2026-09-27T07:30:00Z"
+      entityType: task
+      entityId: 3c2b1a09-8f7e-4d6c-b5a4-938271605f42
+      payload: {publicId: TASK-000720, status: done, systemStatusCategory: terminal_success, version: 9}
+    task:
+      id: 3c2b1a09-8f7e-4d6c-b5a4-938271605f42
+      publicId: TASK-000720
+      typeKey: coding-task
+      title: P004 — календарь
+      status: done
+      priority: normal
+      customFields: {baseBranch: feature/process-packages}
+  - name: verification failed, back to the executor
+    event:
+      id: 5f0c1c52-0a51-4a8e-9a0e-3f3f6f1d0a09
+      type: task.verification_failed
+      time: "2026-09-26T18:12:40Z"
+      entityType: task
+      entityId: 3c2b1a09-8f7e-4d6c-b5a4-938271605f43
+      payload: {verificationId: 6e5d4c3b-2a19-4807-b6f5-e4d3c2b1a093, attempt: 1, results: [],
+                failedCheck: review, reason: approval_rejected, consecutiveFailures: 1,
+                blocked: false, fromStatus: in_review, status: todo, systemStatusCategory: todo}
+  - name: verification failed and blocked
+    event:
+      id: 5f0c1c52-0a51-4a8e-9a0e-3f3f6f1d0a10
+      type: task.verification_failed
+      time: "2026-09-26T19:00:00Z"
+      entityType: task
+      entityId: 3c2b1a09-8f7e-4d6c-b5a4-938271605f44
+      payload: {attempt: 3, failedCheck: merge, reason: merge_conflict, consecutiveFailures: 3,
+                blocked: true, fromStatus: in_review, status: blocked}
+  - name: verification failed, recorded before blocked existed
+    event:
+      id: 5f0c1c52-0a51-4a8e-9a0e-3f3f6f1d0a11
+      type: task.verification_failed
+      time: "2026-09-20T12:00:00Z"
+      entityType: task
+      entityId: 3c2b1a09-8f7e-4d6c-b5a4-938271605f45
+      payload: {attempt: 1, failedCheck: form, reason: check_failed, status: todo}
+
+decisions:
+  - name: published commit, approved, merge succeeded
+    task:
+      id: 3c2b1a09-8f7e-4d6c-b5a4-938271605f46
+      publicId: TASK-000720
+      title: "P004 — календарь: вид каталога, API, домен"
+      description: Календарь для cal.* (CP-ADR-0074 п.9)
+      assigneeId: 2b3c4d5e-6f7a-4b8c-9d0e-1f2a3b4c5d61
+      workspaceId: 7a6b5c4d-3e2f-4a1b-9c8d-7e6f5a4b3c21
+      status: in_review
+      priority: normal
+      customFields:
+        path: control-plane
+        pinned: 74809ce0a1b2c3d4e5f60718293a4b5c6d7e8f90
+        head: fe26b21c0a1b2c3d4e5f60718293a4b5c6d7e8f9
+        featureSlug: process-packages
+        repository: https://git.example.org/taimen/control-plane.git
+        branch: feature/process-packages
+        commit: fe26b21c0a1b2c3d4e5f60718293a4b5c6d7e8f9
+        targetBranch: main
+        url: https://git.example.org/taimen/oss.git
+      artifacts:
+        commit:
+          metadata:
+            published: true
+            repository: https://git.example.org/taimen/control-plane.git
+            branch: task/TASK-000720
+            commit: d6bc318a1b2c3d4e5f60718293a4b5c6d7e8f901
+            targetBranch: feature/process-packages
+    approval: {id: 1f2e3d4c-5b6a-4978-8a6b-5c4d3e2f1a01, comment: Одобрено, decidedBy: 2b3c4d5e-6f7a-4b8c-9d0e-1f2a3b4c5d62,
+               decidedAt: "2026-09-27T07:10:00+00:00", outcome: approved}
+    invocation: {id: 9b1a7c2e-3d4f-4a5b-8c6d-7e8f9a0b1c31, skill: git.merge@1, status: succeeded,
+                 output: {merged: true, text: "ok"}}
+  - name: unpublished commit, rejected without comment, merge conflict
+    task:
+      id: 3c2b1a09-8f7e-4d6c-b5a4-938271605f47
+      publicId: TASK-000724
+      title: P007 — движок
+      assigneeId: null
+      workspaceId: 7a6b5c4d-3e2f-4a1b-9c8d-7e6f5a4b3c21
+      status: in_review
+      priority: high
+      customFields:
+        path: memory-service
+        pinned: 74809ce0a1b2c3d4e5f60718293a4b5c6d7e8f90
+        head: 500e08d0a1b2c3d4e5f60718293a4b5c6d7e8f91
+        featureSlug: declarative-cycle
+        repository: https://git.example.org/taimen/memory-service.git
+        branch: feature/declarative-cycle
+        commit: b009a63a1b2c3d4e5f60718293a4b5c6d7e8f902
+        targetBranch: master
+      artifacts:
+        commit:
+          metadata:
+            published: false
+            repository: https://git.example.org/taimen/memory-service.git
+            branch: task/TASK-000724
+            commit: ebc85523b14d3c4d5e60718293a4b5c6d7e8f903
+            targetBranch: master
+    approval: {id: 1f2e3d4c-5b6a-4978-8a6b-5c4d3e2f1a02, comment: null, decidedBy: 2b3c4d5e-6f7a-4b8c-9d0e-1f2a3b4c5d62,
+               outcome: rejected}
+    invocation:
+      id: 9b1a7c2e-3d4f-4a5b-8c6d-7e8f9a0b1c32
+      skill: git.merge@1
+      status: failed
+      output: {merged: false, reason: conflict, details: "CONFLICT (content): Merge conflict in src/control_plane/domain/cel_profile.py"}
+      error: {code: merge_conflict, message: the branch does not merge cleanly}
+  - name: a task without its commit artifact and custom fields
+    task:
+      id: 3c2b1a09-8f7e-4d6c-b5a4-938271605f48
+      publicId: TASK-000730
+      title: Ручная задача
+      description: ""
+      status: todo
+      priority: low
+      customFields: {}
+    approval: {id: 1f2e3d4c-5b6a-4978-8a6b-5c4d3e2f1a03, outcome: rejected, comment: "Нет ветки"}
+    invocation: {id: 9b1a7c2e-3d4f-4a5b-8c6d-7e8f9a0b1c33, skill: feature.design_check@1, status: failed,
+                 error: {code: skill_timeout, message: the check did not answer in time}}

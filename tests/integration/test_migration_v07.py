@@ -17,7 +17,7 @@ from sqlalchemy import inspect, text
 from sqlalchemy.engine import Engine
 
 V06_HEAD = "72ef8bc31a06"
-CURRENT_HEAD = "439255fb8627"
+CURRENT_HEAD = "d7f2a9c4e1b8"
 # The revision right before the harness manifests were dropped (D007).
 BEFORE_MANIFEST_DROP = "d7e2a9c4f1b8"
 MANIFEST_TABLES = {"run_harness_manifests", "run_manifest_ephemerals"}

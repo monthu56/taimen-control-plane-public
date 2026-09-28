@@ -1,0 +1,105 @@
+# yaml-language-server: $schema=../../schema/v1/object.schema.json
+apiVersion: taimen.ai/v1
+kind: TaskType
+key: coding-task
+spec:
+  displayName: Coding task
+  description: >-
+    Результат — код на опубликованной ветке. Задача выполнена, только когда
+    ревью одобрено человеком и ветка влита (приёмка типа, TAI-ADR-0053,
+    CP-ADR-0067 В5–В7): до этого её зависимые не выдаются исполнителям.
+    Отклонённое ревью или неудачное вливание возвращают задачу тому же
+    исполнителю на ту же ветку.
+  fieldSchema:
+    type: object
+    properties:
+      # Ветка, от которой отводится ветка задачи и в которую вливается ревью
+      # (ветка фичи, TAI-ADR-0047 амендмент 2026-09-25); нет — ветка по умолчанию
+      # репозитория.
+      baseBranch: {type: string, maxLength: 200}
+  lifecycleSchema:
+    statuses:
+      - {key: backlog, category: backlog, displayName: Backlog}
+      - {key: todo, category: active, displayName: To do}
+      - {key: in_progress, category: active, displayName: In progress}
+      - {key: blocked, category: blocked, displayName: Blocked}
+      - {key: in_review, category: active, displayName: In review}
+      - {key: done, category: terminal_success, displayName: Done}
+      - {key: cancelled, category: terminal_cancelled, displayName: Cancelled}
+    transitions:
+      - {from: backlog, to: [todo, in_progress, blocked, in_review, done, cancelled]}
+      - {from: todo, to: [backlog, in_progress, blocked, in_review, done, cancelled]}
+      - {from: in_progress, to: [backlog, todo, blocked, in_review, done, cancelled]}
+      - {from: blocked, to: [backlog, todo, in_progress, in_review, done, cancelled]}
+      - {from: in_review, to: [backlog, todo, in_progress, blocked, done, cancelled]}
+    initialStatus: todo
+    claimStatus: in_progress
+    releaseStatus: todo
+    completionStatus: done
+  instructions: |-
+    Задача на код в одном репозитории; результат — коммит на ветке задачи, его
+    опубликует исполнитель-демон. После сдачи задачу принимают критерии типа:
+    ревью человека, затем вливание ветки. Отказ ревью или конфликт вливания
+    возвращают задачу тебе: причина — в комментарии провала проверки, ветка —
+    та же, продолжай её, а не начинай новую.
+
+    Проверки:
+    - Сначала запускай только затронутые тесты; полный набор, как в CI, — один раз,
+      перед завершением.
+    - Одновременно — только один прогон тестов и не в фоне: общие ресурсы
+      (тестовая база) не рассчитаны на параллельные прогоны. Прогон молчит дольше
+      нескольких минут — останови его и найди причину, не запускай второй.
+    - Задавай разумный таймаут команд; час ожидания без вывода — это сбой, а не
+      работа.
+
+    Результат: итог первой строкой; какие проверки прошли и с каким результатом;
+    что осталось или требует решения человека.
+  approvalSchema: {}
+  # Приёмка типа (TAI-ADR-0053 п.1, CP-ADR-0067 В5–В7): ревью и вливание — критерии
+  # самой задачи, а не отдельная задача code-review-merge. Задача без опубликованного
+  # коммита (when не выполнен) пропускает оба и становится выполненной сразу.
+  # merge — внешняя запись (git.merge@1, external_write): допустима только после
+  # human с тем же when; вызов идёт полномочиями решившего ревью, основание —
+  # его approval. Провал любого критерия — комментарий и возврат задачи в todo тому
+  # же исполнителю; повторная сдача запрашивает новое решение.
+  acceptance:
+    - key: review
+      kind: human
+      description: >-
+        Ревью кода человеком: сделано ли то, что требовалось; не сломаны ли тесты,
+        миграции и контракты API; нет ли секретов, локальных путей и лишних файлов;
+        соответствие ADR и конституции. Смотреть изменения ветки от merge-base с
+        целевой веткой (метаданные артефакта commit). approve — ветка вливается,
+        reject — задача возвращается исполнителю с комментарием решения.
+      spec:
+        approver: ${SELFDEV_REVIEWER_PRINCIPAL}
+      when:
+        - "$.task.artifact[commit].metadata.published"
+    - key: merge
+      kind: deterministic
+      description: >-
+        Одобренный коммит влит в целевую ветку скиллом git.merge@1; конфликт или
+        сдвинутая ветка — провал с причиной, задача возвращается исполнителю.
+      spec:
+        skill: git.merge@1
+        inputs:
+          repository: "$.task.artifact[commit].metadata.repository!"
+          branch: "$.task.artifact[commit].metadata.branch!"
+          commit: "$.task.artifact[commit].metadata.commit!"
+          target: "$.task.artifact[commit].metadata.targetBranch!"
+          message: "Merge $.task.publicId!: $.task.title"
+        expect: {merged: true}
+      when:
+        - "$.task.artifact[commit].metadata.published"
+  # Профиль контекста (TAI-ADR-0042 п.3, CP-ADR-0064): якоря из описания задачи →
+  # граф software-delivery в памяти → вызывающие, место определения, управляющий ADR.
+  contextSchema:
+    anchors:
+      - from: description
+        kinds: [endpoint, adr, event, table]
+    traverse:
+      - {relation: calls, direction: in, depth: 1, limit: 20}
+      - {relation: defined_in, direction: out, depth: 1}
+      - {relation: governs, direction: in, from: previous}
+    asOf: taskCreated
+    budgetTokens: 4000

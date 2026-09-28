@@ -1,0 +1,50 @@
+# yaml-language-server: $schema=../../schema/v1/object.schema.json
+# Опубликовать ревизию компонента в открытой поставке (TAI-ADR-0043, амендмент
+# 2026-09-25; фича oss-sync). Работу заводит правило oss-sync на коммит суперпроекта
+# для каждого компонента, чья закреплённая ревизия прошла oss.check; исполняет её
+# скилл oss.publish@1 (execution, CP-ADR-0056 M2.2): повторная проверка, перемотка
+# oss/X.Y только вперёд, сдвиг сабмодуля в umbrella. Агенту такая работа не
+# достаётся; ревью нет — внешнее действие проверяет сам скилл. Теги релиза ставит
+# человек, не этот тип.
+apiVersion: taimen.ai/v1
+kind: TaskType
+key: oss-publish
+spec:
+  displayName: OSS publish
+  description: >-
+    Перемотать ветку открытой поставки компонента на проверенную ревизию и сдвинуть
+    его сабмодуль в umbrella. Исполняет скилл oss.publish@1.
+  execution:
+    skill: oss.publish
+    version: "1"
+    inputs: $.customFields
+  fieldSchema:
+    type: object
+    required: [component, sha, repository, ossBranch, umbrella, umbrellaBranch, superproject]
+    additionalProperties: false
+    properties:
+      component: {type: string, pattern: "^[a-z0-9][a-z0-9-]*$", description: Путь сабмодуля}
+      sha: {type: string, pattern: "^[0-9a-f]{40}$", description: Ревизия, закреплённая суперпроектом}
+      repository: {type: string, maxLength: 500}
+      ossBranch: {type: string, pattern: "^oss/[0-9]+\\.[0-9]+$"}
+      umbrella: {type: string, maxLength: 500}
+      umbrellaBranch: {type: string, maxLength: 200}
+      superproject: {type: string, maxLength: 500}
+      superprojectRef: {type: string, maxLength: 100, description: Коммит суперпроекта, на котором проверено}
+      mirror: {type: string, maxLength: 500, description: Публичное зеркало компонента (TAI-ADR-0043, амендмент 2)}
+  lifecycleSchema:
+    statuses:
+      - {key: todo, category: active, displayName: To do}
+      - {key: in_progress, category: active, displayName: In progress}
+      - {key: blocked, category: blocked, displayName: Blocked}
+      - {key: done, category: terminal_success, displayName: Done}
+      - {key: cancelled, category: terminal_cancelled, displayName: Cancelled}
+    transitions:
+      - {from: todo, to: [in_progress, blocked, done, cancelled]}
+      - {from: in_progress, to: [todo, blocked, done, cancelled]}
+      - {from: blocked, to: [todo, in_progress, done, cancelled]}
+    initialStatus: todo
+    claimStatus: in_progress
+    releaseStatus: todo
+    completionStatus: done
+  approvalSchema: {}

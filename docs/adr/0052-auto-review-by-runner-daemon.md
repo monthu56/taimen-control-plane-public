@@ -1,6 +1,16 @@
 # ADR-0052: Автоматическое ревью кода — задача ревьюеру заводит демон runner'а
 
-Статус: Accepted (BidOps BO-13, 2026-09-11); амендмент 2026-09-23 — режим `human`
+Статус: Superseded — [ADR-0067](0067-verification-stage.md), амендмент
+2026-09-27 (фича `declarative-cycle`, C002 — TASK-000641): ревью и вливание —
+критерии приёмки самой задачи, которые объявляет её тип (`human` ревьюера, затем
+вливание скиллом после его решения), а не задача `code-review`, которую заводит
+демон. Отклонение и неудачное вливание возвращают задачу исполнителю, задач правок
+нет. Раздел `workingCopy.review` описания агента выводится
+([ADR-0073](0073-agent-registry.md), амендмент А2). Код демона (`review.py`,
+`_request_review`, `_record_verdict`, переменные `CONTROL_PLANE_AGENT_REVIEW*`)
+удалён в C006 (TASK-000645, 2026-09-27); открытые ревью `code-review-merge`
+доводятся по прежней схеме — исходами approval их типа, без демона. Принято (BidOps BO-13, 2026-09-11); амендмент
+2026-09-23 — режим `human`.
 
 Контекст: ADR-0016 — адаптеры автономного рантайма и execution workspace;
 ADR-0019 — природа работы и ревью кода другим вендором; ADR-0046 — отношения
@@ -141,15 +151,13 @@ metadata артефакта `commit` рядом с `branch`/`commit`/`published`
 
 ## Conformance
 
-Пробы для `adr.conformance_check` (пилот «саморазработка»):
+Пробы для `adr.conformance_check` (пилот «саморазработка»). Решение заменено,
+код удалён в declarative-cycle C006 (TASK-000645): пробы проверяют, что пути
+авто-ревью в демоне нет.
 
 ```conformance
-- file: src/control_plane_agent/review.py
+- absent: {path: "src/control_plane_agent/**/*.py", pattern: '_request_review|_record_verdict|CONTROL_PLANE_AGENT_REVIEW'}
   repo: control-plane
-- grep: {path: src/control_plane_agent/review.py, pattern: 'REVIEW_MODES = \("agent", "human"\)'}
-  repo: control-plane
-- grep: {path: src/control_plane_agent/main.py, pattern: "_request_review_approval"}
-  repo: control-plane
-- grep: {path: tests/unit/test_agent_review.py, pattern: "test_human_mode_opens_one_gate_approval"}
+- absent: {path: src/control_plane_agent/revision.py, pattern: 'ReviewPolicy|review_policy'}
   repo: control-plane
 ```

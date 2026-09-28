@@ -157,6 +157,7 @@ async def test_a_required_output_is_checked_even_without_acceptance(
         {
             "key": "output.plan",
             "kind": "deterministic",
+            "source": "output",
             "description": "Required output plan (plan-doc)",
             "spec": {
                 "artifact": {

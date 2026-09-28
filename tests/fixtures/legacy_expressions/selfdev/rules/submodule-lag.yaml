@@ -1,0 +1,50 @@
+# yaml-language-server: $schema=../../schema/v1/object.schema.json
+# Указатель сабмодуля догоняет компонент (ADR-0029: «изменение в компоненте
+# коммитится в его репозитории; указатель в суперпроекте bump'ается отдельным
+# коммитом»): на коммите main компонента скилл submodule.lag_check@1 сверяет
+# указатель в main суперпроекта с головой ветки компонента; отстаёт — решение
+# submodule-bump с воротами (TAI-ADR-0053 п.6): approve сдвигает указатель скиллом
+# git.bump_submodule@1 ровно на наблюдённую голову. Дедуп по сабмодулю: одно
+# открытое решение, пока указатель не догонит; закрывает его правило
+# submodule-lag-resolved на коммите суперпроекта (тот же ключ). Открытая задача
+# devops с этим ключом, заведённая прежней версией правила, находится по ключу и
+# новой не дублируется.
+apiVersion: taimen.ai/v1
+kind: WorkRule
+key: submodule-lag
+spec:
+  description: Компонент ушёл вперёд, указатель в суперпроекте отстаёт — решение о сдвиге указателя
+  workspaceId: ${SELFDEV_WORKSPACE_ID}
+  identity: {agent: selfdev-rules}
+  trigger: {kind: observation, type: repo.commit_observed}
+  condition:
+    in: [{var: payload.data.repo}, [control-plane, memory-service, iam-service, notification-service]]
+  interpretation:
+    skill: submodule.lag_check@1
+    inputs:
+      repository: ${SELFDEV_SUPERPROJECT_URL}
+      ref: main
+      submodules: ["{{payload.data.repo}}"]
+  action:
+    kind: request_decision
+    taskType: submodule-bump
+    forEach: skill.output.lagging
+    dedupKeyTemplate: "submodule-lag:{{item.path}}"
+    fields:
+      title: "Сдвинуть указатель сабмодуля {{item.path}} на {{item.head}}"
+      priority: medium
+      # решает ревьюер установки — тот же, что одобряет ревью кода
+      approver: ${SELFDEV_REVIEWER_PRINCIPAL}
+      description: |
+        Компонент {{item.path}} ушёл вперёд: в main суперпроекта закреплён {{item.pinned}},
+        голова ветки {{item.branch}} — {{item.head}} (наблюдён коммит {{payload.data.sha}}).
+
+        Решение: approve сдвигает указатель `{{item.path}}` на {{item.head}} отдельным коммитом
+        в main суперпроекта (скилл git.bump_submodule@1), reject — отменяет. Если указатель
+        догонят иначе, задачу закроет правило submodule-lag-resolved.
+      customFields:
+        path: "{{item.path}}"
+        pinned: "{{item.pinned}}"
+        head: "{{item.head}}"
+        branch: "{{item.branch}}"
+        repository: "{{payload.data.url}}"

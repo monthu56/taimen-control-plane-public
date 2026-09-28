@@ -81,6 +81,9 @@ Control Plane; official-клиентство не даёт Claude Code ника�
 | `cp_list_task_types` / `cp_get_task_type` | реестр типов work item, read-only: словарь статусов и граф переходов тенанта |
 | `cp_create_goal` / `cp_update_goal` / `cp_list_goals` / `cp_get_goal` | цели (ADR-0062): желаемое состояние, критерии, работа цели, закрытие цели (`status` achieved/abandoned); `cp_create_task` принимает `goal_id`, `origin`, `acceptance`, `evidence` |
 | `cp_list_rules` / `cp_get_rule` | правила вывода работы (ADR-0063), read-only: триггер, условие, скилл интерпретации, действие и история оценок — откуда взялась задача с `origin.kind = rule` |
+| `cp_pkg_check` / `cp_pkg_test` / `cp_pkg_plan` | автор процессов (CP-ADR-0074 §17): каталог пакета с диска — проверка в ядре, тесты в песочнице с покрытием, план применения с `planHash`; ничего не пишут |
+| `cp_pkg_apply` | применить пакет **только по `planHash`** плана, который видел пользователь; без хэша — отказ `plan_hash_required`, устаревший план — `plan_stale` |
+| `cp_process_get` / `cp_process_explain` | процесс по `key` или `key@version` с его версиями; объяснение экземпляра — решения по журналу с причинами, ответы памяти на `recall` и регламенты (`governedBy`) каждого решения |
 | `cp_claim_task` / `cp_release_task` | захват/освобождение (явные действия) |
 | `cp_start_run` / `cp_get_run` / `cp_get_run_context` | исполнение |
 | `cp_checkpoint` | durable operational state для resume |

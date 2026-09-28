@@ -47,12 +47,13 @@ N+1 без изменений и игнорирует незнакомые по�
 | [`approval.outcome_executed`](#approvaloutcome_executed) | `approval` | 1 | The outcome actions the task type declares for the decision were executed. |
 | [`approval.outcome_failed`](#approvaloutcome_failed) | `approval` | 1 | An outcome action failed; the remaining actions stay for replay. |
 | [`approval.rejected`](#approvalrejected) | `approval` | 2 | The approval was rejected by an eligible principal. |
-| [`approval.requested`](#approvalrequested) | `approval` | 2 | A decision was requested from a principal or from the holders of a role. |
+| [`approval.requested`](#approvalrequested) | `approval` | 3 | A decision was requested from a principal or from the holders of a role. |
 | [`artifact.content_purged`](#artifactcontent_purged) | `artifact` | 1 | The bytes of an artifact were removed by an administrator; the record stays. |
 | [`artifact.content_read`](#artifactcontent_read) | `artifact` | 1 | The bytes of an artifact were handed out (CP-ADR-0072 §5). |
 | [`artifact.created`](#artifactcreated) | `artifact` | 2 | An artifact was recorded. |
 | [`artifact_type.created`](#artifact_typecreated) | `artifact_type` | 1 | An artifact type version was created (CP-ADR-0072). |
 | [`attention.feedback_recorded`](#attentionfeedback_recorded) | `attention_feedback` | 1 | A principal judged an item of its attention list (CP-ADR-0071). |
+| [`calendar.published`](#calendarpublished) | `calendar` | 1 | A new version of a working-day calendar was published (CP-ADR-0074 §9). |
 | [`capability.assigned`](#capabilityassigned) | `principal` | 1 | A capability was assigned to the principal. |
 | [`capability.created`](#capabilitycreated) | `capability` | 1 | A capability was created. |
 | [`capability.revoked`](#capabilityrevoked) | `principal` | 1 | A capability was revoked from the principal. |
@@ -69,11 +70,32 @@ N+1 без изменений и игнорирует незнакомые по�
 | [`iam_binding.created`](#iam_bindingcreated) | `iam_binding` | 1 | An IAM identity was bound to a local principal (CP-ADR-0053). |
 | [`iam_binding.revoked`](#iam_bindingrevoked) | `iam_binding` | 1 | An IAM binding was revoked; the identity no longer enters. |
 | [`iam_binding.updated`](#iam_bindingupdated) | `iam_binding` | 1 | The permissions of an IAM binding changed. |
+| [`knowledge.changed`](#knowledgechanged) | `workspace` | 1 | A knowledge snapshot opened, changed or closed documents in memory (CP-ADR-0076 §6); an empty reconciliation writes no event. |
 | [`knowledge.pack_registered`](#knowledgepack_registered) | `knowledge_pack` | 1 | A domain knowledge pack version was registered. |
 | [`knowledge.packs_configured`](#knowledgepacks_configured) | `workspace` | 1 | The knowledge packs of a workspace tree were configured. |
 | [`knowledge.snapshot_reconciled`](#knowledgesnapshot_reconciled) | `workspace` | 1 | A knowledge snapshot was reconciled into the memory service (CP-ADR-0060). |
 | [`observation.recorded`](#observationrecorded) | `observation` | 1 | An observation was recorded (ADR-0057). |
 | [`principal.created`](#principalcreated) | `principal` | 1 | A principal (human, agent or service) was created. |
+| [`process.cancelled`](#processcancelled) | `process_instance` | 1 | An operator cancelled the instance. |
+| [`process.compensated`](#processcompensated) | `process_instance` | 1 | Compensations of completed steps ran in reverse order. |
+| [`process.completed`](#processcompleted) | `process_instance` | 1 | The instance completed with an outcome. |
+| [`process.correlated`](#processcorrelated) | `process_instance` | 1 | An event matched start.key or a correlate rule of a running instance. |
+| [`process.data_changed`](#processdata_changed) | `process_instance` | 1 | Instance data changed; timers depending on the fields were recomputed. |
+| [`process.definition_published`](#processdefinition_published) | `process_definition` | 1 | A new immutable version of a process was published (CP-ADR-0074 §3). |
+| [`process.escalated`](#processescalated) | `process_instance` | 1 | An escalation level of a step fired. |
+| [`process.failed`](#processfailed) | `process_instance` | 1 | An error reached the top of the instance without a handler. |
+| [`process.migrated`](#processmigrated) | `process_instance` | 1 | The instance moved to another version by the process's migration map. |
+| [`process.milestone_lost`](#processmilestone_lost) | `process_instance` | 1 | A reached milestone stopped holding: its guard is false again (a standing goal is no longer met); it is reached again when the guard holds again. |
+| [`process.milestone_reached`](#processmilestone_reached) | `process_instance` | 1 | A milestone of the case was reached. |
+| [`process.recall_completed`](#processrecall_completed) | `process_instance` | 1 | Memory answered a recall step; the answer is in the instance journal (CP-ADR-0076 §4). |
+| [`process.recall_timed_out`](#processrecall_timed_out) | `process_instance` | 1 | A recall step got no answer in time; the step's onTimeout runs. |
+| [`process.resumed`](#processresumed) | `process_instance` | 1 | The instance was resumed; frozen timers got their remaining time back. |
+| [`process.stage_entered`](#processstage_entered) | `process_instance` | 1 | A stage of the case was entered. |
+| [`process.stage_exited`](#processstage_exited) | `process_instance` | 1 | A stage of the case was exited. |
+| [`process.started`](#processstarted) | `process_instance` | 1 | A process instance started from its start trigger. |
+| [`process.suspended`](#processsuspended) | `process_instance` | 1 | The instance was suspended; its timers froze. |
+| [`process.timer_fired`](#processtimer_fired) | `process_instance` | 1 | A timer of the instance fired; the engine takes it as its next event. |
+| [`process.timer_rescheduled`](#processtimer_rescheduled) | `process_instance` | 1 | A pending timer moved: data or a calendar it reads changed, or on resume. |
 | [`project.archived`](#projectarchived) | `project` | 1 | The project was archived. |
 | [`project.config_revision_activated`](#projectconfig_revision_activated) | `project` | 1 | A configuration revision became the active one. |
 | [`project.config_revision_created`](#projectconfig_revision_created) | `project` | 1 | A new configuration revision of the project was drafted. |
@@ -392,6 +414,22 @@ A decision was requested from a principal or from the holders of a role.
 
 Сущность: `approval`.
 
+Версия 3 (добавлено: excludedPrincipals):
+
+| Поле | Тип | Всегда | Описание |
+|---|---|---|---|
+| `taskId` | string \| null (uuid) | да |  |
+| `artifactId` | string \| null (uuid) | да |  |
+| `requiredRoleId` | string \| null (uuid) | да | Set when any holder of the role may decide |
+| `assignedPrincipalId` | string \| null (uuid) | да | Set when one principal decides |
+| `gate` | boolean | да | A gate holds the task's claim and completion until decided |
+| `workspaceId` | string \| null (uuid) | да | The approval's workspace, else its task's workspace |
+| `taskPublicId` | string \| null | да | Public id of the task, e.g. TASK-000123 |
+| `taskTitle` | string \| null | да |  |
+| `requestedBy` | string (uuid) | да | Principal who requested the decision |
+| `comment` | string | да | Request comment; credential-shaped material redacted, cut to the limit |
+| `excludedPrincipals` | array | да | Principals whose decision the core refuses (separation of duties, CP-ADR-0074); empty when nobody is excluded |
+
 Версия 2 (добавлено: workspaceId, taskPublicId, taskTitle, requestedBy, comment):
 
 | Поле | Тип | Всегда | Описание |
@@ -529,6 +567,23 @@ A principal judged an item of its attention list (CP-ADR-0071).
 | `verdict` | string | да | useful or not_needed |
 | `created` | boolean | да | false when the verdict replaced an earlier one |
 | `hasComment` | boolean | да | The comment itself stays with the feedback row |
+
+### calendar.published
+
+A new version of a working-day calendar was published (CP-ADR-0074 §9).
+
+Сущность: `calendar`.
+
+Версия 1:
+
+| Поле | Тип | Всегда | Описание |
+|---|---|---|---|
+| `key` | string | да |  |
+| `version` | integer | да |  |
+| `calendarHash` | string | да |  |
+| `previousVersion` | integer \| null | да |  |
+| `years` | array | да |  |
+| `provisionalYears` | array | да |  |
 
 ### capability.assigned
 
@@ -761,6 +816,27 @@ The permissions of an IAM binding changed.
 | `iamPrincipalId` | any | да |  |
 | `permissions` | array | да |  |
 
+### knowledge.changed
+
+A knowledge snapshot opened, changed or closed documents in memory (CP-ADR-0076 §6); an empty reconciliation writes no event.
+
+Сущность: `workspace`.
+
+Версия 1:
+
+| Поле | Тип | Всегда | Описание |
+|---|---|---|---|
+| `snapshotId` | any | да |  |
+| `pack` | any | да |  |
+| `source` | any | да |  |
+| `observedAt` | any | да |  |
+| `workspaceId` | string (uuid) | да |  |
+| `rootWorkspaceId` | string (uuid) | да |  |
+| `namespace` | string | да |  |
+| `changes` | array | да | Natural keys the memory service reported for the snapshot |
+| `truncated` | boolean | да | The memory service cut the list; the counters stay complete |
+| `counters` | object | да |  |
+
 ### knowledge.pack_registered
 
 A domain knowledge pack version was registered.
@@ -847,6 +923,384 @@ A principal (human, agent or service) was created.
 |---|---|---|---|
 | `kind` | string | да |  |
 | `displayName` | string | да |  |
+
+### process.cancelled
+
+An operator cancelled the instance.
+
+Сущность: `process_instance`.
+
+Версия 1:
+
+| Поле | Тип | Всегда | Описание |
+|---|---|---|---|
+| `instanceId` | string (uuid) | да |  |
+| `definitionKey` | string | да |  |
+| `version` | integer | да | Version of the process the instance is pinned to |
+| `instanceKey` | string | да | Value of start.key; unique per definition key |
+| `reason` | string | да | Reason given; credential-shaped material redacted, cut to the limit |
+| `compensated` | boolean | да | Compensations ran before the cancel |
+| `workspaceId` | string \| null (uuid) | нет | Workspace of the instance: the scope of its case in memory |
+
+### process.compensated
+
+Compensations of completed steps ran in reverse order.
+
+Сущность: `process_instance`.
+
+Версия 1:
+
+| Поле | Тип | Всегда | Описание |
+|---|---|---|---|
+| `instanceId` | string (uuid) | да |  |
+| `definitionKey` | string | да |  |
+| `version` | integer | да | Version of the process the instance is pinned to |
+| `instanceKey` | string | да | Value of start.key; unique per definition key |
+| `scope` | string | да | all, or the id of the scope compensated |
+| `steps` | array | да | Ids of the steps compensated, in the order run |
+| `workspaceId` | string \| null (uuid) | нет | Workspace of the instance: the scope of its case in memory |
+
+### process.completed
+
+The instance completed with an outcome.
+
+Сущность: `process_instance`.
+
+Версия 1:
+
+| Поле | Тип | Всегда | Описание |
+|---|---|---|---|
+| `instanceId` | string (uuid) | да |  |
+| `definitionKey` | string | да |  |
+| `version` | integer | да | Version of the process the instance is pinned to |
+| `instanceKey` | string | да | Value of start.key; unique per definition key |
+| `outcome` | string | да |  |
+| `memory` | object \| null | да | Case projection {case, facts, entities, documents} evaluated from the process's memory section; null when the process declares none |
+| `workspaceId` | string \| null (uuid) | нет | Workspace of the instance: the scope of its case in memory |
+
+### process.correlated
+
+An event matched start.key or a correlate rule of a running instance.
+
+Сущность: `process_instance`.
+
+Версия 1:
+
+| Поле | Тип | Всегда | Описание |
+|---|---|---|---|
+| `instanceId` | string (uuid) | да |  |
+| `definitionKey` | string | да |  |
+| `version` | integer | да | Version of the process the instance is pinned to |
+| `instanceKey` | string | да | Value of start.key; unique per definition key |
+| `triggerEventId` | string \| null (uuid) | да |  |
+| `triggerType` | string | да |  |
+| `changedFields` | array | да | Data paths the event changed |
+| `workspaceId` | string \| null (uuid) | нет | Workspace of the instance: the scope of its case in memory |
+
+### process.data_changed
+
+Instance data changed; timers depending on the fields were recomputed.
+
+Сущность: `process_instance`.
+
+Версия 1:
+
+| Поле | Тип | Всегда | Описание |
+|---|---|---|---|
+| `instanceId` | string (uuid) | да |  |
+| `definitionKey` | string | да |  |
+| `version` | integer | да | Version of the process the instance is pinned to |
+| `instanceKey` | string | да | Value of start.key; unique per definition key |
+| `changedFields` | array | да | Data paths that changed |
+| `element` | string \| null | да | Element whose output or set changed them |
+| `memory` | object \| null | да | Case projection {case, facts, entities, documents} evaluated from the process's memory section; null when the process declares none |
+| `workspaceId` | string \| null (uuid) | нет | Workspace of the instance: the scope of its case in memory |
+
+### process.definition_published
+
+A new immutable version of a process was published (CP-ADR-0074 §3).
+
+Сущность: `process_definition`.
+
+Версия 1:
+
+| Поле | Тип | Всегда | Описание |
+|---|---|---|---|
+| `key` | string | да |  |
+| `version` | integer | да |  |
+| `definitionHash` | string | да |  |
+| `previousVersion` | integer \| null | да | Null for the first version of the key |
+| `workspaceId` | string \| null (uuid) | да |  |
+| `identityAgent` | string \| null | да | Agent key the process acts as |
+| `displayName` | string | да |  |
+| `governedBy` | array | да | Regulations of the process as a whole: {document, section} |
+| `elements` | array | да | Stages, steps, milestones and decision tables: {id, kind, parent, displayName, governedBy} — what the memory projection of the version is built from (CP-ADR-0076 §3) |
+
+### process.escalated
+
+An escalation level of a step fired.
+
+Сущность: `process_instance`.
+
+Версия 1:
+
+| Поле | Тип | Всегда | Описание |
+|---|---|---|---|
+| `instanceId` | string (uuid) | да |  |
+| `definitionKey` | string | да |  |
+| `version` | integer | да | Version of the process the instance is pinned to |
+| `instanceKey` | string | да | Value of start.key; unique per definition key |
+| `element` | string | да |  |
+| `level` | integer | да | 1-based escalation level of the step |
+| `action` | string | да | remind, reassign, notify or raise |
+| `taskId` | string \| null (uuid) | да |  |
+| `to` | array | да | Resolved principals the action addresses |
+| `workspaceId` | string \| null (uuid) | нет | Workspace of the instance: the scope of its case in memory |
+
+### process.failed
+
+An error reached the top of the instance without a handler.
+
+Сущность: `process_instance`.
+
+Версия 1:
+
+| Поле | Тип | Всегда | Описание |
+|---|---|---|---|
+| `instanceId` | string (uuid) | да |  |
+| `definitionKey` | string | да |  |
+| `version` | integer | да | Version of the process the instance is pinned to |
+| `instanceKey` | string | да | Value of start.key; unique per definition key |
+| `error` | object | да |  |
+| `element` | string \| null | да |  |
+| `workspaceId` | string \| null (uuid) | нет | Workspace of the instance: the scope of its case in memory |
+
+### process.migrated
+
+The instance moved to another version by the process's migration map.
+
+Сущность: `process_instance`.
+
+Версия 1:
+
+| Поле | Тип | Всегда | Описание |
+|---|---|---|---|
+| `instanceId` | string (uuid) | да |  |
+| `definitionKey` | string | да |  |
+| `version` | integer | да | Version of the process the instance is pinned to |
+| `instanceKey` | string | да | Value of start.key; unique per definition key |
+| `fromVersion` | integer | да |  |
+| `map` | object | да | Old element id -> new element id |
+| `policy` | string | да |  |
+| `workspaceId` | string \| null (uuid) | нет | Workspace of the instance: the scope of its case in memory |
+
+### process.milestone_lost
+
+A reached milestone stopped holding: its guard is false again (a standing goal is no longer met); it is reached again when the guard holds again.
+
+Сущность: `process_instance`.
+
+Версия 1:
+
+| Поле | Тип | Всегда | Описание |
+|---|---|---|---|
+| `instanceId` | string (uuid) | да |  |
+| `definitionKey` | string | да |  |
+| `version` | integer | да | Version of the process the instance is pinned to |
+| `instanceKey` | string | да | Value of start.key; unique per definition key |
+| `milestone` | string | да |  |
+| `stage` | string \| null | да |  |
+| `workspaceId` | string \| null (uuid) | нет | Workspace of the instance: the scope of its case in memory |
+
+### process.milestone_reached
+
+A milestone of the case was reached.
+
+Сущность: `process_instance`.
+
+Версия 1:
+
+| Поле | Тип | Всегда | Описание |
+|---|---|---|---|
+| `instanceId` | string (uuid) | да |  |
+| `definitionKey` | string | да |  |
+| `version` | integer | да | Version of the process the instance is pinned to |
+| `instanceKey` | string | да | Value of start.key; unique per definition key |
+| `milestone` | string | да |  |
+| `stage` | string \| null | да |  |
+| `workspaceId` | string \| null (uuid) | нет | Workspace of the instance: the scope of its case in memory |
+
+### process.recall_completed
+
+Memory answered a recall step; the answer is in the instance journal (CP-ADR-0076 §4).
+
+Сущность: `process_instance`.
+
+Версия 1:
+
+| Поле | Тип | Всегда | Описание |
+|---|---|---|---|
+| `instanceId` | string (uuid) | да |  |
+| `definitionKey` | string | да |  |
+| `version` | integer | да | Version of the process the instance is pinned to |
+| `instanceKey` | string | да | Value of start.key; unique per definition key |
+| `step` | string | да |  |
+| `recallId` | string (uuid) | да | Id of the recall intent |
+| `asOf` | string (date-time) | да |  |
+| `nodeCount` | integer | да |  |
+| `edgeCount` | integer | да |  |
+| `truncated` | boolean | да |  |
+| `resultHash` | string | да |  |
+| `workspaceId` | string \| null (uuid) | нет | Workspace of the instance: the scope of its case in memory |
+
+### process.recall_timed_out
+
+A recall step got no answer in time; the step's onTimeout runs.
+
+Сущность: `process_instance`.
+
+Версия 1:
+
+| Поле | Тип | Всегда | Описание |
+|---|---|---|---|
+| `instanceId` | string (uuid) | да |  |
+| `definitionKey` | string | да |  |
+| `version` | integer | да | Version of the process the instance is pinned to |
+| `instanceKey` | string | да | Value of start.key; unique per definition key |
+| `step` | string | да |  |
+| `recallId` | string (uuid) | да |  |
+| `reason` | string | да | timeout, memory_unavailable or memory_disabled |
+| `workspaceId` | string \| null (uuid) | нет | Workspace of the instance: the scope of its case in memory |
+
+### process.resumed
+
+The instance was resumed; frozen timers got their remaining time back.
+
+Сущность: `process_instance`.
+
+Версия 1:
+
+| Поле | Тип | Всегда | Описание |
+|---|---|---|---|
+| `instanceId` | string (uuid) | да |  |
+| `definitionKey` | string | да |  |
+| `version` | integer | да | Version of the process the instance is pinned to |
+| `instanceKey` | string | да | Value of start.key; unique per definition key |
+| `cause` | string | да | event or operator |
+| `workspaceId` | string \| null (uuid) | нет | Workspace of the instance: the scope of its case in memory |
+
+### process.stage_entered
+
+A stage of the case was entered.
+
+Сущность: `process_instance`.
+
+Версия 1:
+
+| Поле | Тип | Всегда | Описание |
+|---|---|---|---|
+| `instanceId` | string (uuid) | да |  |
+| `definitionKey` | string | да |  |
+| `version` | integer | да | Version of the process the instance is pinned to |
+| `instanceKey` | string | да | Value of start.key; unique per definition key |
+| `stage` | string | да |  |
+| `workspaceId` | string \| null (uuid) | нет | Workspace of the instance: the scope of its case in memory |
+
+### process.stage_exited
+
+A stage of the case was exited.
+
+Сущность: `process_instance`.
+
+Версия 1:
+
+| Поле | Тип | Всегда | Описание |
+|---|---|---|---|
+| `instanceId` | string (uuid) | да |  |
+| `definitionKey` | string | да |  |
+| `version` | integer | да | Version of the process the instance is pinned to |
+| `instanceKey` | string | да | Value of start.key; unique per definition key |
+| `stage` | string | да |  |
+| `workspaceId` | string \| null (uuid) | нет | Workspace of the instance: the scope of its case in memory |
+
+### process.started
+
+A process instance started from its start trigger.
+
+Сущность: `process_instance`.
+
+Версия 1:
+
+| Поле | Тип | Всегда | Описание |
+|---|---|---|---|
+| `instanceId` | string (uuid) | да |  |
+| `definitionKey` | string | да |  |
+| `version` | integer | да | Version of the process the instance is pinned to |
+| `instanceKey` | string | да | Value of start.key; unique per definition key |
+| `triggerEventId` | string \| null (uuid) | да | Journal event that started it |
+| `triggerType` | string | да |  |
+| `memory` | object \| null | да | Case projection {case, facts, entities, documents} evaluated from the process's memory section; null when the process declares none |
+| `workspaceId` | string \| null (uuid) | нет | Workspace of the instance: the scope of its case in memory |
+
+### process.suspended
+
+The instance was suspended; its timers froze.
+
+Сущность: `process_instance`.
+
+Версия 1:
+
+| Поле | Тип | Всегда | Описание |
+|---|---|---|---|
+| `instanceId` | string (uuid) | да |  |
+| `definitionKey` | string | да |  |
+| `version` | integer | да | Version of the process the instance is pinned to |
+| `instanceKey` | string | да | Value of start.key; unique per definition key |
+| `cause` | string | да | event (a suspend block) or operator |
+| `reason` | string | да | Reason given; credential-shaped material redacted, cut to the limit |
+| `workspaceId` | string \| null (uuid) | нет | Workspace of the instance: the scope of its case in memory |
+
+### process.timer_fired
+
+A timer of the instance fired; the engine takes it as its next event.
+
+Сущность: `process_instance`.
+
+Версия 1:
+
+| Поле | Тип | Всегда | Описание |
+|---|---|---|---|
+| `instanceId` | string (uuid) | да |  |
+| `definitionKey` | string | да |  |
+| `version` | integer | да | Version of the process the instance is pinned to |
+| `instanceKey` | string | да | Value of start.key; unique per definition key |
+| `timerId` | string (uuid) | да |  |
+| `element` | string | да |  |
+| `dueAt` | string (date-time) | да |  |
+| `workspaceId` | string \| null (uuid) | нет | Workspace of the instance: the scope of its case in memory |
+
+### process.timer_rescheduled
+
+A pending timer moved: data or a calendar it reads changed, or on resume.
+
+Сущность: `process_instance`.
+
+Версия 1:
+
+| Поле | Тип | Всегда | Описание |
+|---|---|---|---|
+| `instanceId` | string (uuid) | да |  |
+| `definitionKey` | string | да |  |
+| `version` | integer | да | Version of the process the instance is pinned to |
+| `instanceKey` | string | да | Value of start.key; unique per definition key |
+| `timerId` | string (uuid) | да |  |
+| `element` | string | да |  |
+| `previousDueAt` | string (date-time) | да |  |
+| `dueAt` | string (date-time) | да |  |
+| `provisional` | boolean | да | Computed on a provisional calendar year |
+| `cause` | string | да | data_changed, calendar_changed or resumed |
+| `changedFields` | array | да |  |
+| `workspaceId` | string \| null (uuid) | нет | Workspace of the instance: the scope of its case in memory |
 
 ### project.archived
 

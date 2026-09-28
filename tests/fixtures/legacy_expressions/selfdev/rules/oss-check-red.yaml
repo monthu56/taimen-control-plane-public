@@ -1,0 +1,38 @@
+# yaml-language-server: $schema=../../schema/v1/object.schema.json
+# Ствол компонента не публикуется (TAI-ADR-0043 п.1): закреплённая суперпроектом
+# ревизия не прошла oss.check@1 — одна работа devops на компонент с причиной и
+# находками (файл, строка, номер правила; текст стоп-листа не раскрывается).
+# Закрывает её правило oss-check-resolved, когда компонент опубликован.
+apiVersion: taimen.ai/v1
+kind: WorkRule
+key: oss-check-red
+spec:
+  description: Закреплённая ревизия компонента не публикуется — работа devops
+  workspaceId: ${SELFDEV_WORKSPACE_ID}
+  identity: {agent: selfdev-rules}
+  trigger: {kind: observation, type: repo.commit_observed}
+  condition: {eq: [{var: payload.data.repo}, project-taimen-ai]}
+  interpretation:
+    skill: oss.check@1
+    inputs:
+      superproject: ${SELFDEV_SUPERPROJECT_URL}
+      ref: "{{payload.data.sha}}"
+  action:
+    kind: ensure_work
+    taskType: devops
+    forEach: skill.output.failing
+    dedupKeyTemplate: "oss-check:{{item.component}}"
+    fields:
+      title: "Ствол {{item.component}} не публикуется: {{item.reason}}"
+      priority: high
+      description: |
+        Коммит суперпроекта {{skill.output.ref}} закрепил {{item.component}} на {{item.sha}},
+        но ревизия не уходит в открытую поставку ({{skill.output.ossBranch}}): {{item.reason}}.
+        Находки (вид проверки, файл, строка, номер правила стоп-листа): {{item.findings}}
+
+        Причины: not_publishable — исправить находки в стволе компонента (стоп-лист лежит
+        в deploy/oss/stoplist.txt суперпроекта); not_fast_forward — ветка поставки не
+        предок ревизии, указатель откатили; not_on_trunk — указатель на ревизии вне ствола;
+        check_unavailable — проверка не выполнилась (права, gitleaks), см. details:
+        {{item.details}}. Задача закроется сама, когда компонент будет опубликован
+        (правило oss-check-resolved).

@@ -1,0 +1,21 @@
+# Skill inputs by the skill's schema: an unknown one, a required one missing,
+# and a read of an output field the skill does not declare.
+# expect: unknown_skill_input /spec/stages/0/steps/0/call/input/txt
+# expect: skill_input_missing /spec/stages/0/steps/0/call/input
+# expect: expression_type_error /spec/stages/0/steps/0/output/as/summary
+apiVersion: taimen.ai/v1
+kind: Process
+key: sample
+spec:
+  version: 1
+  displayName: Sample
+  identity: {agent: sample-process}
+  owner: [{role: lead}]
+  data: {type: object, properties: {number: {type: string}, summary: {type: string}}}
+  start: {on: {observation: sample.opened}, key: event.payload.number, set: {number: "'1'"}}
+  stages:
+    - id: work
+      steps:
+        - id: send
+          call: {skill: "text.summarize@1", input: {txt: data.number}}
+          output: {as: {summary: step.result.sumary}}

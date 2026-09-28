@@ -1,0 +1,50 @@
+{
+  "$comment": "Pinned request contract of the Memory Service document ingest the Context Adapter calls for case documents (CP-ADR-0076 §2). Hand-extracted from memory-service server/app.py (DocumentIngestRequest, DocumentChunkIn; chunks capped by retrieval/documents.MAX_CHUNKS_PER_REQUEST). Pydantic there ignores unknown fields, so additionalProperties is false here: a misspelled field would otherwise be dropped silently. Regenerate when memory-service changes the endpoint.",
+  "memoryService": {
+    "repository": "monthu56/taimen-memory-service",
+    "commit": "6ef1ef9"
+  },
+  "paths": {
+    "/api/brain/documents": {
+      "post": {
+        "requestBody": "DocumentIngestRequest",
+        "responses": ["201", "400", "422"]
+      }
+    }
+  },
+  "schemas": {
+    "DocumentIngestRequest": {
+      "type": "object",
+      "required": ["natural_key", "title"],
+      "additionalProperties": false,
+      "properties": {
+        "natural_key": {"type": "string"},
+        "title": {"type": "string"},
+        "type": {"type": "string"},
+        "namespace": {"type": "string"},
+        "scope": {"type": ["object", "null"]},
+        "source_path": {"type": "string"},
+        "properties": {"type": ["object", "null"]},
+        "meta": {"type": ["object", "null"]},
+        "links": {"type": ["array", "null"], "items": {"type": "string"}},
+        "chunks": {
+          "type": "array",
+          "maxItems": 500,
+          "items": {
+            "type": "object",
+            "required": ["text"],
+            "additionalProperties": false,
+            "properties": {
+              "text": {"type": "string"},
+              "heading": {"type": "string"},
+              "order": {"type": ["integer", "null"]}
+            }
+          }
+        },
+        "replace": {"type": "boolean"},
+        "pii": {"type": ["boolean", "null"]},
+        "pii_categories": {"type": ["array", "null"], "items": {"type": "string"}}
+      }
+    }
+  }
+}

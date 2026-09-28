@@ -2050,6 +2050,389 @@ async def cp_list_events(after: str = "", limit: int = 50) -> str:
         return _error(exc)
 
 
+# --- process authoring (CP-ADR-0074 §17) --------------------------------------
+
+#: Applying a package changes the catalog: never read-only, never idempotent
+#: (the same hash a second time is a stale plan), and a plan may retire objects.
+APPLYING = ToolAnnotations(
+    readOnlyHint=False, destructiveHint=True, idempotentHint=False, openWorldHint=False
+)
+_PACKAGE_SUFFIXES = (".yaml", ".yml")
+_PLAN_HASH = re.compile(r"^sha256:[0-9a-f]{64}$")
+#: Journal entries cp_process_explain reads at most; the rest is a cursor.
+_EXPLAIN_MAX_ENTRIES = 1000
+_PACKAGE_HINTS = {
+    "plan_stale": (
+        "The catalog or the open instances changed since this plan was built. "
+        "Run cp_pkg_plan again, show the new plan to the user and apply its planHash."
+    ),
+    "migration_required": (
+        "Open instances wait on elements the new version drops: add a migration "
+        "to the process (migrations: [{from, to, policy, map}]) and plan again."
+    ),
+    "invalid_package": "Fix the problems (file and line) and plan again.",
+}
+
+
+def _problem(
+    code: str, message: str, *, file: str | None = None, hint: str | None = None
+) -> dict[str, Any]:
+    """A finding of this adapter in the shape of the core's (``ProcessProblemOut``)."""
+    return {
+        "code": code,
+        "severity": "error",
+        "path": "",
+        "file": file,
+        "line": None,
+        "message": message,
+        "hint": hint,
+    }
+
+
+def _problems_error(code: str, message: str, problems: list[dict[str, Any]]) -> str:
+    return _dump({"error": code, "message": message, "problems": problems})
+
+
+def _package_error(exc: ControlPlaneError) -> str:
+    """An error of a package or process tool: the core's findings, or one of this form.
+
+    The core puts the findings of a refused package in ``details.problems``;
+    any other refusal (a right, a stale plan, a malformed body) becomes one
+    finding of the same shape, so the author reads every answer one way.
+    """
+    hint = _PACKAGE_HINTS.get(exc.code)
+    problems = exc.details.get("problems")
+    if not isinstance(problems, list) or not problems:
+        errors = exc.details.get("errors")
+        if isinstance(errors, list) and errors:
+            problems = [
+                {
+                    **_problem(exc.code, str(item.get("message")), hint=hint),
+                    "path": str(item.get("path") or item.get("loc") or ""),
+                }
+                for item in errors
+                if isinstance(item, dict)
+            ]
+        else:
+            problems = [_problem(exc.code, exc.message, hint=hint)]
+    payload: dict[str, Any] = {
+        "error": exc.code,
+        "message": exc.message,
+        "details": {k: v for k, v in exc.details.items() if k != "problems"},
+        "problems": problems,
+    }
+    if hint is not None:
+        payload["hint"] = hint
+    return _dump(payload)
+
+
+def _read_package(path: str) -> tuple[list[dict[str, str]], list[dict[str, Any]]]:
+    """The YAML files of a package directory as ``{path, content}``, or findings.
+
+    Paths are relative to the directory with ``/``; hidden files and
+    directories (``.layout``, ``.git``) are not part of the package.
+    """
+    root = Path(path).expanduser()
+    if not root.is_dir():
+        return [], [_problem("package_not_found", f"Not a package directory: {path}")]
+    files: list[dict[str, str]] = []
+    problems: list[dict[str, Any]] = []
+    for item in sorted(root.rglob("*")):
+        relative = item.relative_to(root)
+        if any(part.startswith(".") for part in relative.parts):
+            continue
+        if not item.is_file() or item.suffix not in _PACKAGE_SUFFIXES:
+            continue
+        name = relative.as_posix()
+        try:
+            files.append({"path": name, "content": item.read_text(encoding="utf-8")})
+        except (OSError, UnicodeDecodeError) as exc:
+            problems.append(
+                _problem("package_file_unreadable", f"{type(exc).__name__}: {exc}", file=name)
+            )
+    if not files and not problems:
+        problems.append(
+            _problem(
+                "package_empty",
+                f"No YAML files in {path}",
+                hint="A package is a directory with package.yaml and its objects",
+            )
+        )
+    return files, problems
+
+
+async def _package(path: str) -> tuple[list[dict[str, str]], str | None]:
+    files, problems = await asyncio.to_thread(_read_package, path)
+    if problems:
+        return [], _problems_error(problems[0]["code"], problems[0]["message"], problems)
+    return files, None
+
+
+@mcp.tool(
+    description=(
+        "Check a process package directory in the core without running its "
+        "tests: every object against the catalog schema and the process "
+        "language. 'problems' name the file, line and JSON pointer of each "
+        "finding (code, severity, message, hint). Writes nothing."
+    ),
+    annotations=READ_ONLY,
+)
+async def cp_pkg_check(path: str, workspace_id: str = "") -> str:
+    files, refused = await _package(path)
+    if refused is not None:
+        return refused
+    try:
+        report = await _client().test_package(
+            files, workspace_id=workspace_id or None, check_only=True
+        )
+    except ControlPlaneError as exc:
+        return _package_error(exc)
+    return _dump({"status": report["status"], "problems": report["problems"]})
+
+
+@mcp.tool(
+    description=(
+        "Check a process package directory and run its tests (tests/*.test.yaml) "
+        "in the core's sandbox: status passed | failed | invalid, problems, "
+        "failures by test step, coverage by process with what no test reached. "
+        "'tests' narrows the run to these test files. Writes nothing."
+    ),
+    annotations=READ_ONLY,
+)
+async def cp_pkg_test(path: str, tests: list[str] | None = None, workspace_id: str = "") -> str:
+    files, refused = await _package(path)
+    if refused is not None:
+        return refused
+    try:
+        return _dump(
+            await _client().test_package(files, tests=tests, workspace_id=workspace_id or None)
+        )
+    except ControlPlaneError as exc:
+        return _package_error(exc)
+
+
+@mcp.tool(
+    description=(
+        "Plan applying a process package directory: what changes in the catalog "
+        "by object and field (and who owns each field), the behavioural diff of "
+        "each changed process replayed on real instances, the fate of open "
+        "instances (pin / migrate), regulation coverage, problems — and the "
+        "planHash. Show the plan to the user; cp_pkg_apply applies exactly this "
+        "hash. Writes nothing."
+    ),
+    annotations=READ_ONLY,
+)
+async def cp_pkg_plan(
+    path: str,
+    workspace_id: str = "",
+    replay_limit: int | None = None,
+    overwrite_console: bool = False,
+) -> str:
+    files, refused = await _package(path)
+    if refused is not None:
+        return refused
+    try:
+        return _dump(
+            await _client().plan_package(
+                files,
+                workspace_id=workspace_id or None,
+                replay_limit=replay_limit,
+                overwrite_console=overwrite_console,
+            )
+        )
+    except ControlPlaneError as exc:
+        return _package_error(exc)
+
+
+@mcp.tool(
+    description=(
+        "Apply a process package directory — only the plan the user saw: "
+        "'plan_hash' is the planHash of cp_pkg_plan, required. The core builds "
+        "the plan again and refuses plan_stale when the catalog or the open "
+        "instances changed since; then plan again. Pass the workspace_id and "
+        "overwrite_console the plan was built with. Call only after the user "
+        "approved the plan."
+    ),
+    annotations=APPLYING,
+)
+async def cp_pkg_apply(
+    path: str, plan_hash: str, workspace_id: str = "", overwrite_console: bool = False
+) -> str:
+    if not _PLAN_HASH.match(plan_hash or ""):
+        problem = _problem(
+            "plan_hash_required",
+            "A package is applied only by the hash of its plan (sha256:<64 hex>)",
+            hint="Run cp_pkg_plan, show the plan to the user and pass its planHash",
+        )
+        return _problems_error(problem["code"], problem["message"], [problem])
+    files, refused = await _package(path)
+    if refused is not None:
+        return refused
+    try:
+        return _dump(
+            await _client().apply_package(
+                files,
+                plan_hash=plan_hash,
+                workspace_id=workspace_id or None,
+                overwrite_console=overwrite_console,
+            )
+        )
+    except ControlPlaneError as exc:
+        return _package_error(exc)
+
+
+@mcp.tool(
+    description=(
+        "A published process by key (latest version) or key@version: its spec, "
+        "definition hash, identity agent, owner and warnings, plus its versions, "
+        "newest first."
+    ),
+    annotations=READ_ONLY,
+)
+async def cp_process_get(ref: str, versions_limit: int = 20) -> str:
+    try:
+        client = _client()
+        definition = await client.get_process_definition(ref)
+        versions = await client.list_process_versions(definition["key"], limit=versions_limit)
+    except ControlPlaneError as exc:
+        return _package_error(exc)
+    return _dump(
+        {
+            "definition": definition,
+            "versions": {"items": versions["items"], "nextCursor": versions["nextCursor"]},
+        }
+    )
+
+
+def _regulations(spec: Mapping[str, Any]) -> tuple[list[dict[str, Any]], dict[str, list[Any]]]:
+    """``governedBy`` of the process, and of each element with what encloses it.
+
+    An element answers to its own documents and to those of the stages and
+    the process around it, nearest first; each item says where it is declared
+    (``element``, ``null`` for the process). The data schema is not walked.
+    """
+
+    def items(node: Mapping[str, Any], element: str | None) -> list[dict[str, Any]]:
+        return [
+            {**item, "element": element}
+            for item in node.get("governedBy") or ()
+            if isinstance(item, Mapping)
+        ]
+
+    process = items(spec, None)
+    by_element: dict[str, list[Any]] = {}
+
+    def walk(node: Any, inherited: list[dict[str, Any]]) -> None:
+        if isinstance(node, Mapping):
+            element = node.get("id")
+            if isinstance(element, str):
+                inherited = items(node, element) + inherited
+                by_element.setdefault(element, inherited)
+            for key, value in node.items():
+                if key != "governedBy":
+                    walk(value, inherited)
+        elif isinstance(node, list):
+            for value in node:
+                walk(value, inherited)
+
+    walk({k: v for k, v in spec.items() if k not in ("governedBy", "data")}, process)
+    return process, by_element
+
+
+@mcp.tool(
+    description=(
+        "Explain a process instance: its state and, step by step from the "
+        "decision journal, what came in (and from whom), what the engine "
+        "decided and why, what it did, what memory answered to its recall "
+        "steps, and which regulations (governedBy) govern each decision — read "
+        "against the version the instance runs on."
+    ),
+    annotations=READ_ONLY,
+)
+async def cp_process_explain(instance_id: str) -> str:
+    try:
+        client = _client()
+        instance = await client.get_process_instance(instance_id)
+        definition = await client.get_process_definition(
+            f"{instance['definitionKey']}@{instance['definitionVersion']}"
+        )
+        entries: list[dict[str, Any]] = []
+        cursor: str | None = None
+        while True:
+            page = await client.list_process_journal(instance_id, limit=200, cursor=cursor)
+            entries.extend(page["items"])
+            cursor = page["nextCursor"]
+            if cursor is None or len(entries) >= _EXPLAIN_MAX_ENTRIES:
+                break
+    except ControlPlaneError as exc:
+        return _package_error(exc)
+    process_rules, element_rules = _regulations(definition["spec"])
+
+    def governed(element: str | None) -> list[Any]:
+        if element is None:
+            return process_rules
+        # A timer or a branch of a step is named after it: "<step>:<part>".
+        return element_rules.get(element) or element_rules.get(element.split(":")[0], process_rules)
+
+    steps: list[dict[str, Any]] = []
+    for entry in entries:
+        if entry["kind"] == "input":
+            received = entry["data"].get("input") or {}
+            steps.append(
+                {
+                    "seq": entry["seq"],
+                    "at": entry["at"],
+                    "input": entry["reason"],
+                    "inputKind": received.get("kind"),
+                    "body": received.get("body"),
+                    "actorId": entry["actorId"],
+                    "eventId": entry["eventId"],
+                    "decisions": [],
+                    "intents": [],
+                }
+            )
+            continue
+        if not steps or steps[-1]["seq"] != entry["seq"]:  # pragma: no cover - input first
+            continue
+        explained = {
+            "kind": entry["kind"],
+            "element": entry["element"],
+            "reason": entry["reason"],
+            "data": entry["data"],
+            "governedBy": governed(entry["element"]),
+        }
+        steps[-1]["intents" if entry["kind"] == "intent" else "decisions"].append(explained)
+    # What memory answered: the recall inputs, by the step that asked.
+    memory = [
+        {
+            "seq": step["seq"],
+            "at": step["at"],
+            "element": next(
+                (d["element"] for d in step["decisions"] if d["kind"] == "recall"), None
+            ),
+            **(step["body"] or {}),
+        }
+        for step in steps
+        if step["inputKind"] == "recall"
+    ]
+    return _dump(
+        {
+            "instance": instance,
+            "process": {
+                "key": definition["key"],
+                "version": definition["version"],
+                "latestVersion": definition["latestVersion"],
+                "displayName": definition["displayName"],
+                "definitionHash": definition["definitionHash"],
+                "governedBy": process_rules,
+            },
+            "steps": steps,
+            "memory": memory,
+            "journalCursor": cursor,
+        }
+    )
+
+
 def main() -> None:  # pragma: no cover - process entrypoint
     adopt_run_from_environment()
     mcp.run("stdio")

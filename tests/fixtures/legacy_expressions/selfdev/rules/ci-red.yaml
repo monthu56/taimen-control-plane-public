@@ -1,0 +1,44 @@
+# yaml-language-server: $schema=../../schema/v1/object.schema.json
+# CI красный на main → работа (TAI-ADR-0036, CP-ADR-0063). Наблюдение ci.run_observed
+# отдаёт git-коннектор на каждую завершённую попытку прогона GitHub Actions
+# суперпроекта; на каждый упавший job — задача. Дедуп по (репозиторий, job): пока
+# задача открыта, следующие красные прогоны того же job'а дублей не заводят; job,
+# упавший снова после закрытия задачи, — новая работа. Фактом-основанием служит само
+# наблюдение, скилл не нужен.
+apiVersion: taimen.ai/v1
+kind: WorkRule
+key: ci-red
+spec:
+  description: Упавший job CI суперпроекта на main — задача на починку
+  # Выключено решением владельца 2026-09-25: CI суперпроекта не запускается
+  # (биллинг GitHub), правило завело 10 ложных задач. Включать — status: enabled.
+  status: disabled
+  workspaceId: ${SELFDEV_WORKSPACE_ID}
+  identity: {agent: selfdev-rules}
+  trigger: {kind: observation, type: ci.run_observed}
+  condition:
+    and:
+      - {eq: [{var: payload.data.repo}, project-taimen-ai]}
+      - {eq: [{var: payload.data.branch}, main]}
+      - {in: [{var: payload.data.conclusion}, [failure, timed_out]]}
+  action:
+    kind: ensure_work
+    taskType: coding-task
+    forEach: payload.data.failedJobs
+    # bidops — отложенная вертикаль (решение владельца 2026-09-24): её давний красный
+    # job не заводит работу, пока вертикаль не вернётся в план
+    where: {ne: [{var: item}, bidops]}
+    dedupKeyTemplate: "ci-red:{{payload.data.repo}}:{{item}}"
+    fields:
+      title: "CI красный на main: {{item}}"
+      priority: high
+      description: |
+        Job `{{item}}` упал в прогоне CI «{{payload.data.workflow}}» суперпроекта на main
+        (коммит {{payload.data.sha}}, исход {{payload.data.conclusion}}).
+
+        Прогон: {{payload.data.url}}
+
+        Что сделать: разобрать лог job'а и починить причину (код, тест или конфигурацию
+        CI). Задача заведена правилом ci-red автоматически; пока она открыта, новые
+        падения этого job'а новых задач не заводят. После исправления закройте задачу —
+        следующее падение, если оно будет, заведёт новую.

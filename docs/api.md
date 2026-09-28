@@ -17,7 +17,9 @@ Permissions ключа: `principals.read|write`, `delegations.manage`,
 `observations.write`, `projects.read|manage`,
 `project_templates.read|manage`, `operations.read|manage`,
 `artifact_types.read|manage` (CP-ADR-0072),
-`agents.read|manage|status.write` (CP-ADR-0073), `admin`
+`agents.read|manage|status.write` (CP-ADR-0073),
+`processes.read|write|operate`, `packages.test|plan`, `calendars.write`
+(CP-ADR-0074), `admin`
 (подразумевает все). Права v0.5 не выдаются старым ключам неявно —
 их нужно назначить явно (см. [migration-v0.5](migration-v0.5.md)). Проверка выполняется и в route-слое, и в командах
 application-слоя.
@@ -263,12 +265,31 @@ POST  /api/v1/rules                       rules.write  (ADR-0063: key, descripti
                                           request_decision: {поле: шаблон}, форма — при
                                           записи (invalid_rule_action), значения — fieldSchema
                                           типа при заведении работы (оценка failed,
-                                          custom_fields_invalid); амендмент ADR-0063 oss-sync)
+                                          custom_fields_invalid); амендмент ADR-0063 oss-sync;
+                                          амендмент ADR-0063 2026-09-27 (C005): identity
+                                          {agent} — правило оценивается и действует
+                                          полномочиями principal'а агента реестра, 422
+                                          unknown_agent (нет или выведен), 403
+                                          permission_escalation (у пишущего нет права
+                                          ревизии агента); у ensure_work — taskTypes и
+                                          шаблонный taskType, fields.relations {spawnedBy,
+                                          dependsOn}; отказ элемента forEach —
+                                          work[].refused, все отказаны — failed
+                                          work_items_refused; в task — typeKey, typeVersion);
+                                          амендмент ADR-0063 P012: fields.workspaceId —
+                                          шаблон workspace заводимой работы (ensure_work|
+                                          request_decision; пусто — workspace правила;
+                                          tasks.write проверяется на целевом workspace; не id —
+                                          failed invalid_rule_field), fields.assignee
+                                          role:<slug> — работа роли целевого workspace без
+                                          исполнителя (нет роли — failed unknown_role)
 GET   /api/v1/rules                       rules.read   (?status=&workspaceId=&key=&triggerKind=;
                                           archived — только по status=archived)
 GET   /api/v1/rules/{id}                  rules.read   (+ETag "rule-<v>")
 PATCH /api/v1/rules/{id}                  rules.write  (If-Match; description, trigger, condition|null
-                                          (null — всегда), interpretation|null, action, goalId|null;
+                                          (null — всегда), interpretation|null, action, goalId|null,
+                                          identity|null (null — снять личность; у правила с
+                                          личностью любая правка проверяет права пишущего);
                                           архивное — 409 rule_archived)
 POST  /api/v1/rules/{id}:enable           rules.write  (идемпотентно; полномочия — вызывающего)
 POST  /api/v1/rules/{id}:disable          rules.write  (идемпотентно)
@@ -334,8 +355,10 @@ POST  /api/v1/tasks/{id|publicId}:complete tasks.write (If-Match; claimId+fencin
 `cancelled` и отзывает живой вызов скилла. Попытка (`TaskVerificationOut`):
 `attempt`, `status` (`running|waiting_human|waiting_external|passed|failed|
 cancelled`), `trigger` (`complete|run|approval`), `triggerRef`,
-`authorityPrincipalId`, `checks` (acceptance на момент открытия), `results`
-(`[{key, kind, status, evidence, reason, message?}]`), `cursor`,
+`authorityPrincipalId`, `checks` (критерии на момент открытия, у каждого
+`source`: `output | type | task | rule`), `results` (`[{key, kind, source,
+status, evidence, reason, message?, details?}]`, `status` — `passed | skipped |
+failed | cancelled`), `cursor`,
 `skillInvocationId`, `approvalId`, `nextCheckAt`, `startedAt`, `finishedAt`.
 
 Выходы типа как критерии (CP-ADR-0067, амендмент 2026-09-26; [план A006]).
@@ -348,6 +371,59 @@ required`, с содержимым; причины провала — `artifact_
 критериями `output.<key>` **перед** acceptance задачи — задача с обязательным
 выходом проходит стадию, даже если её acceptance пуст. Ключ с префиксом
 `output.` в acceptance — `422 invalid_acceptance`.
+
+Декларативный цикл (фича `declarative-cycle`, контракт — C002; амендменты
+CP-ADR-0067 2026-09-27, CP-ADR-0063 2026-09-27, CP-ADR-0073 А1).
+
+Реализовано в C004:
+
+- `acceptance[]` у `POST /task-types` и в `TaskTypeOut` — критерии по умолчанию
+  версии типа (та же форма и грамматика, что у задачи; проверяются при
+  публикации, иначе `422 invalid_acceptance_spec` / `invalid_acceptance` с
+  `details.field`). Попытка исполняет выходы типа (`source: output`), затем
+  критерии типа (`type`), затем критерии задачи (`task`); неявный
+  `rule-evidence` (`rule`) — только если ни тип, ни задача критериев не
+  объявляют. Ключ задачи, совпадающий с ключом её версии типа, —
+  `422 invalid_acceptance` (`details.field = acceptance[i].key`).
+  `TaskOut.acceptance` — по-прежнему только собственный документ задачи.
+  Evidence задачи может ссылаться на критерий её типа (`check`).
+- `when[]` у критерия (задача, тип, `acceptance` правил и `ensureWork`): 1…8
+  выражений `$.task…` без `|truncate`; иначе `422 invalid_acceptance_spec`,
+  `details.field = acceptance[i].when[j]`; у критериев цели —
+  `422 invalid_acceptance`. Условие читается, когда попытка доходит до
+  критерия, полномочиями завершившего. Невыполненное — результат `skipped`,
+  `reason: condition_unmet`, `details.when` — первое невыполненное выражение;
+  попытка идёт дальше, все пропущенные — попытка пройдена.
+- `deterministic` со скиллом `external_write` допустим, если раньше него (для
+  задачи — среди критериев её типа и своих) стоит `human`/`llm_judge` без
+  `when` или с тем же `when`; иначе `422 invalid_acceptance_spec`,
+  `details.cause = external_write_without_decision`. Исполняется, только если
+  ближайший такой критерий прошёл в этой же попытке (иначе провал
+  `no_decision`): вызов идёт полномочиями решившего gate
+  (`decision_authority` approval) с `authorizationBasis = {kind: approval,
+  approvalId}`. Решение gate задачи поэтому всегда сохраняет снимок полномочий
+  решившего.
+
+Реализовано в C006:
+
+- `agent:<key>` в полях назначения: `assigneeId` у `POST`/`PATCH /tasks`,
+  `assignee` у `ensureWork` (исходы approval и `completionSchema`),
+  `fields.assignee` у `ensure_work` и `request_decision` правил. Ядро при
+  записи заменяет ссылку на principal агента; в задаче и в `TaskOut.assigneeId`
+  — UUID, ссылка не хранится. Агента с таким ключом нет, он выведен или ещё
+  не связан с личностью — `422 unknown_agent`, `details: {field, agent}`
+  (`field` — `assigneeId`, `ensureWork.assignee`, `action.fields.assignee`);
+  в исходе и правиле это ошибка действия с тем же кодом, ничего не пишется.
+  Ссылка разрешается после проверки права на запись: без `tasks.write` —
+  `403`, а не ответ о существовании агента.
+
+Ещё не реализовано — запрос с полем получает `501 not_implemented` с
+`details.field` и ничего не пишет:
+
+- `assigneeId` у `POST`/`PATCH /tasks` принимает `agent:<key>`. Неизвестный,
+  выведенный или несвязанный агент — `422 unknown_agent` (C006).
+- `identity {agent}` у `POST`/`PATCH /rules` и в `RuleOut`: правило действует
+  полномочиями principal'а агента (C005).
 
 GET  /api/v1/claims                       tasks.read   (?taskId=&sessionId=&status=)
 GET  /api/v1/claims/{id}                  tasks.read
@@ -586,20 +662,145 @@ PUT  /api/v1/agents/{key}/status          agents.status.write ({phase, reason?,
                                           stale_status_report; событие agent.status_changed
                                           только при изменении phase/reason/node/ревизии)
 
+Процессы, календари, пакеты (CP-ADR-0074; контракт опубликован, до шага фичи
+process-packages маршрут отвечает 501 not_implemented с details.implementedBy):
+POST /api/v1/process-definitions          processes.write (на workspace процесса, если есть
+                                          spec.workspaceId; body {key, spec} — spec объекта
+                                          каталога вида Process; версия spec.version
+                                          неизменяема: тот же хэш — 200, другое содержимое
+                                          или версия не больше последней — 409
+                                          process_version_conflict (details.latestVersion);
+                                          422 invalid_process с details.problems[code,
+                                          severity, path, file, line, message, hint]; права
+                                          агента личности шире публикующего — 403
+                                          permission_escalation; предупреждения — warnings
+                                          версии; событие process.definition_published)
+                                          — реализован
+GET  /api/v1/process-definitions          processes.read (последняя версия каждого ключа, по
+                                          key; ?key=&workspaceId=&governedBy=<ключ
+                                          документа>&limit=&cursor=; governedBy — процессы,
+                                          чья последняя версия ссылается на документ, с
+                                          workspaceId и owner версии, CP-ADR-0076 п.7)
+                                          — реализован
+GET  /api/v1/process-definitions/{key}[@version]  processes.read (ProcessDefinitionOut с
+                                          owner, warnings; 404, если нет) — реализован
+GET  /api/v1/process-definitions/{key}/versions   processes.read (ProcessVersionOut —
+                                          без spec, новые первыми; ?limit=&cursor=)
+                                          — реализован
+POST /api/v1/process-definitions/{key}:replay     packages.test + processes.read ({spec,
+                                          instanceIds?, limit ≤ 200, по умолчанию 50};
+                                          журналы instanceIds или последних limit
+                                          экземпляров текущей версии из читаемых workspace
+                                          → кандидат под номером версии экземпляра; ответ
+                                          200 {key, candidateHash, replayed, diverged,
+                                          problems, instances[instanceId, instanceKey,
+                                          version, events, divergences[journalSeq, kind
+                                          decision | intent | input | data | timer | state,
+                                          element, recorded, replayed]]} — у экземпляра не
+                                          больше одного, первое; кандидат с ошибкой проверки —
+                                          problems и пустой instances; нет процесса или
+                                          экземпляра этого процесса — 404, экземпляр вне
+                                          читаемых workspace — 403; транзакция только
+                                          на чтение, память не зовётся) — реализован
+POST /api/v1/process-instances            processes.operate (на workspace экземпляра;
+                                          {process, key, data?, workspaceId?} — старт без
+                                          события: ключ и данные заданы, data по схеме
+                                          данных процесса, иначе 422 invalid_process_data;
+                                          повтор ключа — 409 process_instance_exists с
+                                          details.instanceId; процесс, выведенный
+                                          переименованием пакета, — 409 process_retired;
+                                          201 ProcessInstanceOut; process.started с
+                                          triggerType command) — реализован
+GET  /api/v1/process-instances            processes.read (новые первыми; ?definitionKey=
+                                          &instanceKey=&status=&workspaceId=&limit=&cursor=)
+                                          — реализован
+GET  /api/v1/process-instances/{id}       processes.read (данные, стадии, открытые элементы
+                                          с задачей и approvals ожидания, ожидающие и
+                                          замороженные таймеры) — реализован
+GET  /api/v1/process-instances/{id}/journal  processes.read (журнал решений по шагам: вход,
+                                          решения, намерения; seq, at, kind, element, reason,
+                                          actorId, eventId, data; ?kind=&limit=&cursor=)
+                                          — реализован
+POST /api/v1/process-instances/{id}:suspend  processes.operate ({reason}; таймеры
+                                          замораживаются; не running — 409
+                                          invalid_process_instance_state) — реализован
+POST /api/v1/process-instances/{id}:resume   processes.operate ({reason?}; не suspended —
+                                          409) — реализован
+POST /api/v1/process-instances/{id}:cancel   processes.operate ({reason, compensate=true};
+                                          закрытый или уже отменяемый — 409) — реализован
+POST /api/v1/calendars                    calendars.write ({key, spec} вида Calendar; версия
+                                          по хэшу spec с годами и датами по порядку: 201
+                                          новая, 200 без изменений; событие
+                                          calendar.published; 422 invalid_calendar с
+                                          details.code unknown_timezone |
+                                          duplicate_calendar_year |
+                                          calendar_date_outside_year |
+                                          calendar_day_conflict и details.path) — реализован
+GET  /api/v1/calendars                    аутентификация (последняя версия каждого ключа,
+                                          по key; ?limit=&cursor=) — реализован
+GET  /api/v1/calendars/{key}[@version]    аутентификация (404, если нет) — реализован
+POST /api/v1/packages:test                packages.test ({package: {files[{path,
+                                          content}]}, tests?, workspaceId?}; ?checkOnly=true —
+                                          только проверка; песочница, транзакция только на
+                                          чтение; ответ 200 status passed | failed |
+                                          invalid, problems с file и line, tests с провалами
+                                          по шагам, coverage — elements, transitions,
+                                          decisionRows, handlers с missing; workspaceId —
+                                          ещё processes.read на него, нет — 404;
+                                          given.fromInstance теста — пробный прогон с копии
+                                          живого экземпляра, читается как GET
+                                          /process-instances/{id}: без processes.read на
+                                          его workspace — 403, неизвестный — 404)
+                                          — реализован
+POST /api/v1/packages:plan                packages.plan ({package, workspaceId?,
+                                          replayLimit=50, overwriteConsole=false}; виды
+                                          Calendar и Process; ничего не пишет; changes —
+                                          create | update | rename | unchanged с полями
+                                          before/after и владельцем package | console
+                                          (поле консоли не перетирается без
+                                          overwriteConsole); processes — replay на
+                                          replayLimit экземплярах и судьба открытых по
+                                          версиям pin | migrate | unaffected с
+                                          migrationRequired; regulationCoverage — разделы
+                                          регламента из памяти (узлы section_of) с
+                                          элементами и непокрытые; problems с file и line;
+                                          planHash, catalogEtag; workspaceId — подстановка
+                                          ${…} в spec.workspaceId и processes.read на него)
+                                          — реализован
+POST /api/v1/packages:apply               packages.plan + право вида каждого изменения
+                                          (processes.write, calendars.write) ({package,
+                                          planHash, workspaceId?, overwriteConsole?}; план
+                                          строится заново под блокировкой: другой хэш —
+                                          409 plan_stale с details.currentPlanHash и
+                                          catalogEtag; 422 migration_required; иные ошибки
+                                          плана — 422 invalid_package; одна транзакция:
+                                          календари, процессы, перенос экземпляров
+                                          migrate с process.migrated, вывод
+                                          переименованного ключа; ответ applied[kind, key,
+                                          action, version] и catalogEtag после) — реализован
+
 POST /api/v1/approvals                    approvals.manage (ровно одно из requiredRoleId |
                                           assignedPrincipalId; gate=true требует task и
-                                          блокирует claim/complete до решения)
+                                          блокирует claim/complete до решения;
+                                          excludedPrincipals — кому решать нельзя, CP-ADR-0074
+                                          п.7: до 100 principal tenant'а, повторы схлопываются,
+                                          неизвестный — 404, исключён assignedPrincipalId —
+                                          422 invalid_approval; ответ и approval.requested v3
+                                          несут список, [] — никто не исключён)
 GET  /api/v1/approvals[/{id}]             approvals.read   (?status=&taskId=)
-POST /api/v1/approvals/{id}:approve       approvals.decide + eligibility (assigned или роль);
+POST /api/v1/approvals/{id}:approve       approvals.decide + eligibility (assigned или роль;
+                                          principal из excludedPrincipals — 403
+                                          separation_of_duties_violation при любой роли);
                                           gate, тип которого объявляет preconditions.approved:
                                           пока хоть одно не выполнено — 409
                                           approval_precondition_failed (details.failed[index,
                                           kind, cause, reason, observationId?]), решение не
                                           записывается (ADR-0061, амендмент 2 от 2026-09-25)
-POST /api/v1/approvals/{id}:reject        approvals.decide + eligibility
+POST /api/v1/approvals/{id}:reject        approvals.decide + eligibility (как у :approve)
 POST /api/v1/approvals/{id}:cancel        approvals.manage; для gate=true дополнительно
                                           автор запроса ИЛИ eligibility решателя
-                                          (иначе 403 not_eligible)
+                                          (иначе 403 not_eligible или
+                                          separation_of_duties_violation)
 GET  /api/v1/approvals/{id}/outcome       approvals.read   (ADR-0061: объявленные типом задачи
                                           действия исхода решения и что с каждым стало:
                                           outcome, outcomeStatus pending|deferred|executed|
@@ -725,7 +926,10 @@ GET  /api/v1/context-packs/{id}           tasks.read на задачу паке�
                                           метаданных артефактов без artifacts.read и из
                                           задачи spawnedBy без tasks.read на неё
                                           вырезаны вместе с их значениями в request,
-                                          unresolved и used.entities)
+                                          unresolved и used.entities; пакет задачи
+                                          шага процесса — якоря source=step, в
+                                          request.semantic — чтение по сходству,
+                                          найденное им — в used.entities, CP-ADR-0076 п.6)
 POST /api/v1/context-packs/{id}:replay    tasks.read на задачу + events.read  (записанный
                                           запрос — после той же редакции — снова,
                                           видимостью вызывающего:
@@ -1076,7 +1280,18 @@ bootstrap-admin они входят автоматически (как все п
 namespace, число сущностей/связей, `duplicate` и числовые счётчики ответа памяти —
 без содержимого снимка), `knowledge.pack_registered` (entity `knowledge_pack`;
 name, version, status — без манифеста), `knowledge.packs_configured` (entity
-`workspace`; namespace, закреплённые packs, strict).
+`workspace`; namespace, закреплённые packs, strict), `knowledge.changed`
+(CP-ADR-0076 п.7, entity `workspace`: `changes[{kind, key, change opened|changed|
+closed}]`, `truncated` — после сверки снимка, пустая сверка события не даёт).
+
+process-packages (CP-ADR-0074 п.13, схемы — `docs/events/`):
+`process.definition_published` (entity `process_definition`),
+`process.started|correlated|data_changed|stage_entered|stage_exited|milestone_reached|
+timer_fired|timer_rescheduled|escalated|suspended|resumed|compensated|recall_completed|
+recall_timed_out|migrated|completed|cancelled|failed` (entity `process_instance`;
+`started|data_changed|completed` несут вычисленную проекцию дела `memory`,
+`recall_completed` — счётчики и хэш ответа, не узлы), `calendar.published`
+(entity `calendar`).
 
 M2.1 (ADR-0056): `skill.invocation_requested|claimed|retry_scheduled|succeeded|failed`
 (entity `skill_invocation`; payload — ids, skill/version, attempt, код ошибки,

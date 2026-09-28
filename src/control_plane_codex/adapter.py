@@ -51,6 +51,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from control_plane_agent.blocked import ENV_BLOCKED_FILE, blocked_file, record_blocked_file
 from control_plane_agent.inputs import LocalInput
 from control_plane_agent.instructions import (
     build_prompt,
@@ -95,6 +96,13 @@ the branch goes to people, not into a void.
 Your final message is published as the run's summary; your messages, commands
 and tool calls are recorded as a bounded transcript for audit, your reasoning
 is not.
+
+If you cannot do the work, write why into the file named by the environment
+variable `CONTROL_PLANE_BLOCKED_FILE` (for example `printf '%s' '<why>' >
+"$CONTROL_PLANE_BLOCKED_FILE"`) before you finish: that is the `blocked`
+signal of the platform contract. The runner then fails the run and hands the
+task to a person instead of publishing it as done. Nothing is committed in that
+case, and the working copy stays as you left it.
 """
 
 
@@ -172,27 +180,36 @@ class CodexAdapter:
             logger=logger,
         )
         mapper = CodexEventMapper(recorder)
-        try:
-            result = await self.cli.run_turn(
-                prompt,
-                cwd=cwd,
-                resume_session_id=resume_id,
-                log_name=public_id,
-                on_thread_id=on_thread_id,
-                on_event=mapper.consume,
-            )
-        except CodexError as exc:
-            await recorder.close(failed=True)
-            await with_suppressed(client.finish_action(run_id, str(action["id"]), status="failed"))
-            await self._checkpoint(
-                client,
-                run_id,
-                # The message may name a local path or a binary; the checkpoint
-                # is read elsewhere, so only the shape of the failure travels.
-                # The detail stays in the runner's log.
-                {"phase": "failed", "errorType": type(exc).__name__},
-            )
-            raise
+        # The executor's way to say "stopped, not done" without the Control
+        # Plane tools: the file becomes the run's `blocked` checkpoint.
+        with blocked_file() as stop_file:
+            try:
+                result = await self.cli.run_turn(
+                    prompt,
+                    cwd=cwd,
+                    resume_session_id=resume_id,
+                    # Outside the working copy: the signal is never committed.
+                    env={ENV_BLOCKED_FILE: str(stop_file)},
+                    log_name=public_id,
+                    on_thread_id=on_thread_id,
+                    on_event=mapper.consume,
+                )
+            except CodexError as exc:
+                await recorder.close(failed=True)
+                await with_suppressed(
+                    client.finish_action(run_id, str(action["id"]), status="failed")
+                )
+                await self._checkpoint(
+                    client,
+                    run_id,
+                    # The message may name a local path or a binary; the checkpoint
+                    # is read elsewhere, so only the shape of the failure travels.
+                    # The detail stays in the runner's log.
+                    {"phase": "failed", "errorType": type(exc).__name__},
+                )
+                raise
+            if not result.is_error:
+                await record_blocked_file(client, run_id, stop_file)
 
         await client.finish_action(
             run_id,

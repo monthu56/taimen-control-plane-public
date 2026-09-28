@@ -1,0 +1,14 @@
+# expect: unknown_task_type /spec/stages/0/steps/0/human/taskType
+apiVersion: taimen.ai/v1
+kind: Process
+key: sample
+spec:
+  version: 1
+  displayName: Sample
+  identity: {agent: sample-process}
+  owner: [{role: lead}]
+  data: {type: object, properties: {number: {type: string}}}
+  start: {on: {observation: sample.opened}, key: event.payload.number, set: {number: "'1'"}}
+  stages:
+    - id: work
+      steps: [{id: ask, human: {taskType: approval-review, assign: [{role: lead}]}}]

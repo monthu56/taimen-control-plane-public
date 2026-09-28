@@ -10,6 +10,13 @@ the agent sees nothing its principal could not read through ``/context``.
 ``POST /context-packs/{id}:replay`` sends a recorded pack's request again with
 the caller's visibility and says whether the answer still uses the same
 entities and facts: how a reviewer sees what the executor saw.
+
+A process's ``recall`` step (CP-ADR-0076 §4) reads through the same client:
+its anchors are natural keys the engine computed, its traversal the step's,
+its moment the time of the input that reached the step, its visibility the
+process identity's. The worker asks outside any transaction
+(:func:`fetch_process_recall`) and hands the normalized answer to the
+instance's journal.
 """
 
 import uuid
@@ -29,9 +36,13 @@ from control_plane.application.context.graph import (
     base_scope,
     deadline_after,
     drift,
+    entities_of,
     kind_patterns,
     off_loop,
+    recall_answer,
+    semantic_request,
     typed,
+    typed_pack,
     used_of,
     within,
     within_budget,
@@ -44,8 +55,10 @@ from control_plane.domain.context_schema import (
     DEFAULT_BUDGET_TOKENS,
     MAX_ANCHORS,
     MAX_CANDIDATE_CHARS,
+    MAX_STEP_LIMIT,
     Candidate,
     extract_identifiers,
+    traverse_steps,
 )
 from control_plane.domain.enums import Permission
 from control_plane.domain.errors import (
@@ -252,7 +265,7 @@ async def fetch_replay(
         # Every anchor was redacted for this reader: nothing to send.
         return _replayed(record, {})
     try:
-        pack = await typed(
+        pack = await typed_pack(
             provider,
             scope,
             record["request"],
@@ -276,3 +289,151 @@ def _replayed(record: dict[str, Any], pack: dict[str, Any]) -> dict[str, Any]:
         "drift": difference,
         "pack": within_budget(pack, record["budgetTokens"] or DEFAULT_BUDGET_TOKENS),
     }
+
+
+# --- a process's recall step (CP-ADR-0076 §4) -------------------------------------------
+
+
+class ProcessRecallFailed(Exception):
+    """Memory gave no answer: ``reason`` names why, ``retryable`` whether to ask again.
+
+    ``memory_unavailable`` (transport, 5xx, the deadline) and ``memory_disabled``
+    (no provider) are asked again until the step's own timeout; a request
+    memory rejects (``memory_rejected``) will be rejected again.
+    """
+
+    def __init__(self, reason: str, *, retryable: bool, detail: str = "") -> None:
+        super().__init__(f"{reason}: {detail}" if detail else reason)
+        self.reason = reason
+        self.retryable = retryable
+
+
+@dataclass
+class ProcessRecallCall:
+    """A ``recall`` intent ready for memory: what the transactional half resolved."""
+
+    scope: GraphScope
+    anchors: list[Candidate]
+    traverse: list[dict[str, Any]]
+    as_of: str | None
+    query: str = ""
+    kinds: list[str] = field(default_factory=list)
+    limit: int | None = None
+
+
+def process_recall_call(intent: dict[str, Any], scope: GraphScope) -> ProcessRecallCall:
+    """The call of a ``recall`` intent, as the engine made it (``anchors``, ``traverse``…).
+
+    An anchor is ``{kind, key, via?}`` (``{case: true}`` came with the case's
+    kind and key); one whose expression gave no key is not sent.
+    """
+    anchors = [
+        Candidate(
+            value=str(anchor["key"])[:MAX_CANDIDATE_CHARS],
+            kind=str(anchor.get("kind") or ""),
+            source="recall",
+            via=str(anchor["via"]) if anchor.get("via") else None,
+        )
+        for anchor in intent.get("anchors") or ()
+        if isinstance(anchor, dict) and anchor.get("key") not in (None, "")
+    ]
+    return ProcessRecallCall(
+        scope=scope,
+        anchors=anchors[:MAX_ANCHORS],
+        traverse=[
+            step.to_request() for step in traverse_steps(intent.get("traverse"), where="recall")
+        ],
+        as_of=intent.get("asOf"),
+        query=str(intent.get("query") or "").strip(),
+        kinds=[str(k) for k in intent.get("kinds") or ()],
+        limit=intent.get("limit"),
+    )
+
+
+async def _via(
+    call: ProcessRecallCall, provider: GraphProvider, *, deadline: float, trace: str | None
+) -> list[Candidate]:
+    """Anchors with ``via`` replaced by the entities pointing at them over that relation."""
+    anchors = [c for c in call.anchors if c.via is None]
+    groups: dict[str, list[Candidate]] = {}
+    for candidate in call.anchors:
+        if candidate.via is not None:
+            groups.setdefault(candidate.via, []).append(candidate)
+    for relation, group in groups.items():
+        request: dict[str, Any] = {
+            "anchors": [c.to_request() for c in group],
+            "traverse": [
+                {
+                    "relation": relation,
+                    "direction": "in",
+                    "depth": 1,
+                    "limit": MAX_STEP_LIMIT,
+                    "from": "anchors",
+                }
+            ],
+            "allow_semantic": False,
+        }
+        if call.as_of:
+            request["as_of"] = call.as_of
+        reached = await typed(provider, call.scope, request, deadline=deadline, trace_run_id=trace)
+        anchors += [
+            Candidate(value=str(e["natural_key"]), kind=str(e.get("kind") or ""), via=relation)
+            for e in entities_of(reached)
+            if not e.get("anchor") and e.get("natural_key")
+        ]
+    unique: dict[tuple[str, str], Candidate] = {}
+    for candidate in anchors:
+        unique.setdefault((candidate.kind, candidate.value), candidate)
+    return list(unique.values())[:MAX_ANCHORS]
+
+
+async def fetch_process_recall(
+    call: ProcessRecallCall,
+    provider: GraphProvider | None,
+    settings: Settings,
+    *,
+    trace_run_id: str = "",
+) -> dict[str, Any]:
+    """Non-transactional half: ``{nodes, edges, truncated}``, or :class:`ProcessRecallFailed`.
+
+    The explicit links of the anchors first; then, with a ``query``, what it
+    finds by similarity, marked ``inferred``.
+    """
+    if provider is None:
+        raise ProcessRecallFailed("memory_disabled", retryable=True)
+    deadline = deadline_after(settings)
+    trace = trace_run_id or None
+    try:
+        anchors = await _via(call, provider, deadline=deadline, trace=trace)
+        explicit: dict[str, Any] = {}
+        if anchors:
+            request: dict[str, Any] = {
+                "anchors": [c.to_request() for c in anchors],
+                "traverse": call.traverse,
+                "allow_semantic": False,
+            }
+            if call.as_of:
+                request["as_of"] = call.as_of
+            explicit = await typed(
+                provider, call.scope, request, deadline=deadline, trace_run_id=trace
+            )
+        semantic = None
+        if call.query:
+            semantic = await typed(
+                provider,
+                call.scope,
+                semantic_request(call.query, call.as_of),
+                deadline=deadline,
+                trace_run_id=trace,
+            )
+    except TimeoutError:
+        raise ProcessRecallFailed(
+            "memory_unavailable", retryable=True, detail="no answer in time"
+        ) from None
+    except ContextProviderError as exc:
+        if exc.retryable:
+            raise ProcessRecallFailed(
+                "memory_unavailable", retryable=True, detail=str(exc)
+            ) from exc
+        raise ProcessRecallFailed("memory_rejected", retryable=False, detail=str(exc)) from exc
+    return recall_answer(explicit, semantic, kinds=call.kinds, limit=call.limit)

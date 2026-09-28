@@ -1,0 +1,63 @@
+# yaml-language-server: $schema=../../schema/v1/object.schema.json
+# Документ задач фичи → задачи (TAI-ADR-0053 п.2, CP-ADR-0063 Г1–Г3). Шаг
+# feature-tasks завершён — значит, его документ уже прошёл tasks.check@1 (критерий
+# типа form). Правило разбирает тот же документ тем же скиллом и заводит по элементу
+# выхода: пункты документа — coding-task в порядке зависимостей, затем по
+# feature-converge на каждый упомянутый репозиторий со связями на все его пункты.
+#
+# - тип на элемент — {{item.type}} из допустимых taskTypes;
+# - ключ дедупликации — item.dedupKey, его скилл строит как
+#   feature:<slug>:<ID пункта> (сходимость — feature:<slug>:converge:<репозиторий>);
+#   на те же ключи ссылается item.dependsOn, поэтому связи depends_on
+#   разрешаются внутри одной оценки; повтор (переоценка того же события, второй
+#   task.completed) задач и связей не дублирует;
+# - исполнитель — item.assignee: agent:<key> из строки «Исполнитель» (ядро
+#   разрешает его в principal агента, CP-ADR-0073 А1); пункт «человек» и сходимость
+#   получают исполнителя шага разбиения — скилл подставляет вход humanAssignee;
+# - customFields — поля элемента по именам: у coding-task baseBranch, у сходимости
+#   featureSlug, repository, branch, targetBranch; пустое опускается (Б1);
+# - spawnedBy — шаг разбиения: сходимость получает от него spec и tasks входами.
+#
+# repositories — та же карта установки, что у критерия form типа feature-tasks.
+apiVersion: taimen.ai/v1
+kind: WorkRule
+key: feature-expand
+spec:
+  description: Завершён шаг разбиения фичи — задачи исполнения и сходимости по документу задач
+  workspaceId: ${SELFDEV_WORKSPACE_ID}
+  identity: {agent: sdd-rules}
+  trigger: {kind: event, type: task.completed}
+  condition: {eq: [{var: task.typeKey}, feature-tasks]}
+  interpretation:
+    skill: tasks.check@1
+    inputs:
+      repository: "{{task.customFields.repository}}"
+      ref: "{{task.customFields.branch}}"
+      slug: "{{task.customFields.featureSlug}}"
+      humanAssignee: "{{task.assigneeId}}"
+      repositories:
+        суперпроект: {url: "${SELFDEV_SUPERPROJECT_URL}", branch: main}
+        control-plane: {url: "${SELFDEV_CONTROL_PLANE_URL}", branch: main}
+        memory-service: {url: "${SELFDEV_MEMORY_SERVICE_URL}", branch: master}
+        iam-service: {url: "${SELFDEV_IAM_SERVICE_URL}", branch: main}
+        notification-service: {url: "${SELFDEV_NOTIFICATION_SERVICE_URL}", branch: main}
+  action:
+    kind: ensure_work
+    forEach: skill.output.items
+    taskType: "{{item.type}}"
+    taskTypes: [coding-task, feature-converge]
+    dedupKeyTemplate: "{{item.dedupKey}}"
+    fields:
+      title: "{{item.title}}"
+      description: "{{item.description}}"
+      priority: "{{task.priority}}"
+      assignee: "{{item.assignee}}"
+      customFields:
+        baseBranch: "{{item.customFields.baseBranch}}"
+        featureSlug: "{{item.customFields.featureSlug}}"
+        repository: "{{item.customFields.repository}}"
+        branch: "{{item.customFields.branch}}"
+        targetBranch: "{{item.customFields.targetBranch}}"
+      relations:
+        spawnedBy: "{{task.id}}"
+        dependsOn: "{{item.dependsOn}}"

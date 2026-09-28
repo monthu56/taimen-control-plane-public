@@ -57,6 +57,20 @@ class ContextProvider(Protocol):
         """Deliver observations into one namespace (at-least-once)."""
         ...
 
+    async def ingest_document(
+        self,
+        *,
+        namespace: str,
+        document: dict[str, Any],
+        trace_run_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Write one document (node and text chunks) into a namespace.
+
+        Idempotent by the document's ``natural_key``: ``replace`` swaps its
+        chunks, so a re-delivery writes the same document again.
+        """
+        ...
+
     async def build_context(
         self,
         *,

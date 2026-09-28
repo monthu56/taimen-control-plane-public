@@ -1,0 +1,23 @@
+# yaml-language-server: $schema=../../../../packages/schema/v1/test.schema.json
+process: purchase-example
+name: отказ от участия после прошлого проигрыша
+given:
+  clock: "2026-10-01T09:00:00+03:00"
+  principals: {purchase-lead: [alice], finance: [bob, carol]}
+mocks:
+  recall:
+    - step: recall-history
+      output: {nodes: [{kind: lesson, key: "lesson:1", text: "заказчик снижает цену на переторжке"}]}
+steps:
+  - emit:
+      observation: purchase.notice_published
+      payload: {number: "0373100000126000001", subject: "Разработка ПО", nmck: 12000000,
+                submissionDeadline: "2026-10-15T10:00:00+03:00", customer: {inn: "7700000000", name: "Заказчик"}}
+  - expect:
+      stages: {go-no-go: open}
+      tasks: [{step: decide-participation, assignee: alice}]
+      memory: {recalled: [recall-history]}
+  - advance: P10D
+  - expect: {events: [process.escalated]}
+  - complete: {step: decide-participation, by: alice, output: {decision: no-go}}
+  - expect: {status: completed, outcome: declined, noSideEffects: true}

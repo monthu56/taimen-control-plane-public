@@ -291,7 +291,7 @@ async def test_envelope_carries_workspace_and_schema_version(client: httpx.Async
     requested = by_entity[("approval.requested", world["childApproval"]["id"])]
     # Requested without a workspace, the approval lives in the task's one.
     assert requested["workspaceId"] == world["child"]["id"]
-    assert requested["schemaVersion"] == 2
+    assert requested["schemaVersion"] == 3
     bootstrapped = next(e for e in items if e["type"] == "tenant.bootstrapped")
     assert bootstrapped["workspaceId"] is None
     workspace_created = by_entity[("workspace.created", world["sales"]["id"])]
@@ -355,6 +355,7 @@ async def test_approval_events_v2_payloads(client: httpx.AsyncClient) -> None:
     assert len(requested["comment"]) == 1000
     assert secret not in requested["comment"]
     assert "[redacted]" in requested["comment"]
+    assert requested["excludedPrincipals"] == []
 
     approved = by[("approval.approved", first["id"])]["payload"]
     assert approved["decisionBy"] == reviewer["id"]
@@ -372,13 +373,16 @@ async def test_approval_events_v2_payloads(client: httpx.AsyncClient) -> None:
     assert no_task["workspaceId"] is None
     assert by[("approval.cancelled", third["id"])]["payload"]["cancelledBy"] == me["id"]
 
-    # Contract: every approval event validates against its catalog version.
+    # Contract: every approval event validates against its catalog version
+    # (approval.requested is at v3, CP-ADR-0074 §7; the others at v2).
     for event in events:
-        assert event["schemaVersion"] == 2
-        assert payload_violations(event["type"], 2, event["payload"]) == []
-    # v2 only adds fields: a v1 consumer's schema accepts the same payloads.
+        version = 3 if event["type"] == "approval.requested" else 2
+        assert event["schemaVersion"] == version
+        assert payload_violations(event["type"], version, event["payload"]) == []
+    # Versions only add fields: an older consumer's schema accepts the same payloads.
     for event in events:
         assert payload_violations(event["type"], 1, event["payload"]) == []
+        assert payload_violations(event["type"], 2, event["payload"]) == []
 
 
 # --- WebSocket ---------------------------------------------------------------

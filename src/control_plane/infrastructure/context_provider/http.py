@@ -5,6 +5,8 @@ Wire contract (the Memory Service's public ``/api/memory/*`` API):
 * ``POST /api/memory/observations:batch`` → 207 with per-item results and
   ``accepted``/``duplicates``/``failed`` counters. Write scope is exactly one
   namespace, passed as ``{"scope": {"namespace": ...}}``.
+* ``POST /api/brain/documents`` → 201: one document (node and text chunks),
+  idempotent by ``natural_key`` (case documents, CP-ADR-0076 §2);
 * ``POST /api/memory/context`` → 200 ContextPack (sections, sources,
   token_estimate, budget, trace_id). Read scope likewise, plus
   ``scope.namespaces`` when the read spans the tenant namespace and a
@@ -198,6 +200,27 @@ class HttpContextProvider:
             failed=max(reported_failed, len(errors)),
             errors=errors,
         )
+
+    async def ingest_document(
+        self,
+        *,
+        namespace: str,
+        document: dict[str, Any],
+        trace_run_id: str | None = None,
+    ) -> dict[str, Any]:
+        response = await self._post(
+            "/api/brain/documents",
+            {**document, "scope": {"namespace": namespace}},
+            request_timeout=self._ingest_timeout,
+            trace_run_id=trace_run_id,
+        )
+        try:
+            body: dict[str, Any] = response.json()
+        except ValueError as exc:
+            raise ContextProviderError(
+                f"malformed document response: {exc}", retryable=True
+            ) from exc
+        return body
 
     async def build_context(
         self,

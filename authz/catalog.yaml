@@ -109,6 +109,21 @@ actions:
     resource: tenant
   agents.status.write:
     resource: tenant
+  # --- процессы (CP-ADR-0074 §11): определения и экземпляры — на воркспейсе
+  # процесса (процесс уровня tenant — на tenant), как правила; пакеты и
+  # календари — уровень tenant ---
+  processes.read:
+    resource: workspace
+  processes.write:
+    resource: workspace
+  processes.operate:
+    resource: workspace
+  packages.test:
+    resource: tenant
+  packages.plan:
+    resource: tenant
+  calendars.write:
+    resource: tenant
   project_templates.read:
     resource: tenant
   project_templates.manage:

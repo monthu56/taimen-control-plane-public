@@ -1,0 +1,45 @@
+# yaml-language-server: $schema=../../schema/v1/object.schema.json
+# Цепочки миграций alembic целы (CP-ADR-0063): на каждом коммите main компонента с
+# живыми миграциями скилл migrations.check@1 разбирает ревизии его дерева; цепочка с
+# несколькими головами или корнями, разрывом или дублем ревизии — задача. Типичный
+# случай — две ветки влиты с одним родителем миграции: `alembic upgrade head` на
+# стенде откажет. Дедуп по (репозиторий, каталог миграций).
+apiVersion: taimen.ai/v1
+kind: WorkRule
+key: migrations-check
+spec:
+  description: Сломанная цепочка миграций alembic в main компонента — задача
+  workspaceId: ${SELFDEV_WORKSPACE_ID}
+  identity: {agent: selfdev-rules}
+  trigger: {kind: observation, type: repo.commit_observed}
+  condition:
+    and:
+      - {in: [{var: payload.data.repo}, [control-plane, iam-service]]}
+      - {exists: payload.data.url}
+  interpretation:
+    skill: migrations.check@1
+    inputs:
+      repository: "{{payload.data.url}}"
+      ref: "{{payload.data.sha}}"
+      repo: "{{payload.data.repo}}"
+  action:
+    kind: ensure_work
+    taskType: coding-task
+    forEach: skill.output.failing
+    dedupKeyTemplate: "migrations:{{item.repo}}:{{item.path}}"
+    fields:
+      title: "Цепочка миграций сломана: {{item.repo}}/{{item.path}}"
+      priority: high
+      description: |
+        Проверка миграций alembic (migrations.check@1) на коммите {{payload.data.sha}}
+        репозитория {{item.repo}} нашла сбой цепочки {{item.path}}:
+
+        {{item.text}}
+
+        Головы: {{item.heads}}
+
+        Что сделать: при нескольких головах — перевесить `down_revision` последней
+        влитой миграции на голову другой ветки (или добавить миграцию-слияние), затем
+        поправить тест головы миграций; при разрыве или дубле — восстановить цепочку.
+        Пока это не исправлено, `alembic upgrade head` на стенде откажет. Задача заведена
+        правилом migrations-check автоматически.

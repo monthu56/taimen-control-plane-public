@@ -52,6 +52,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from control_plane.application.authorization import AuthContext, ResourceRef, authorize
+from control_plane.application.commands.agent_assignees import is_agent_reference
 from control_plane.application.commands.principals import ensure_core_principal
 from control_plane.application.commands.relations import add_relation, resolve_task
 from control_plane.application.commands.skill_invocations import (
@@ -646,7 +647,13 @@ async def _ensure_work(
         description=str(inputs.get("description") or ""),
         priority=str(priority),
         type_key=_required_text(inputs, ENSURE_WORK, "type"),
-        assignee_id=_optional_uuid(inputs, ENSURE_WORK, "assignee"),
+        # An id, or an agent of the registry by key (CP-ADR-0073, A1).
+        assignee_id=(
+            str(inputs["assignee"])
+            if is_agent_reference(inputs.get("assignee"))
+            else _optional_uuid(inputs, ENSURE_WORK, "assignee")
+        ),
+        assignee_field=f"{ENSURE_WORK}.assignee",
         workspace_id=workspace_id,
         # Checked against the field_schema of the version the work item pins:
         # a misfit fails the action with custom_fields_invalid.

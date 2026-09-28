@@ -1,5 +1,5 @@
 {
-  "$comment": "Pinned request contract of the Memory Service knowledge endpoints (CP-ADR-0060). paths/schemas are copied from memory-service app.openapi(); snapshotDocument is hand-extracted from domain/reconcile.py. Regenerate when memory-service changes these endpoints.",
+  "$comment": "Pinned request contract of the Memory Service knowledge endpoints (CP-ADR-0060). paths/schemas are copied from memory-service app.openapi(); snapshotDocument is hand-extracted from domain/reconcile.py. Regenerate when memory-service changes these endpoints. responses.reconcile is the answer part the core reads (knowledge.changed, CP-ADR-0076 §7): ReconcileChanges of platform_memory_client.models and the example of docs/INTEGRATION.md, memory-service feature/process-packages 966dd5c (P003, MEM-ADR-020 amendment).",
   "memoryService": {
     "repository": "monthu56/taimen-memory-service",
     "branch": "master",
@@ -169,5 +169,117 @@
       }
     },
     "maxItemsTotal": 20000
+  },
+  "responses": {
+    "reconcile": {
+      "memoryService": {
+        "branch": "feature/process-packages",
+        "commit": "966dd5c"
+      },
+      "changesField": "changes",
+      "ReconcileChanges": {
+        "additionalProperties": true,
+        "description": "Natural keys ``{kind, key}`` of nodes touched by one reconcile (MEM-ADR-020).\n\n``opened`` — new for the ``(source, scope)``, ``changed`` — superseded by a new\nversion, ``closed`` — gone from the snapshot. Each list holds at most ``limit``\nkeys; ``truncated`` says one of them was cut (full numbers are in ``entities``).",
+        "properties": {
+          "opened": {
+            "default": [],
+            "items": {
+              "additionalProperties": {
+                "type": "string"
+              },
+              "type": "object"
+            },
+            "title": "Opened",
+            "type": "array"
+          },
+          "changed": {
+            "default": [],
+            "items": {
+              "additionalProperties": {
+                "type": "string"
+              },
+              "type": "object"
+            },
+            "title": "Changed",
+            "type": "array"
+          },
+          "closed": {
+            "default": [],
+            "items": {
+              "additionalProperties": {
+                "type": "string"
+              },
+              "type": "object"
+            },
+            "title": "Closed",
+            "type": "array"
+          },
+          "limit": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Limit"
+          },
+          "truncated": {
+            "default": false,
+            "title": "Truncated",
+            "type": "boolean"
+          }
+        },
+        "title": "ReconcileChanges",
+        "type": "object"
+      },
+      "changeLists": [
+        "opened",
+        "changed",
+        "closed"
+      ],
+      "example": {
+        "source": "git:web-app",
+        "scope": "web-app",
+        "namespace": "…",
+        "snapshot_id": "…",
+        "observed_at": "2026-09-23T08:47:12Z",
+        "pack": "code@1",
+        "opened": 9,
+        "closed": 0,
+        "unchanged": 0,
+        "superseded": 0,
+        "entities": {
+          "opened": 3,
+          "closed": 0,
+          "unchanged": 0,
+          "superseded": 0
+        },
+        "relations": {
+          "opened": 6,
+          "closed": 0,
+          "unchanged": 0,
+          "superseded": 0,
+          "pending": 1,
+          "resolved": 0,
+          "retried": 0
+        },
+        "changes": {
+          "opened": [
+            {
+              "kind": "ui_call",
+              "key": "web-app:src/runs/page.tsx:38"
+            }
+          ],
+          "changed": [],
+          "closed": [],
+          "limit": 1000,
+          "truncated": false
+        },
+        "duplicate": false
+      }
+    }
   }
 }

@@ -9,10 +9,12 @@ future rule engine — produces the same document:
   ``{kind, ref?, ruleId?, evidence[]}``. Immutable after creation: it is a
   record of how the item came to be, not a status.
 * **acceptance** (a task) / **criteria** (a goal) — the checks that tell done
-  from not done: ``[{key, kind, description, spec?}]``. A task's ``spec``
-  follows a grammar per kind (CP-ADR-0067), checked here when the document
-  is written; the verification stage executes it. A goal's ``spec`` stays
-  opaque: nothing verifies goal criteria.
+  from not done: ``[{key, kind, description, spec?, when?}]``. A task's
+  ``spec`` follows a grammar per kind (CP-ADR-0067), checked here when the
+  document is written; the verification stage executes it. ``when`` names
+  what the task must have for the check to run at all (amendment
+  2026-09-27). A task type version declares checks of the same form for all
+  its tasks. A goal's ``spec`` stays opaque: nothing verifies goal criteria.
 * **evidence** — pointers to facts: an observation, an artifact, an object
   in an external system or a task context pack (CP-ADR-0064), each
   optionally tied to one acceptance check.
@@ -26,7 +28,12 @@ import uuid
 from enum import StrEnum
 from typing import Any
 
-from control_plane.domain.approval_outcomes import MAX_INPUT_LENGTH, expressions_in
+from control_plane.domain.approval_outcomes import (
+    MAX_INPUT_LENGTH,
+    Path,
+    expressions_in,
+    parse_path,
+)
 from control_plane.domain.artifact_schema import (
     CONTENT_OPTIONAL,
     CONTENT_REQUIRED,
@@ -115,6 +122,13 @@ ARTIFACT_SPEC_KEYS = frozenset({"type", "mediaTypes", "content"})
 OUTPUT_CHECK_PREFIX = "output."
 # Skill inputs of a check read the task being verified, nothing else.
 SPEC_INPUT_ROOTS = frozenset({"task"})
+# ``when`` of a check (CP-ADR-0067, amendment 2026-09-27): 1..8 ``$.task``
+# expressions, all of which must resolve to something for the check to run.
+MAX_CHECK_CONDITIONS = 8
+# The kinds a person decides: the only basis a check may write outside on.
+DECISION_KINDS = frozenset({CheckKind.HUMAN.value, CheckKind.LLM_JUDGE.value})
+# ``details.cause`` of a check writing outside with no decision before it.
+EXTERNAL_WRITE_WITHOUT_DECISION = "external_write_without_decision"
 
 CHECK_KEY_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,62}$")
 # The key of the implicit ``external_state`` check a rule closing work without
@@ -390,18 +404,28 @@ def normalize_origin(value: Any, *, field: str = "origin") -> dict[str, Any]:
 
 
 def normalize_checks(
-    items: Any, *, field: str = "acceptance", typed_spec: bool = True
+    items: Any,
+    *,
+    field: str = "acceptance",
+    typed_spec: bool = True,
+    conditions: bool | None = None,
 ) -> list[dict[str, Any]]:
     """Validate a list of acceptance checks (or goal criteria).
 
     ``spec`` is bounded and scanned for secrets, since it is stored and read
-    by agents. With ``typed_spec`` (a task's acceptance) it must also follow
-    the grammar of its kind (``check_spec``), so that a check the
-    verification stage cannot execute is refused when it is written, not
-    when the work is done. Goal criteria pass ``typed_spec=False``: nothing
-    executes them, and their ``spec`` stays opaque. A check without ``spec``
-    is accepted as before.
+    by agents. With ``typed_spec`` (a task's or a task type's acceptance) it
+    must also follow the grammar of its kind (``check_spec``), so that a
+    check the verification stage cannot execute is refused when it is
+    written, not when the work is done. Goal criteria pass
+    ``typed_spec=False``: nothing executes them, and their ``spec`` stays
+    opaque. A check without ``spec`` is accepted as before.
+
+    ``conditions`` — whether a check may carry ``when`` (default: as
+    ``typed_spec``); a rule's acceptance probe checks it without typing the
+    spec. On goal criteria ``when`` is ``invalid_acceptance``: nobody runs them.
     """
+    if conditions is None:
+        conditions = typed_spec
     if not isinstance(items, list):
         raise _invalid("invalid_acceptance", f"{field} must be a list", field)
     if len(items) > MAX_CHECKS:
@@ -414,7 +438,9 @@ def normalize_checks(
         path = f"{field}[{index}]"
         if not isinstance(item, dict):
             raise _invalid("invalid_acceptance", f"{path} must be an object", path)
-        unknown = sorted(set(item) - {"key", "kind", "description", "spec"})
+        unknown = sorted(set(item) - {"key", "kind", "description", "spec", "when"})
+        if "when" in item and not conditions:
+            unknown = sorted({*unknown, "when"})
         if unknown:
             raise _invalid("invalid_acceptance", f"{path} has unknown keys: {unknown}", path)
         key = item.get("key")
@@ -459,8 +485,58 @@ def normalize_checks(
             if typed_spec:
                 check_spec(kind, spec, field=f"{path}.spec")
             check["spec"] = spec
+        if item.get("when") is not None:
+            check["when"] = check_conditions(item["when"], field=f"{path}.when", kind=kind)
         result.append(check)
     return result
+
+
+def check_conditions(value: Any, *, field: str, kind: str = "") -> list[str]:
+    """``when`` of a check: 1..8 ``$.task`` expressions, no ``|truncate``.
+
+    The grammar and truth are those of a completion's ``when`` (CP-ADR-0061,
+    amendment 2026-09-25): each must resolve to something — not ``null``,
+    ``""`` or ``false`` — for the check to run; otherwise it is ``skipped``.
+    """
+    if not isinstance(value, list) or not 1 <= len(value) <= MAX_CHECK_CONDITIONS:
+        raise _spec_error(
+            field, kind, f"when must be a list of 1 to {MAX_CHECK_CONDITIONS} expressions"
+        )
+    for index, item in enumerate(value):
+        where = f"{field}[{index}]"
+        if not isinstance(item, str):
+            raise _spec_error(where, kind, "must be a $.task expression")
+        condition = _condition(item, where=where, kind=kind)
+        if condition.root not in SPEC_INPUT_ROOTS or condition.truncate is not None:
+            raise _spec_error(where, kind, "a condition is one $.task expression, no |truncate")
+    return list(value)
+
+
+def _condition(text: str, *, where: str, kind: str) -> Path:
+    try:
+        return parse_path(text, where=where)
+    except ValidationError as exc:
+        raise _spec_error(where, kind, exc.message) from None
+
+
+def condition_paths(check: dict[str, Any]) -> tuple[Path, ...]:
+    """The parsed ``when`` of a normalized check (empty: it always runs)."""
+    return tuple(parse_path(text) for text in check.get("when") or ())
+
+
+def decision_before(checks: list[dict[str, Any]], index: int) -> bool:
+    """A check a person decides precedes ``checks[index]`` under the same condition.
+
+    What makes a ``deterministic`` check with an ``external_write`` skill
+    admissible (CP-ADR-0067, amendment 2026-09-27, B7): a ``human`` or
+    ``llm_judge`` check earlier in the list whose ``when`` is absent or the
+    same list of expressions — its decision is the basis of the write.
+    """
+    when = checks[index].get("when")
+    return any(
+        check["kind"] in DECISION_KINDS and check.get("when") in (None, when)
+        for check in checks[:index]
+    )
 
 
 def _spec_error(field: str, kind: str, message: str) -> ValidationError:
@@ -604,6 +680,35 @@ def output_checks(schema: ArtifactSchema) -> list[dict[str, Any]]:
             }
         )
     return checks
+
+
+def attempt_checks(
+    outputs: list[dict[str, Any]],
+    type_checks: list[dict[str, Any]],
+    task_checks: list[dict[str, Any]],
+    implicit: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """The checks one attempt runs, in order, each with its ``source``.
+
+    The required outputs of the task type (``output``), then the checks its
+    version declares (``type``), then the task's own (``task``; a key the
+    outputs or the type already hold is passed over — the type's check
+    stands). ``implicit`` (``rule``) is run only when neither the type nor
+    the task declares a check: a rule closing work verifies it by the
+    evidence it wrote (CP-ADR-0067, amendments 2026-09-26 and 2026-09-27).
+    """
+    taken = {check["key"] for check in outputs}
+    declared = [c for c in type_checks if c["key"] not in taken]
+    taken |= {check["key"] for check in declared}
+    own = [c for c in task_checks if c["key"] not in taken]
+    fallback = [] if declared or own else [c for c in implicit if c["key"] not in taken]
+    tagged = [
+        *(("output", c) for c in outputs),
+        *(("type", c) for c in declared),
+        *(("task", c) for c in own),
+        *(("rule", c) for c in fallback),
+    ]
+    return [{**check, "source": source} for source, check in tagged]
 
 
 def _check_spec_inputs(value: Any, *, field: str, kind: str) -> None:

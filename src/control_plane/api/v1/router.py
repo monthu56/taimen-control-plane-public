@@ -11,6 +11,7 @@ from control_plane.api.v1 import (
     artifacts,
     attention,
     bootstrap,
+    calendars,
     child_handles,
     claims,
     context,
@@ -23,8 +24,10 @@ from control_plane.api.v1 import (
     observations,
     operations,
     org,
+    packages,
     principal_org,
     principals,
+    processes,
     projects,
     rules,
     runs,
@@ -58,6 +61,9 @@ api_v1_router.include_router(task_types.router)
 api_v1_router.include_router(tasks.router)
 api_v1_router.include_router(goals.router)
 api_v1_router.include_router(rules.router)
+api_v1_router.include_router(processes.router)
+api_v1_router.include_router(calendars.router)
+api_v1_router.include_router(packages.router)
 api_v1_router.include_router(task_comments.router)
 api_v1_router.include_router(claims.router)
 api_v1_router.include_router(runs.router)

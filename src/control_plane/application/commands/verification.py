@@ -87,6 +87,7 @@ from control_plane.application.events import record_event
 from control_plane.domain.approval_outcomes import Path, expressions_in, render
 from control_plane.domain.artifact_schema import CONTENT_REQUIRED
 from control_plane.domain.artifact_type import media_type_allowed
+from control_plane.domain.completion_work import is_met
 from control_plane.domain.enums import (
     ApprovalStatus,
     Permission,
@@ -96,7 +97,15 @@ from control_plane.domain.enums import (
     SkillSideEffects,
 )
 from control_plane.domain.errors import ConflictError, DomainError, NotFoundError, ValidationError
-from control_plane.domain.work_graph import INVALID_ACCEPTANCE_SPEC, CheckKind, EvidenceKind
+from control_plane.domain.work_graph import (
+    DECISION_KINDS,
+    EXTERNAL_WRITE_WITHOUT_DECISION,
+    INVALID_ACCEPTANCE_SPEC,
+    CheckKind,
+    EvidenceKind,
+    condition_paths,
+    decision_before,
+)
 from control_plane.domain.work_item import TERMINAL_CATEGORIES, WorkItemStatusCategory
 from control_plane.infrastructure.db.models import (
     Approval,
@@ -116,6 +125,8 @@ WAITING_EXTERNAL = "waiting_external"
 PASSED = "passed"
 FAILED = "failed"
 CANCELLED = "cancelled"
+# A check whose ``when`` does not hold: not run, not a failure (amendment 2026-09-27).
+SKIPPED = "skipped"
 OPEN_STATUSES = (RUNNING, WAITING_HUMAN, WAITING_EXTERNAL)
 
 TRIGGERS = frozenset({"run", "complete", "approval", "rule"})
@@ -142,6 +153,10 @@ NO_APPROVER = "no_approver"
 ARTIFACT_MISSING = "artifact_missing"
 ARTIFACT_MEDIA_TYPE = "artifact_media_type"
 ARTIFACT_CONTENT_MISSING = "artifact_content_missing"
+# A check with ``when`` whose condition does not hold is skipped for this reason.
+CONDITION_UNMET = "condition_unmet"
+# An external write with no decision passed before it in the same attempt.
+NO_DECISION = "no_decision"
 # Why an attempt was cancelled.
 TASK_CANCELLED = "task_cancelled"
 # The reason given to a skill call the stage stops waiting for.
@@ -217,15 +232,20 @@ async def check_acceptance_skills(
     checks: list[dict[str, Any]],
     *,
     field: str = "acceptance",
+    before: list[dict[str, Any]] | None = None,
 ) -> None:
-    """What ``deterministic`` checks name is registered; their skills write nothing outside.
+    """What ``deterministic`` checks name is registered; an external write follows a decision.
 
     The grammar (``check_spec``) knows the form only; the registries are
     asked here, when the acceptance is written. A check whose skill is
-    ``external_write`` is refused: a verification has no approval that could
-    be the basis of an external write (ADR-0056 §4). A check on an artifact
-    names an artifact type registered in the tenant (CP-ADR-0072 §9).
+    ``external_write`` is admitted only after a ``human`` / ``llm_judge``
+    check under the same condition (``decision_before``): the decision is
+    the basis of the write (ADR-0056 §4; CP-ADR-0067, amendment 2026-09-27,
+    B7). ``before`` — the checks that run ahead of ``checks`` in every
+    attempt: the task type's, for a task's own acceptance. A check on an
+    artifact names an artifact type registered in the tenant (CP-ADR-0072 §9).
     """
+    ahead = list(before or [])
     for index, check in enumerate(checks):
         if check["kind"] != CheckKind.DETERMINISTIC:
             continue
@@ -252,11 +272,19 @@ async def check_acceptance_skills(
                 f"{path}: skill {ref!r} is not registered",
                 details={"field": path, "kind": check["kind"]},
             ) from exc
-        if skill.side_effects == SkillSideEffects.EXTERNAL_WRITE:
+        if skill.side_effects == SkillSideEffects.EXTERNAL_WRITE and not decision_before(
+            [*ahead, *checks], len(ahead) + index
+        ):
             raise ValidationError(
                 INVALID_ACCEPTANCE_SPEC,
-                f"{path}: {ref!r} writes to an external system; a check may not",
-                details={"field": path, "kind": check["kind"], "sideEffects": skill.side_effects},
+                f"{path}: {ref!r} writes to an external system; a check may only after "
+                "a human or llm_judge check under the same condition",
+                details={
+                    "field": path,
+                    "kind": check["kind"],
+                    "sideEffects": skill.side_effects,
+                    "cause": EXTERNAL_WRITE_WITHOUT_DECISION,
+                },
             )
 
 
@@ -394,11 +422,12 @@ class Timing:
 class _Outcome:
     """What one look at a check found: a result, or a reason to wait."""
 
-    status: str  # passed | failed | running | waiting_human | waiting_external
+    status: str  # passed | skipped | failed | running | waiting_human | waiting_external
     evidence: list[dict[str, Any]] = field(default_factory=list)
     reason: str | None = None
     message: str | None = None
     next_check_at: datetime | None = None
+    details: dict[str, Any] | None = None
 
 
 async def execute_verification(
@@ -454,16 +483,31 @@ async def execute_verification(
 
     while row.cursor < len(row.checks):
         check = row.checks[row.cursor]
-        outcome = await _look(session, ctx, task, row, check, timing)
+        outcome = None
+        if row.status == RUNNING and row.skill_invocation_id is None:
+            # Just arrived at the check: its condition is read now, not when
+            # the attempt opened — a check before it may have waited for days.
+            outcome = await _condition(session, ctx, task, check)
+        if outcome is None:
+            outcome = await _look(session, ctx, task, row, check, timing)
         if outcome.status == FAILED:
             return await _fail(session, ctx, task, row, outcome)
-        if outcome.status != PASSED:
+        if outcome.status not in (PASSED, SKIPPED):
             row.status = outcome.status
             row.next_check_at = outcome.next_check_at
             row.updated_at = utcnow()
             await session.flush()
             return row
-        row.results = [*row.results, _result(check, PASSED, evidence=outcome.evidence)]
+        row.results = [
+            *row.results,
+            _result(
+                check,
+                outcome.status,
+                evidence=outcome.evidence,
+                reason=outcome.reason,
+                details=outcome.details,
+            ),
+        ]
         row.cursor += 1
         row.skill_invocation_id = None
         row.approval_id = None
@@ -471,6 +515,41 @@ async def execute_verification(
         row.updated_at = utcnow()
         await session.flush()
     return await _pass(session, ctx, task, row)
+
+
+async def _condition(
+    session: AsyncSession, ctx: AuthContext, task: Task, check: dict[str, Any]
+) -> _Outcome | None:
+    """``skipped`` if the check's ``when`` does not hold; ``None`` to run it.
+
+    Read as the completer, like the check's inputs. What it cannot read
+    fails the check: whether it is due cannot even be told.
+    """
+    conditions = condition_paths(check)
+    if not conditions:
+        return None
+    context = _task_context(task, ctx)
+    try:
+        async with session.begin_nested():
+            await read_context(session, ctx, context, (), extra=conditions)
+    except DomainError as exc:
+        error = failure_of(exc)
+        return _Outcome(FAILED, reason=error["code"], message=error["message"])
+    unmet = next((c for c in conditions if not is_met(context.resolve(c))), None)
+    if unmet is None:
+        return None
+    return _Outcome(SKIPPED, reason=CONDITION_UNMET, details={"when": unmet.text})
+
+
+def _task_context(task: Task, ctx: AuthContext) -> DecisionContext:
+    return DecisionContext(
+        approval_id=None,
+        decided_by=ctx.principal_id,
+        outcome="verification",
+        approval={},
+        task=task_view(task),
+        spawned_by={},
+    )
 
 
 async def _look(
@@ -515,14 +594,22 @@ async def _skill_check(
     if row.skill_invocation_id is None:
         try:
             async with session.begin_nested():
+                caller, approval_id = ctx, None
+                skill_row = await resolve_skill_ref(session, ctx, spec["skill"])
+                if skill_row.side_effects == SkillSideEffects.EXTERNAL_WRITE:
+                    basis = await _decision_basis(session, row, ctx.trace_run_id)
+                    if isinstance(basis, _Outcome):
+                        return basis
+                    caller, approval_id = basis
                 inputs = await _render_inputs(session, ctx, task, spec.get("inputs") or {})
                 queued = await invoke_skill(
                     session,
-                    ctx,
+                    caller,
                     skill_ref=spec["skill"],
                     inputs=inputs,
                     idempotency_key=f"{INVOCATION_KEY_PREFIX}{row.id}:{row.cursor}",
                     task_ref=str(task.id),
+                    approval_id=approval_id,
                     requested_by=(SkillInvocationRequester.VERIFICATION, str(row.id)),
                 )
         except DomainError as exc:
@@ -574,19 +661,62 @@ async def _skill_check(
     )
 
 
+async def _decision_basis(
+    session: AsyncSession, row: TaskVerification, trace_run_id: str
+) -> tuple[AuthContext, uuid.UUID] | _Outcome:
+    """Who writes outside for the check, and on which decision (amendment 2026-09-27, B7).
+
+    The gate approval counted for the nearest ``human`` / ``llm_judge`` check
+    that passed earlier in this attempt; the call is made with the authority
+    of whoever decided it — they allowed the write, not the completer — and
+    cites the approval as its basis (ADR-0056 §4). A decision skipped by its
+    condition, or none at all, is ``no_decision``.
+    """
+    approval: Approval | None = None
+    for result in reversed(row.results):
+        if result["kind"] not in DECISION_KINDS or result["status"] != PASSED:
+            continue
+        cited = next(
+            (e["ref"] for e in result["evidence"] if e.get("kind") == APPROVAL_EVIDENCE), None
+        )
+        if cited is not None:
+            approval = await session.get(Approval, uuid.UUID(cited))
+        break
+    if (
+        approval is None
+        or approval.status != ApprovalStatus.APPROVED
+        or approval.decision_by_principal_id is None
+        or not approval.decision_authority
+    ):
+        return _Outcome(
+            FAILED,
+            reason=NO_DECISION,
+            message="the check writes to an external system and no decision of a person "
+            "passed before it in this attempt",
+        )
+    await require_active_credential(
+        session,
+        authority=approval.decision_authority,
+        principal_id=approval.decision_by_principal_id,
+        subject="the approval was decided with",
+    )
+    caller = _snapshot_context(
+        approval.decision_authority,
+        tenant_id=row.tenant_id,
+        principal_id=approval.decision_by_principal_id,
+        request_id=f"verification:{row.id}",
+        correlation_id=row.correlation_id,
+        trace_run_id=trace_run_id,
+    )
+    return caller, approval.id
+
+
 async def _render_inputs(
     session: AsyncSession, ctx: AuthContext, task: Task, inputs: dict[str, Any]
 ) -> dict[str, Any]:
     """The check's inputs, their ``$.task…`` expressions read as the completer."""
     paths: list[Path] = [path for text in _strings(inputs) for path in expressions_in(text)]
-    context = DecisionContext(
-        approval_id=None,
-        decided_by=ctx.principal_id,
-        outcome="verification",
-        approval={},
-        task=task_view(task),
-        spawned_by={},
-    )
+    context = _task_context(task, ctx)
     await read_context(session, ctx, context, (), extra=tuple(paths))
     rendered = render(inputs, context.resolve)
     assert isinstance(rendered, dict)
@@ -987,14 +1117,17 @@ def _result(
     evidence: list[dict[str, Any]] | None = None,
     reason: str | None = None,
     message: str | None = None,
+    details: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     return {
         "key": check["key"],
         "kind": check["kind"],
+        **({"source": check["source"]} if "source" in check else {}),
         "status": status,
         "evidence": evidence or [],
         "reason": reason,
         **({"message": message[:2000]} if message else {}),
+        **({"details": details} if details else {}),
     }
 
 
@@ -1263,16 +1396,34 @@ async def _lock_row(session: AsyncSession, verification_id: uuid.UUID) -> TaskVe
 
 def _authority_context(row: TaskVerification, trace_run_id: str) -> AuthContext:
     """The completer, as the credential snapshot taken at completion says."""
-    authority = row.authority or {}
-    iam = authority.get("iamPrincipalId")
-    return AuthContext(
+    return _snapshot_context(
+        row.authority or {},
         tenant_id=row.tenant_id,
         principal_id=row.authority_principal_id,
+        request_id=f"verification:{row.id}",
+        correlation_id=row.correlation_id,
+        trace_run_id=trace_run_id,
+    )
+
+
+def _snapshot_context(
+    authority: dict[str, Any],
+    *,
+    tenant_id: uuid.UUID,
+    principal_id: uuid.UUID,
+    request_id: str,
+    correlation_id: str,
+    trace_run_id: str,
+) -> AuthContext:
+    iam = authority.get("iamPrincipalId")
+    return AuthContext(
+        tenant_id=tenant_id,
+        principal_id=principal_id,
         principal_kind=str(authority.get("principalKind") or "human"),
         api_key_id=uuid.UUID(str(authority["credentialId"])),
         permissions=frozenset(authority.get("permissions") or ()),
-        request_id=f"verification:{row.id}",
-        correlation_id=row.correlation_id,
+        request_id=request_id,
+        correlation_id=correlation_id,
         causation_id=None,
         trace_run_id=trace_run_id,
         iam_principal_id=uuid.UUID(iam) if iam else None,

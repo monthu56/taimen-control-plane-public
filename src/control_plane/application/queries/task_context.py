@@ -42,13 +42,16 @@ from control_plane.application.commands.approval_outcomes import (
 )
 from control_plane.application.common import new_uuid, utcnow
 from control_plane.application.context.graph import (
+    SEMANTIC_REQUEST,
     GraphScope,
     KindPatterns,
     deadline_after,
     entities_of,
     kind_patterns,
     off_loop,
+    semantic_request,
     typed,
+    typed_pack,
     used_of,
     within,
     within_budget,
@@ -61,11 +64,13 @@ from control_plane.domain.context_schema import (
     DEFAULT_BUDGET_TOKENS,
     MAX_ANCHORS,
     MAX_STEP_LIMIT,
+    STEP_SOURCE,
     Candidate,
     ContextSchema,
     anchor_candidates,
     parse_context_schema,
     parse_source,
+    step_profile,
 )
 from control_plane.domain.enums import Permission
 from control_plane.domain.errors import AuthorizationError, DomainError, NotFoundError
@@ -102,10 +107,22 @@ class TaskContextCall:
     scope: GraphScope
     replay: dict[str, Any] | None = None
     warnings: list[str] = field(default_factory=list)
+    # The text a process step's context reads by similarity (CP-ADR-0076 §6).
+    semantic_text: str | None = None
 
 
 async def task_profile(session: AsyncSession, task: Task) -> ContextSchema | None:
-    """The context profile of the task's type version, if it declares one."""
+    """The context profile of the task: its process step's, else its type version's.
+
+    A task of a process step carries the step's ``context`` (CP-ADR-0076 §6),
+    which replaces the profile of its type.
+    """
+    if task.context_profile:
+        try:
+            return step_profile(task.context_profile)
+        except DomainError:  # the engine computed it from a checked version
+            logger.warning("task %s carries an unreadable context profile", task.id)
+            return None
     task_type = await session.get(TaskType, task.type_id)
     if task_type is None or not task_type.context_schema:
         return None
@@ -263,6 +280,7 @@ async def prepare_task_context(
         scope=scope,
         replay=replay,
         warnings=warnings,
+        semantic_text=task.title if schema.semantic else None,
     )
 
 
@@ -331,6 +349,7 @@ async def _anchors(
         aliases=catalog.aliases,
         warnings=call.warnings,
     )
+    candidates = [*call.schema.values, *candidates]
     anchors = [c for c in candidates if c.via is None]
     groups: dict[tuple[str, str], list[Candidate]] = {}
     for candidate in candidates:
@@ -408,7 +427,7 @@ async def fetch_task_context(
                 budgetTokens=record["budgetTokens"],
                 redactedAnchors=record["redactedAnchors"],
             )
-            if not record["request"].get("anchors"):
+            if not record["request"].get("anchors") and not record["request"].get(SEMANTIC_REQUEST):
                 result["status"] = "empty"
                 return result
             scope = GraphScope(
@@ -416,7 +435,7 @@ async def fetch_task_context(
                 namespaces=record["namespaces"],
                 visibility=call.scope.visibility,
             )
-            pack = await typed(
+            pack = await typed_pack(
                 provider, scope, record["request"], deadline=deadline, trace_run_id=trace
             )
             result.update(
@@ -426,16 +445,23 @@ async def fetch_task_context(
             return result
         anchors = await _anchors(call, provider, deadline=deadline, trace_run_id=trace)
         result["anchors"] = [_candidate_doc(c) for c in anchors]
-        if not anchors:
+        semantic = (call.semantic_text or "").strip()
+        if not anchors and not semantic:
             result["status"] = "empty"
             return result
-        request = {
+        request: dict[str, Any] = {
             "anchors": [c.to_request() for c in anchors],
             "traverse": [step.to_request() for step in call.schema.traverse],
             "as_of": call.as_of.isoformat(),
             "allow_semantic": False,
         }
-        pack = await typed(provider, call.scope, request, deadline=deadline, trace_run_id=trace)
+        if semantic:
+            # A process step's context: the explicit links of the case first,
+            # then what its text finds by similarity, marked (CP-ADR-0076 §6).
+            request[SEMANTIC_REQUEST] = semantic_request(semantic, call.as_of.isoformat())
+        pack = await typed_pack(
+            provider, call.scope, request, deadline=deadline, trace_run_id=trace
+        )
         budget = call.schema.budget_tokens or DEFAULT_BUDGET_TOKENS
         result.update(status="ok", pack=within_budget(pack, budget))
     except TimeoutError:
@@ -563,6 +589,8 @@ async def _hidden_sources(
     hidden: set[str] = set()
     spawned_readable: bool | None = None
     for source in sorted(sources):
+        if source == STEP_SOURCE:
+            continue  # computed by the process from its data, not read from a source
         try:
             path = parse_source(source, where="source")
         except DomainError:
