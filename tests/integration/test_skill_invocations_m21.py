@@ -248,6 +248,80 @@ async def test_contract_requires_policy_columns_and_a_consistent_protocol(
     assert response.json()["error"]["code"] == "invalid_skill_contract"
 
 
+async def test_endpoint_moves_without_a_new_version(
+    client: httpx.AsyncClient, actors: dict[str, Any], sync_engine: Engine
+) -> None:
+    """ADR-0056, amendment 2026-09-29: the endpoint is the installation's
+    address of the implementation, not part of the promise."""
+    admin = actors["admin"]
+    implementation = {
+        "protocol": "http",
+        "endpoint": "https://old.example/api/v1/skills/notify.send",
+        "auth": {"audience": "notification-service", "scopes": ["notifications:send"]},
+    }
+    skill = await published(client, admin, "notify.send", implementation=implementation)
+    url = f"/api/v1/skills/{skill['id']}"
+
+    response = await client.patch(
+        url,
+        json={"endpoint": "https://new.example/api/v1/skills/notify.send"},
+        headers={**auth(admin), "If-Match": '"skill-1"'},
+    )
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["version"] == skill["version"]
+    assert body["contract"]["implementation"] == {
+        **skill["contract"]["implementation"],
+        "endpoint": "https://new.example/api/v1/skills/notify.send",
+    }
+    assert {k: v for k, v in body["contract"].items() if k != "implementation"} == {
+        k: v for k, v in skill["contract"].items() if k != "implementation"
+    }
+
+    with sync_engine.begin() as conn:
+        payload = conn.execute(
+            text(
+                "SELECT payload FROM events WHERE entity_id = :id AND event_type = 'skill.updated'"
+                " ORDER BY sequence DESC LIMIT 1"
+            ),
+            {"id": skill["id"]},
+        ).scalar_one()
+    assert payload["changedFields"] == ["endpoint"]
+    assert payload["endpoint"] == {
+        "from": "https://old.example/api/v1/skills/notify.send",
+        "to": "https://new.example/api/v1/skills/notify.send",
+    }
+
+    response = await client.patch(
+        url, json={"endpoint": "ftp://nope/x"}, headers={**auth(admin), "If-Match": '"skill-2"'}
+    )
+    assert response.status_code == 422, response.text
+
+    # The rest of the implementation stays frozen, in the database too.
+    for statement in (
+        "UPDATE skills SET contract = jsonb_set(contract, '{implementation,auth}', 'null')"
+        " WHERE id = :id",
+        "UPDATE skills SET contract = jsonb_set(contract, '{timeoutSeconds}', '5') WHERE id = :id",
+        "UPDATE skills SET contract = jsonb_set(contract, '{implementation,endpoint}', '1')"
+        " WHERE id = :id",
+    ):
+        with pytest.raises(Exception, match=r"immutable"), sync_engine.begin() as conn:
+            conn.execute(text(statement), {"id": skill["id"]})
+
+
+async def test_local_skill_has_no_endpoint_to_move(
+    client: httpx.AsyncClient, actors: dict[str, Any]
+) -> None:
+    admin = actors["admin"]
+    skill = await published(client, admin)
+    response = await client.patch(
+        f"/api/v1/skills/{skill['id']}",
+        json={"endpoint": "https://a.example/x"},
+        headers={**auth(admin), "If-Match": '"skill-1"'},
+    )
+    assert response.status_code == 422, response.text
+
+
 # --- §1 immutability --------------------------------------------------------
 
 

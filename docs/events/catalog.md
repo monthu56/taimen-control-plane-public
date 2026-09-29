@@ -148,7 +148,7 @@ N+1 без изменений и игнорирует незнакомые по�
 | [`skill.invocation_succeeded`](#skillinvocation_succeeded) | `skill_invocation` | 1 | The invocation finished; its result is an artifact. |
 | [`skill.registered`](#skillregistered) | `skill` | 1 | A skill version was registered. |
 | [`skill.revoked`](#skillrevoked) | `principal` | 1 | A skill was revoked. |
-| [`skill.updated`](#skillupdated) | `skill` | 1 | The description or status of a skill version changed. |
+| [`skill.updated`](#skillupdated) | `skill` | 1 | The description, status or implementation endpoint of a skill version changed. |
 | [`task.claimed`](#taskclaimed) | `task` | 1 | An executor claimed the task under a lease. |
 | [`task.comment_added`](#taskcomment_added) | `task` | 1 | A comment was added to the task. |
 | [`task.comment_edited`](#taskcomment_edited) | `task` | 1 | A task comment was edited. |
@@ -2171,7 +2171,7 @@ A skill was revoked.
 
 ### skill.updated
 
-The description or status of a skill version changed.
+The description, status or implementation endpoint of a skill version changed.
 
 Сущность: `skill`.
 
@@ -2181,6 +2181,7 @@ The description or status of a skill version changed.
 |---|---|---|---|
 | `changedFields` | array | да |  |
 | `rowVersion` | integer | да |  |
+| `endpoint` | object | нет |  |
 
 ### task.claimed
 

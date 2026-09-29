@@ -11,16 +11,14 @@ harnesses and the reference runner daemon `control-plane-agent`.
 
 ## Before you start
 
-- Read the [Product Vision](https://github.com/taimen-ai/taimen/blob/main/docs/product-vision.md)
-  and the platform-wide
-  [ADR registry](https://github.com/taimen-ai/taimen/blob/main/docs/adr/README.md)
-  in the umbrella repository. The Control Plane keeps its own series of
+- Read the platform overview in the
+  [guide](https://github.com/taimen-ai/taimen/tree/main/guide/docs/overview)
+  (in Russian). The Control Plane keeps its own series of
   decisions in [`docs/adr/`](docs/adr/README.md) (numbered `0001…`, prefix
   `CP-` in the platform-wide index). ADRs are written in Russian with an
   English title line; English summaries are provided on request in the
   ADR's discussion.
-- Check the [roadmap](https://github.com/taimen-ai/taimen/blob/main/docs/roadmap.md)
-  and open issues before starting a large change. For anything that changes
+- Check the open issues before starting a large change. For anything that changes
   an API, a data model or a service boundary, open an issue first and propose
   an ADR in `docs/adr/`.
 

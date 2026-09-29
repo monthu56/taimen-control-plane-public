@@ -5,6 +5,7 @@ import pytest
 from control_plane.domain.errors import ValidationError
 from control_plane.domain.skill_contract import (
     normalize_contract,
+    replace_endpoint,
     schema_errors,
     validate_policy_columns,
 )
@@ -95,3 +96,42 @@ def test_malformed_auth_scopes_are_refused(scopes: object, code: str) -> None:
         normalize_contract(http_contract({"audience": "svc", "scopes": scopes}))
     assert exc.value.code == code
     assert exc.value.details["field"] == "implementation.auth.scopes"
+
+
+def test_replace_endpoint_moves_only_the_address() -> None:
+    contract = normalize_contract(
+        {
+            **BASE,
+            "implementation": {
+                "protocol": "http",
+                "endpoint": "https://old.example/api/v1/skills/notify.send",
+                "auth": {"audience": "notification-service", "scopes": ["notifications:send"]},
+            },
+        }
+    )
+    moved = replace_endpoint(contract, "https://new.example/api/v1/skills/notify.send")
+    assert moved["implementation"]["endpoint"] == "https://new.example/api/v1/skills/notify.send"
+    assert {k: v for k, v in moved.items() if k != "implementation"} == {
+        k: v for k, v in contract.items() if k != "implementation"
+    }
+    assert moved["implementation"]["auth"] == contract["implementation"]["auth"]
+    assert contract["implementation"]["endpoint"] == "https://old.example/api/v1/skills/notify.send"
+
+
+@pytest.mark.parametrize("endpoint", ["", None, "ftp://x/y", 42])
+def test_replace_endpoint_checks_the_new_value(endpoint: object) -> None:
+    contract = normalize_contract(
+        {**BASE, "implementation": {"protocol": "http", "endpoint": "https://a.example/x"}}
+    )
+    with pytest.raises(ValidationError) as exc:
+        replace_endpoint(contract, endpoint)
+    assert exc.value.details["field"] == "implementation.endpoint"
+
+
+def test_local_implementation_has_no_endpoint_to_move() -> None:
+    contract = normalize_contract(
+        {**BASE, "implementation": {"protocol": "local", "entrypoint": "pkg.mod:fn"}}
+    )
+    with pytest.raises(ValidationError) as exc:
+        replace_endpoint(contract, "https://a.example/x")
+    assert exc.value.details["protocol"] == "local"

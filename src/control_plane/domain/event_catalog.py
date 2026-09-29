@@ -414,8 +414,12 @@ _register(
 _register(
     "skill.updated",
     "skill",
-    "The description or status of a skill version changed.",
-    data({"changedFields": ARR, "rowVersion": INT}),
+    "The description, status or implementation endpoint of a skill version changed.",
+    data(
+        {"changedFields": ARR, "rowVersion": INT},
+        # ADR-0056, amendment 2026-09-29: only when the endpoint moved.
+        {"endpoint": data({"from": STR_N, "to": STR})},
+    ),
 )
 _register("skill.assigned", "principal", "A skill was assigned.", data({"skillId": UUID}))
 _register("skill.revoked", "principal", "A skill was revoked.", data({"skillId": UUID}))

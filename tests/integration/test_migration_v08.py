@@ -30,8 +30,8 @@ V08_TYPES = "c8a51d70b394"
 # Second revision of the v0.8 line: custom fields and planned dates (ADR-0049).
 V08_FIELDS = "a1c7e94b2f60"
 # The current head of the chain the v0.8 tests upgrade back to (the last
-# revision records what package applies wrote, CP-ADR-0074 §11).
-V08_HEAD = "d7f2a9c4e1b8"
+# revision lets a published skill move its endpoint, ADR-0056 amendment 2026-09-29).
+V08_HEAD = "e6b3d8f1a2c9"
 # The revision right before the agent registry.
 BEFORE_AGENT_REGISTRY = "c3f8a2d6e1b7"
 # The revision right before attention feedback (CP-ADR-0068 approval workspaces).

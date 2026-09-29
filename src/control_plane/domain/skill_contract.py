@@ -275,6 +275,32 @@ def normalize_contract(contract: Any) -> dict[str, Any]:
     }
 
 
+ENDPOINT_PROTOCOLS = frozenset({SkillProtocol.HTTP, SkillProtocol.MCP})
+
+
+def replace_endpoint(contract: dict[str, Any], endpoint: Any) -> dict[str, Any]:
+    """The published contract with only ``implementation.endpoint`` replaced.
+
+    The endpoint is where this installation reaches the implementation, not
+    what the skill promises (ADR-0056, amendment 2026-09-29): moving a service
+    to another host keeps the version. Everything else — protocol, auth,
+    entrypoint, schemas, policy — stays frozen; the new value passes the same
+    check as at publication, and the executor allow-lists (amendment M2.2, D)
+    still decide whether it is ever called.
+    """
+    implementation = contract.get("implementation") or {}
+    protocol = implementation.get("protocol")
+    if protocol not in ENDPOINT_PROTOCOLS:
+        raise _invalid(
+            "Only http and mcp implementations have an endpoint",
+            field="implementation.endpoint",
+            protocol=protocol,
+        )
+    if not isinstance(endpoint, str) or not endpoint:
+        raise _invalid("endpoint must be a non-empty string", field="implementation.endpoint")
+    return {**contract, "implementation": _implementation({**implementation, "endpoint": endpoint})}
+
+
 def validate_policy_columns(side_effects: Any, risk_level: Any) -> tuple[str, str]:
     """``sideEffects``/``riskLevel`` are mandatory next to a contract."""
     if side_effects not in set(SkillSideEffects):

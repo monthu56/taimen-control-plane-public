@@ -263,6 +263,7 @@ async def update_skill(
             input_schema=payload.input_schema,
             output_schema=payload.output_schema,
             status=payload.status,
+            endpoint=payload.endpoint,
         )
         return 200, dump(SkillOut, skill)
 

@@ -525,6 +525,37 @@ audience из своего allow-list, никогда — `control-plane`, `iam`
 Проверка — `tests/unit/test_skill_executor.py` (заглушка `tests/skill_stubs/sdk_like.py`
 в форме SDK) и сквозной `skill-sdk/tests/test_executor_e2e.py` суперпроекта.
 
+## Амендмент 2026-09-29: адрес реализации — не часть обещания (§1)
+
+Перенос инсталляции на новый хост упёрся в неизменяемость:
+у опубликованного `notify.send@1` в `implementation.endpoint` записан адрес
+прежнего хоста, а поднять версию ради нового адреса значит переписать всех,
+кто зовёт `notify.send@1` (процессы, тесты пакетов, описания агентов). Адрес
+при этом — свойство инсталляции, а не того, что скилл обещает: в открытой
+поставке у каждой инсталляции он свой.
+
+1. **Изменяемо одно поле.** У опубликованной версии `PATCH /skills/{id}`
+   принимает `endpoint` — новое значение `contract.implementation.endpoint`.
+   Протокол, `auth`, `entrypoint`, схемы, права, политика, таймауты и
+   остальной контракт по-прежнему заморожены: их изменение — новая версия.
+   Новое значение проходит ту же проверку, что при публикации (`http` —
+   только `http(s)://`); у `local` адреса нет — `422 invalid_skill_contract`,
+   у строки каталога без контракта — `409 skill_not_invocable`.
+2. **База держит ту же границу.** Триггер `skills_immutable` пропускает
+   изменение `contract` только если без `implementation.endpoint` старый и
+   новый документы равны, контракт не появляется и не исчезает, а адрес
+   остаётся строкой (миграция `e6b3d8f1a2c9`).
+3. **Аудит.** Событие `skill.updated` несёт `changedFields: ["endpoint"]` и
+   `endpoint: {from, to}`; `rowVersion` растёт, `If-Match` обязателен.
+4. **Безопасность не меняется.** Право то же, что у публикации
+   (`org.manage`), а решает, пойдёт ли вызов по новому адресу, по-прежнему
+   исполнитель: allow-list origin'ов и audience (амендмент M2.2, D). Вызовы,
+   уже выданные исполнителю, дорабатывают по старому адресу; ещё не
+   выданные уходят исполнителям, чей allow-list покрывает новый.
+5. **Пакеты.** `tools/cp_packages.py` сравнивает контракт без адреса и,
+   если отличается только он, переводит версию на новый адрес `PATCH`'ем
+   вместо отказа «поднимите spec.version».
+
 ## Conformance
 
 ```conformance
@@ -549,5 +580,7 @@ audience из своего allow-list, никогда — `control-plane`, `iam`
 - grep: {path: "src/control_plane_agent/skills.py", pattern: 'RESERVED_AUDIENCES = frozenset\(\{"control-plane", "iam"\}\)'}
   repo: control-plane
 - grep: {path: "src/control_plane/api/v1/schemas.py", pattern: "http_origins"}
+  repo: control-plane
+- grep: {path: "src/control_plane/domain/skill_contract.py", pattern: "def replace_endpoint"}
   repo: control-plane
 ```

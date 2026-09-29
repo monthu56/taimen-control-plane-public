@@ -24,6 +24,7 @@ from control_plane.domain.enums import Permission, SkillProtocol, SkillStatus
 from control_plane.domain.errors import ConflictError, NotFoundError, ValidationError
 from control_plane.domain.skill_contract import (
     normalize_contract,
+    replace_endpoint,
     require_safe_retries,
     validate_policy_columns,
 )
@@ -539,12 +540,16 @@ async def update_skill(
     input_schema: dict[str, Any] | None = None,
     output_schema: dict[str, Any] | None = None,
     status: str | None = None,
+    endpoint: str | None = None,
 ) -> Skill:
-    """Edit what a published version still allows: description and status.
+    """Edit what a published version still allows: description, status and
+    the implementation endpoint.
 
     Everything else is the contract and is frozen (ADR-0056 §1): a change is a
-    new version. The trigger ``skills_immutable`` enforces the same rule at
-    the database; this check exists to answer 409 instead of 500.
+    new version. The endpoint is where this installation reaches the
+    implementation, not part of the promise (amendment 2026-09-29). The
+    trigger ``skills_immutable`` enforces the same rule at the database; this
+    check exists to answer 409 instead of 500.
     """
     await authorize(ctx, Permission.ORG_MANAGE)
     skill = await session.scalar(
@@ -603,6 +608,17 @@ async def update_skill(
     for field_name, value in (("description", description), ("status", status)):
         if value is not None and getattr(skill, field_name) != value:
             changes[field_name] = value
+    previous_endpoint: str | None = None
+    if endpoint is not None:
+        if skill.contract is None:
+            raise ConflictError(
+                "skill_not_invocable",
+                "A catalog entry without a contract has no endpoint",
+                details={"skillId": str(skill.id), "reason": "no_contract"},
+            )
+        previous_endpoint = (skill.contract.get("implementation") or {}).get("endpoint")
+        if endpoint != previous_endpoint:
+            changes["contract"] = replace_endpoint(skill.contract, endpoint)
     if not changes:
         raise ValidationError("empty_update", "No fields to update")
     for field_name, value in changes.items():
@@ -620,7 +636,17 @@ async def update_skill(
         request_id=ctx.request_id,
         correlation_id=ctx.correlation_id,
         trace_run_id=ctx.trace_run_id,
-        payload={"changedFields": sorted(changes), "rowVersion": skill.row_version},
+        payload={
+            "changedFields": sorted(
+                "endpoint" if field_name == "contract" else field_name for field_name in changes
+            ),
+            "rowVersion": skill.row_version,
+            **(
+                {"endpoint": {"from": previous_endpoint, "to": endpoint}}
+                if "contract" in changes
+                else {}
+            ),
+        },
     )
     return skill
 

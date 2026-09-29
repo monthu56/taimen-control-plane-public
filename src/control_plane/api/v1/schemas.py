@@ -976,6 +976,9 @@ class SkillUpdateRequest(ApiModel):
     input_schema: dict[str, Any] | None = None
     output_schema: dict[str, Any] | None = None
     status: str | None = None
+    # The one mutable part of a published contract: implementation.endpoint
+    # (ADR-0056, amendment 2026-09-29).
+    endpoint: str | None = Field(default=None, min_length=1, max_length=2000)
 
 
 class SkillInvokeRequest(ApiModel):
