@@ -11,15 +11,15 @@ harnesses and the reference runner daemon `control-plane-agent`.
 
 ## Before you start
 
-- Read the [Product Vision](https://github.com/monthu56/taimen/blob/main/docs/product-vision.md)
+- Read the [Product Vision](https://github.com/taimen-ai/taimen/blob/main/docs/product-vision.md)
   and the platform-wide
-  [ADR registry](https://github.com/monthu56/taimen/blob/main/docs/adr/README.md)
+  [ADR registry](https://github.com/taimen-ai/taimen/blob/main/docs/adr/README.md)
   in the umbrella repository. The Control Plane keeps its own series of
   decisions in [`docs/adr/`](docs/adr/README.md) (numbered `0001…`, prefix
   `CP-` in the platform-wide index). ADRs are written in Russian with an
   English title line; English summaries are provided on request in the
   ADR's discussion.
-- Check the [roadmap](https://github.com/monthu56/taimen/blob/main/docs/roadmap.md)
+- Check the [roadmap](https://github.com/taimen-ai/taimen/blob/main/docs/roadmap.md)
   and open issues before starting a large change. For anything that changes
   an API, a data model or a service boundary, open an issue first and propose
   an ADR in `docs/adr/`.
@@ -31,8 +31,8 @@ contribution, so that the project can be relicensed or defended without
 tracking down every author. The CLA is checked by cla-assistant on each pull
 request; you sign once for all Taimen repositories.
 
-- Individuals: [`cla/CLA-individual.md`](https://github.com/monthu56/taimen/blob/main/cla/CLA-individual.md)
-- Companies contributing on behalf of employees: [`cla/CLA-entity.md`](https://github.com/monthu56/taimen/blob/main/cla/CLA-entity.md)
+- Individuals: [`cla/CLA-individual.md`](https://github.com/taimen-ai/taimen/blob/main/cla/CLA-individual.md)
+- Companies contributing on behalf of employees: [`cla/CLA-entity.md`](https://github.com/taimen-ai/taimen/blob/main/cla/CLA-entity.md)
 
 The CLA grants the project a copyright and patent licence to your
 contribution; you keep your copyright.
@@ -48,8 +48,8 @@ either work from a checkout of the umbrella repository or clone the SDK next
 to this repository:
 
 ```bash
-git clone https://github.com/monthu56/taimen-platform-auth-sdk.git platform-auth-sdk
-git clone https://github.com/monthu56/taimen-control-plane-public.git control-plane
+git clone https://github.com/taimen-ai/platform-auth-sdk.git platform-auth-sdk
+git clone https://github.com/taimen-ai/control-plane.git control-plane
 cd control-plane
 uv sync                     # runtime deps + the `dev` group (pytest, ruff, mypy)
 ```
