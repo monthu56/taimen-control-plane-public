@@ -49,10 +49,19 @@ EXAMPLES = FIXTURES / "processes"
 SUPERPROJECT = ROOT.parent
 SUPERPROJECT_SCHEMAS = SUPERPROJECT / "packages" / "schema" / "v1"
 SUPERPROJECT_EXAMPLES = SUPERPROJECT / "tools" / "tests" / "fixtures" / "process"
-INSIDE_SUPERPROJECT = (SUPERPROJECT_SCHEMAS / "object.schema.json").is_file()
 # The skill of a process's retrospective (package process-knowledge, CP-ADR-0076 §6).
 SUPERPROJECT_RETROSPECTIVE = (
     SUPERPROJECT / "packages" / "process-knowledge" / "skills" / "process.retrospective.yaml"
+)
+# The development superproject has all three sources; an open umbrella ships the schemas
+# alone, and then the pinned copies are the truth.
+INSIDE_SUPERPROJECT = all(
+    path.is_file()
+    for path in (
+        SUPERPROJECT_SCHEMAS / "object.schema.json",
+        SUPERPROJECT_EXAMPLES / "purchase.process.yaml",
+        SUPERPROJECT_RETROSPECTIVE,
+    )
 )
 
 
