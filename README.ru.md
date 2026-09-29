@@ -522,7 +522,7 @@ POST /api/v1/bootstrap            Authorization: Bearer <CP_BOOTSTRAP_TOKEN>
   "tenantSlug": "acme", "tenantName": "Acme", "adminDisplayName": "Admin",
   "iamBinding": {
     "issuer": "https://iam.example/iam",
-    "iamTenantId": "06c634f6-…", "iamPrincipalId": "38c46361-…"
+    "iamTenantId": "00000000-…", "iamPrincipalId": "11111111-…"
   }
 }
 → 201 { "tenant": …, "adminPrincipal": …, "apiKey": …,
@@ -543,7 +543,7 @@ POST /api/v1/bootstrap            Authorization: Bearer <CP_BOOTSTRAP_TOKEN>
 POST /api/v1/principals/{id}/iam-bindings
 {
   "issuer": "https://iam.example/iam",
-  "iamTenantId": "06c634f6-…", "iamPrincipalId": "54904171-…",
+  "iamTenantId": "00000000-…", "iamPrincipalId": "22222222-…",
   "permissions": ["sessions.open", "tasks.read", "tasks.write", "tasks.claim"]
 }
 ```

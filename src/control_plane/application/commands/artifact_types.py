@@ -111,12 +111,13 @@ async def latest_artifact_type(
     session: AsyncSession, tenant_id: uuid.UUID, key: str
 ) -> ArtifactType | None:
     """The version an artifact of ``key`` is checked against, if registered."""
-    return await session.scalar(
+    result: ArtifactType | None = await session.scalar(
         select(ArtifactType)
         .where(ArtifactType.tenant_id == tenant_id, ArtifactType.key == key)
         .order_by(ArtifactType.version.desc())
         .limit(1)
     )
+    return result
 
 
 async def resolve_artifact_type(session: AsyncSession, ctx: AuthContext, ref: str) -> ArtifactType:

@@ -28,6 +28,9 @@ The components below are used under the following conditions:
 - annotated-types 0.8.0 — MIT
 - anyio 4.14.2 — MIT
 - attrs 26.1.0 — MIT
+- boto3 1.43.103 — Apache-2.0
+- botocore 1.43.103 — Apache-2.0
+- cel-expr-python 0.1.3 — Apache-2.0
 - cffi 2.1.1 — MIT-0
 - click 8.4.2 — BSD-3-Clause
 - cryptography 50.0.0 — Apache-2.0 OR BSD-3-Clause
@@ -40,6 +43,7 @@ The components below are used under the following conditions:
 - httpx 0.28.1 — BSD-3-Clause
 - httpx2 2.10.0 — BSD-3-Clause
 - idna 3.18 — BSD-3-Clause
+- jmespath 1.1.0 — MIT
 - jsonschema 4.26.0 — MIT
 - jsonschema-specifications 2025.9.1 — MIT
 - Mako 1.4.1 — MIT
@@ -47,22 +51,28 @@ The components below are used under the following conditions:
 - mcp 2.0.0 — MIT
 - mcp-types 2.0.0 — MIT
 - opentelemetry-api 1.44.0 — Apache-2.0
+- protobuf 7.36.2 — 3-Clause BSD License
 - pycparser 3.0 — BSD-3-Clause
 - pydantic 2.13.4 — MIT
 - pydantic-settings 2.15.0 — MIT
 - pydantic_core 2.46.4 — MIT
 - PyJWT 2.13.0 — MIT
+- python-dateutil 2.9.0.post0 — Dual License
 - python-dotenv 1.2.2 — BSD-3-Clause
 - python-multipart 0.0.32 — Apache-2.0
 - PyYAML 6.0.3 — MIT
 - referencing 0.37.0 — MIT
+- regex 2026.9.10 — Apache-2.0 AND CNRI-Python
 - rpds-py 2026.6.3 — MIT
+- s3transfer 0.19.2 — Apache License 2.0
+- six 1.17.0 — MIT
 - SQLAlchemy 2.0.51 — MIT
 - sse-starlette 3.4.8 — BSD-3-Clause
 - starlette 1.6.0 — BSD-3-Clause
 - truststore 0.10.4 — MIT
 - typing-inspection 0.4.3 — MIT
 - typing_extensions 4.16.0 — PSF-2.0
+- urllib3 2.8.0 — MIT
 - uvicorn 0.52.1 — BSD-3-Clause
 - uvloop 0.22.1 — MIT License
 - watchfiles 1.2.0 — MIT

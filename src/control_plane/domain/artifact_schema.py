@@ -83,7 +83,8 @@ class ArtifactSchema:
     def artifact_types(self) -> list[str]:
         """Artifact type keys referenced, in order of first mention."""
         keys: list[str] = []
-        for entry in (*self.inputs, *self.outputs):
+        entries: tuple[ArtifactInput | ArtifactOutput, ...] = (*self.inputs, *self.outputs)
+        for entry in entries:
             if entry.type not in keys:
                 keys.append(entry.type)
         return keys
@@ -209,7 +210,11 @@ def check_against_artifact_types(schema: ArtifactSchema, registered: dict[str, l
     ``registered`` maps the key of each artifact type registered in the
     tenant to the media types of its latest version.
     """
-    for name, entries in (("inputs", schema.inputs), ("outputs", schema.outputs)):
+    groups: tuple[tuple[str, tuple[ArtifactInput | ArtifactOutput, ...]], ...] = (
+        ("inputs", schema.inputs),
+        ("outputs", schema.outputs),
+    )
+    for name, entries in groups:
         for index, entry in enumerate(entries):
             if entry.type not in registered:
                 field = f"{ROOT}.{name}[{index}].type"
