@@ -36,8 +36,15 @@ services:
 
   # Artifact content store (CP-ADR-0072 §3). An installation with its own
   # S3 points CP_S3_ENDPOINT_URL there and drops this service.
+  # Same image and digest as CI (.github/workflows/ci.yml): the upstream Docker
+  # Hub image is gone. The entrypoint is /usr/bin/minio, so the command starts
+  # with "server". The image runs as 65532 and ships /data with mode 0777, which
+  # Docker copies into an empty named volume, so minio_data is writable. A
+  # minio_data volume left over from the old root-run image is not: drop it with
+  # "docker volume rm control-plane_minio_data" (or "docker compose down -v").
   minio:
-    image: minio/minio:RELEASE.2025-04-22T22-12-26Z
+    image: cgr.dev/chainguard/minio:latest@sha256:4692462f35d97d7e82c30371d82f057703c5d9489bcae726010594c812f2d285
+    user: "65532"
     command: server /data
     environment:
       MINIO_ROOT_USER: ${CP_S3_ACCESS_KEY_ID:-minioadmin}

@@ -36,6 +36,45 @@
 - Матчинг skill по имени означает: обновление версии skill в реестре не
   выбивает исполнителей со старой версией.
 
+## Амендмент 2026-09-30: участники workspace и держатели его ролей (TASK-001194)
+
+Найдено на приёмке R024: у workspace «Оплата счетов (демо)» `GET
+/workspaces/{id}/members` пуст, а обе его роли назначены владельцу — он в
+`GET /roles/{id}/principals?workspaceId=` и берёт задачи по роли. Консоль и
+ассистент читали `members` и говорили «никто не назначен на роли».
+
+Решение:
+
+1. **Членство остаётся явным.** `WorkspaceMember` — организационная запись,
+   которую ставит и снимает `POST /workspaces/{id}/members[...:remove]`;
+   назначение роли его не создаёт и отзыв роли не снимает. Так членство не
+   исчезает вместе с ролью и не появляется у всех держателей роли уровня
+   tenant. Eligibility по-прежнему считает только роли (см. «Решение»).
+   `GET /workspaces/{id}/members` — только явное членство, форма не меняется.
+2. **Участники — отдельный список**: `GET /workspaces/{id}/participants`.
+   Principal — участник, если он явный член workspace или держит роль
+   workspace: у него есть назначение, которое действует в workspace по
+   правилу CP-ADR-0068 п.7 (уровень tenant, этот workspace или его предок —
+   `role_assignment_scope`), и либо роль принадлежит этому workspace, либо
+   назначение сделано на этот workspace. Назначение роли уровня tenant на
+   уровне tenant участником не делает — иначе участник был бы у каждого
+   workspace. Для каждой роли, созданной в workspace, держатели из
+   `GET /roles/{id}/principals?workspaceId=<этот>` совпадают с участниками,
+   у которых эта роль в `roles`.
+3. **Элемент** — `{principalId, kind, displayName, status, member, roles}`.
+   `member` — есть ли явное членство; `member: false` при непустом `roles` —
+   «держит роль, но не участник по членству». `roles[]` — `{roleId, slug,
+   name, roleWorkspaceId, assignmentWorkspaceId}`: чья роль и на каком
+   уровне назначена. Страница и курсор — как у `GET /roles/{id}/principals`
+   (по principal'ам); статус principal'а не фильтруется.
+4. **Право** — `workspaces.read` и (`org.read` или `principals.read`): кто
+   держит какую роль — данные организации, как у держателей роли. Чужой и
+   несуществующий workspace — одинаковый `404`.
+
+Следствие: консоль («Люди и роли») и ассистент берут людей workspace из
+`participants`, а не из `members`; `members` нужен там, где правят явное
+членство. Клиент — `list_workspace_participants`.
+
 ## Conformance
 
 Пробы для `adr.conformance_check` (пилот «саморазработка»):
@@ -50,5 +89,7 @@
 - grep: {path: src/control_plane/application/commands/eligibility.py, pattern: 'if missing_roles or missing_capabilities or missing_skills'}
   repo: control-plane
 - grep: {path: src/control_plane/application/commands/claims.py, pattern: 'await check_claim_eligibility\(session, ctx, task'}
+  repo: control-plane
+- grep: {path: src/control_plane/api/v1/workspaces.py, pattern: '"/workspaces/\{workspace_id\}/participants"'}
   repo: control-plane
 ```

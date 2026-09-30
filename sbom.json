@@ -701,8 +701,8 @@
     {
       "type": "library",
       "name": "PyJWT",
-      "version": "2.13.0",
-      "purl": "pkg:pypi/pyjwt@2.13.0",
+      "version": "2.15.1",
+      "purl": "pkg:pypi/pyjwt@2.15.1",
       "licenses": [
         {
           "license": {

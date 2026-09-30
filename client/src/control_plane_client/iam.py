@@ -66,10 +66,16 @@ DEFAULT_REFRESH_MARGIN_SECONDS = 30.0
 
 
 class IamCredentialError(ControlPlaneError):
-    """The IAM identity cannot be resolved or exchanged."""
+    """The IAM identity cannot be resolved or exchanged.
 
-    def __init__(self, code: str, message: str) -> None:
-        super().__init__(code, message)
+    ``status`` is the HTTP status IAM answered the exchange with, so a caller
+    can tell a retryable 5xx/429 from a final 4xx without parsing the message;
+    0 when there was no such answer (local store, unreachable IAM, malformed
+    response).
+    """
+
+    def __init__(self, code: str, message: str, *, status: int = 0) -> None:
+        super().__init__(code, message, status=status)
 
 
 class IamCredential:
@@ -155,16 +161,21 @@ class IamCredential:
             # in explicitly is renewed wherever it came from.
             hint = "" if self._explicit_token is not None else ": run `iam auth login`"
             raise IamCredentialError(
-                "iam_invalid_token", f"IAM rejected the Platform Access Token{hint}"
+                "iam_invalid_token",
+                f"IAM rejected the Platform Access Token{hint}",
+                status=response.status_code,
             )
         if response.status_code == 403:
             raise IamCredentialError(
                 "iam_audience_not_allowed",
                 f"the token is not allowed for audience {self._audience}",
+                status=response.status_code,
             )
         if response.status_code >= 400:
             raise IamCredentialError(
-                "iam_exchange_failed", f"IAM answered {response.status_code} to the exchange"
+                "iam_exchange_failed",
+                f"IAM answered {response.status_code} to the exchange",
+                status=response.status_code,
             )
 
         try:
@@ -195,17 +206,17 @@ class IamCredential:
                     "iam_not_authenticated", "the Platform Access Token given explicitly is empty"
                 )
             return token
-        token = self._environment_token()
-        if token:
-            return token
+        found = self._environment_token()
+        if found:
+            return found
         owner = self._owner()
         if self._keychain_available():
-            token = self._keychain_get(owner)
-            if token:
-                return token
-        token = self._file_token(owner)
-        if token:
-            return token
+            found = self._keychain_get(owner)
+            if found:
+                return found
+        found = self._file_token(owner)
+        if found:
+            return found
         raise IamCredentialError(
             "iam_not_authenticated",
             f"no Platform Access Token for {self.account}: run `iam auth login`",

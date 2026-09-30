@@ -56,7 +56,7 @@ The components below are used under the following conditions:
 - pydantic 2.13.4 — MIT
 - pydantic-settings 2.15.0 — MIT
 - pydantic_core 2.46.4 — MIT
-- PyJWT 2.13.0 — MIT
+- PyJWT 2.15.1 — MIT
 - python-dateutil 2.9.0.post0 — Dual License
 - python-dotenv 1.2.2 — BSD-3-Clause
 - python-multipart 0.0.32 — Apache-2.0

@@ -12,6 +12,7 @@ import uuid
 from dataclasses import dataclass
 
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from control_plane.application.authorization import AuthContext, authorize
@@ -139,22 +140,18 @@ async def _registry_agent_of(
     return agent
 
 
-def _check_registry_principal(
-    ctx: AuthContext, agent: Agent, *, issuer: str, iam_principal_id: uuid.UUID
-) -> None:
+def _registry_principal_conflict(agent: Agent) -> ConflictError:
     """The bindings of a registry agent's principal are the registry's own.
 
-    Any other identity on that principal would enter with rights the revision
-    does not set, and would survive ``identity:replace`` — the way back to a
-    previous service identity with rights wider than the revision. So a new
-    identity goes through the registry. Its own identity may still be re-bound
-    by an admin, as the superproject bootstrap does until it moves to the
-    registry routes (CP-ADR-0073, amendment 2026-09-30, E4).
+    Any identity bound here would enter with rights the revision does not set,
+    and would survive ``identity:replace`` — the way back to a previous
+    service identity with rights wider than the revision. Its own identity is
+    no exception, for an admin neither: re-binding it would set rights beside
+    the revision, and racing ``identity:replace`` would reopen the binding the
+    replacement revokes. So every identity goes through the registry
+    (CP-ADR-0073, amendment 2026-09-30, E4).
     """
-    own = (issuer, iam_principal_id) == (agent.iam_issuer, agent.iam_principal_id)
-    if own and ctx.has(Permission.ADMIN):
-        return
-    raise ConflictError(
+    return ConflictError(
         "agent_identity_conflict",
         "The identity of a registry agent changes through the registry: "
         f"/agents/{agent.key}/identity (identity:replace for a service)",
@@ -198,6 +195,35 @@ async def _check_previous_owner(
         )
 
 
+async def _insert_new(
+    session: AsyncSession, binding: IamPrincipalBinding
+) -> IamPrincipalBinding | None:
+    """Insert a binding of a new identity; the row that beat it, if one did.
+
+    Two upserts of one new identity both find no row to lock, and the second
+    insert hits ``uq_iam_bindings_identity`` once the first commits. Under a
+    SAVEPOINT the loser keeps its transaction and reads the winner's row
+    (locked, as the lookup would have locked it) instead of failing with a 500.
+    """
+    try:
+        async with session.begin_nested():
+            session.add(binding)
+            await session.flush()
+    except IntegrityError:
+        winner: IamPrincipalBinding | None = await session.scalar(
+            select(IamPrincipalBinding)
+            .where(
+                IamPrincipalBinding.issuer == binding.issuer,
+                IamPrincipalBinding.iam_principal_id == binding.iam_principal_id,
+            )
+            .with_for_update()
+        )
+        if winner is None:
+            raise  # not the identity index; nothing to answer with
+        return winner
+    return None
+
+
 async def upsert_iam_binding(
     session: AsyncSession,
     ctx: AuthContext,
@@ -215,8 +241,9 @@ async def upsert_iam_binding(
     bound, the row is repointed and reopened rather than duplicated, so a
     revoked identity can be readmitted with one call. Taking it from another
     principal is checked against that owner first (``_check_previous_owner``);
-    the principal of a registry agent takes no identity but its own
-    (``_check_registry_principal``).
+    the principal of a registry agent takes no identity through here at all
+    (``_registry_principal_conflict``). Losing a race to insert the same new
+    identity is a 409 too (``_insert_new``).
     """
     await authorize(ctx, Permission.PRINCIPALS_WRITE)
     check_trusted_issuer(issuer, trusted_issuer)
@@ -230,9 +257,13 @@ async def upsert_iam_binding(
     granted = validate_binding_permissions(
         ctx, permissions=permissions, principal_kind=principal.kind
     )
+    # Unlocked, and safely so: a principal becomes an agent's only in the
+    # transaction that creates it (``PUT /agents/{key}/identity``), and every
+    # call on an agent's principal is refused, so nothing here races
+    # ``identity:replace`` for the agent's bindings.
     agent = await _registry_agent_of(session, ctx, principal.id)
     if agent is not None:
-        _check_registry_principal(ctx, agent, issuer=issuer, iam_principal_id=iam_principal_id)
+        raise _registry_principal_conflict(agent)
 
     now = utcnow()
     existing = await session.scalar(
@@ -270,8 +301,20 @@ async def upsert_iam_binding(
             created_at=now,
             updated_at=now,
         )
-        session.add(binding)
-        await session.flush()
+        winner = await _insert_new(session, binding)
+        if winner is not None and (
+            winner.tenant_id != ctx.tenant_id or winner.principal_id != principal.id
+        ):
+            # Bound at the same moment elsewhere: the caller is told so rather
+            # than taking the identity from a principal it never saw holding it.
+            raise ConflictError(
+                "iam_identity_bound_elsewhere",
+                "This IAM identity was bound to another principal at the same time",
+            )
+        # The same identity on the same principal: the winner's row is the one
+        # this call would have found a moment later, and it is updated below.
+        existing = winner
+    if existing is None:
         event_type = "iam_binding.created"
     else:
         binding = existing

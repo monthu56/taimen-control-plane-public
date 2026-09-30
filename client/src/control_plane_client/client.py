@@ -2292,6 +2292,13 @@ class ControlPlaneClient:
             query["workspaceId"] = workspace_id
         return await self._request("GET", f"/roles/{role_id}/principals", params=query or None)
 
+    async def list_workspace_participants(self, workspace_id: str, **params: Any) -> Json:
+        """A page of participants of the workspace: explicit members (``member``)
+        and holders of its roles (``roles``) — CP-ADR-0010 amendment."""
+        return await self._request(
+            "GET", f"/workspaces/{workspace_id}/participants", params=params or None
+        )
+
     async def list_principals(self, *, kind: str | None = None, **params: Any) -> Json:
         """A page of principals (``PrincipalOut``); there is no name filter."""
         query: Json = dict(params)

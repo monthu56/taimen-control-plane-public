@@ -22,6 +22,8 @@ from control_plane_agent.skills import (
     LocalProtocol,
     McpProtocol,
     SkillExecutor,
+    SkillFailure,
+    _guarded_mcp_client,
     discover_local_entrypoints,
     executor_from_environment,
     iam_token_source,
@@ -731,6 +733,136 @@ async def test_mcp_over_http_refuses_a_private_address() -> None:
     implementation = {"protocol": "mcp", "endpoint": "https://skills.test/mcp", "entrypoint": "x"}
     await executor(fake, mcp=protocol).execute_claimed(claimed(implementation), None)
     assert fake.failed[0]["code"] == "endpoint_address_forbidden"
+
+
+def guarded_mcp_client(
+    monkeypatch: pytest.MonkeyPatch,
+    handler: Any,
+    rules: EndpointPolicy | None = None,
+    headers: dict[str, str] | None = None,
+) -> Any:
+    """``_guarded_mcp_client`` with a mock transport beneath its guard."""
+    import httpx2
+
+    monkeypatch.setattr(httpx2, "AsyncHTTPTransport", lambda: httpx2.MockTransport(handler))
+    return _guarded_mcp_client(rules or policy(), headers or {})
+
+
+async def test_mcp_client_does_not_follow_redirects(monkeypatch: pytest.MonkeyPatch) -> None:
+    import httpx2
+
+    seen: list[Any] = []
+
+    def handler(request: Any) -> Any:
+        seen.append(request)
+        return httpx2.Response(307, headers={"Location": "https://elsewhere.test/mcp"})
+
+    client = guarded_mcp_client(monkeypatch, handler, headers={"Authorization": "Bearer t"})
+    assert client.follow_redirects is False
+    async with client:
+        response = await client.post("https://skills.test/mcp", json={})
+    assert response.status_code == 307
+    [request] = seen
+    assert request.headers["Host"] == "skills.test"
+
+
+async def test_mcp_over_http_does_not_follow_a_redirect(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Through the SDK: every request goes to the checked endpoint, none to the Location."""
+    import httpx2
+
+    seen: list[Any] = []
+
+    def handler(request: Any) -> Any:
+        seen.append(request)
+        return httpx2.Response(307, headers={"Location": "https://elsewhere.test/mcp"})
+
+    monkeypatch.setattr(httpx2, "AsyncHTTPTransport", lambda: httpx2.MockTransport(handler))
+    fake = FakeControlPlane()
+    implementation = {"protocol": "mcp", "endpoint": "https://skills.test/mcp", "entrypoint": "x"}
+    # The Location is an allowed origin too: only not following keeps the request home.
+    origins = frozenset({"https://skills.test", "https://elsewhere.test"})
+    protocol = McpProtocol(policy=policy(origins=origins))
+    await executor(fake, mcp=protocol).execute_claimed(claimed(implementation), None)
+    assert fake.failed and not fake.completed
+    assert seen
+    assert {(r.url.host, r.headers["Host"]) for r in seen} == {("93.184.215.14", "skills.test")}
+
+
+@pytest.mark.parametrize(
+    ("url", "code"),
+    [
+        ("https://evil.test/mcp", "endpoint_not_allowed"),
+        ("https://skills.test@evil.test/mcp", "endpoint_not_allowed"),
+        ("http://127.0.0.1:8080/admin", "endpoint_not_allowed"),
+        ("https://skills.test.evil.test/mcp", "endpoint_not_allowed"),
+    ],
+)
+async def test_mcp_client_refuses_a_forbidden_origin(
+    monkeypatch: pytest.MonkeyPatch, url: str, code: str
+) -> None:
+    client = guarded_mcp_client(monkeypatch, refuse_request)
+    async with client:
+        with pytest.raises(SkillFailure) as raised:
+            await client.post(url, json={})
+    assert raised.value.code == code
+
+
+@pytest.mark.parametrize("address", ["127.0.0.1", "10.1.2.3", "169.254.169.254", "::1", "fd00::1"])
+async def test_mcp_client_refuses_a_private_address(
+    monkeypatch: pytest.MonkeyPatch, address: str
+) -> None:
+    rules = policy(resolve=resolver("93.184.215.14", address))
+    client = guarded_mcp_client(monkeypatch, refuse_request, rules)
+    async with client:
+        with pytest.raises(SkillFailure) as raised:
+            await client.post("https://skills.test/mcp", json={})
+    assert (raised.value.code, raised.value.retryable) == ("endpoint_address_forbidden", False)
+
+
+async def test_mcp_client_connects_to_the_address_it_checked(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import httpx2
+
+    seen: list[Any] = []
+
+    def handler(request: Any) -> Any:
+        seen.append(request)
+        return httpx2.Response(200, json={})
+
+    trusted = frozenset({"skills.test", "plain.test"})
+    rules = policy(resolve=resolver("10.0.0.5"), private_hosts=trusted)
+    client = guarded_mcp_client(monkeypatch, handler, rules)
+    async with client:
+        await client.post("https://skills.test/mcp", json={})
+        await client.post("http://plain.test/mcp", json={})
+    https, http = seen
+    assert (https.url.host, https.headers["Host"]) == ("10.0.0.5", "skills.test")
+    assert https.extensions["sni_hostname"] == "skills.test"
+    # SNI is a TLS matter: plain http gets none.
+    assert (http.url.host, http.headers["Host"]) == ("10.0.0.5", "plain.test")
+    assert "sni_hostname" not in http.extensions
+
+
+async def test_mcp_client_ignores_proxies_of_the_environment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import httpx2
+
+    for name in ("HTTPS_PROXY", "HTTP_PROXY", "ALL_PROXY", "https_proxy", "http_proxy"):
+        monkeypatch.setenv(name, "http://proxy.invalid:3128")
+    seen: list[Any] = []
+
+    def handler(request: Any) -> Any:
+        seen.append(request)
+        return httpx2.Response(200, json={})
+
+    client = guarded_mcp_client(monkeypatch, handler)
+    assert client.trust_env is False
+    async with client:
+        await client.post("https://skills.test/mcp", json={})
+    # Reached the guarded transport, not a proxy mounted from the environment.
+    assert len(seen) == 1
 
 
 def test_mcp_declares_its_origins_and_stdio_servers() -> None:

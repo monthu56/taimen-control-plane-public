@@ -206,7 +206,7 @@ uv run pytest                                 # unit + integration + concurrency
   arguments go through `make test PYTEST_ARGS="tests/unit -x"`. Automated
   runners should run tests through `make test`.
 
-Lint and types: `uv run ruff check . && uv run ruff format --check . && uv run mypy src`.
+Lint and types: `uv run ruff check . && uv run ruff format --check . && uv run mypy`.
 
 ## Migrations
 

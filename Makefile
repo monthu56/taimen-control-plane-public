@@ -13,7 +13,7 @@ fmt:
 	uv run ruff format .
 
 typecheck:
-	uv run mypy src
+	uv run mypy
 
 db-up:
 	docker compose up -d db

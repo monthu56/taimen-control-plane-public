@@ -171,15 +171,27 @@ Upsert той же identity на тот же principal не меняется: у
   проверки нет;
 - на principal действующего агента реестра upsert не заводит и не
   открывает связку — `409 agent_identity_conflict` с `details {agent, route}`:
-  идентичность агента меняется через `/agents/{key}/identity`. Исключение —
-  повторная привязка идентичности, записанной в реестре, вызывающим с
-  `admin` (переходный путь bootstrap).
+  идентичность агента меняется через `/agents/{key}/identity`. Переходное
+  исключение для `admin` (повторная привязка идентичности, записанной в
+  реестре) снято в TASK-001127: отказ — для любого вызывающего.
+
+Гонка за новую identity (TASK-001127). Два upsert одной ещё не связанной
+identity не находят строки для блокировки, и вторая вставка упирается в
+`uq_iam_bindings_identity`. Вставка идёт под SAVEPOINT; проигравший
+перечитывает строку победителя (`FOR UPDATE`): она у другого principal или в
+другом tenant'е — `409 iam_identity_bound_elsewhere`, у того же principal —
+обычное обновление (`200`, `iam_binding.updated`), как ответил бы вызов
+мгновением позже. `500` гонка не даёт.
 
 Проверки: `tests/integration/test_agent_identity_replace.py` — identity агента
 не переносится, после смены и после вывода переносится, `previousPrincipalId`
 в событии; identity человека переносит только администратор;
 `tests/integration/test_agent_identity_bindings.py` — issuer, principal агента
-реестра, перенос identity сервиса вне реестра только администратором.
+реестра (в том числе своя identity агента и `admin` — `409`), перенос identity
+сервиса вне реестра только администратором;
+`tests/concurrency/test_iam_binding_upsert_races.py` — проигравший уникальный
+индекс, параллельные upsert на два principal, upsert рядом с
+`identity:replace`.
 
 ## Conformance
 

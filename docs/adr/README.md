@@ -21,7 +21,7 @@
 |---|---|
 | [0008](0008-workspace-hierarchy.md) | Иерархия workspaces: adjacency list + advisory lock |
 | [0009](0009-role-capability-skill.md) | Семантика Role vs Capability vs Skill |
-| [0010](0010-task-requirements-eligibility.md) | Task requirements и eligibility при claim |
+| [0010](0010-task-requirements-eligibility.md) | Task requirements и eligibility при claim; амендмент 2026-09-30: членство workspace явное, `GET /workspaces/{id}/participants` — явные члены и держатели ролей workspace с признаком `member` и списком `roles` |
 | [0011](0011-task-dependency-model.md) | Модель зависимостей задач и readiness |
 | [0012](0012-run-ownership-fencing.md) | Run: ownership и fencing-семантика |
 | [0013](0013-artifact-model.md) | Artifact: reference-модель хранения; амендмент 2026-09-26 (ADR-0072): содержимое в хранилище ядра |

@@ -16,6 +16,7 @@ from control_plane.api.v1.schemas import (
     WorkspaceMemberRequest,
     WorkspaceMoveRequest,
     WorkspaceOut,
+    WorkspaceParticipantOut,
     WorkspaceUpdateRequest,
     dump,
     page_body,
@@ -242,6 +243,26 @@ async def list_members(
     return JSONResponse(
         page_body([dump(WorkspaceMemberOut, m) for m in page.items], page.next_cursor)
     )
+
+
+@router.get(
+    "/workspaces/{workspace_id}/participants", response_model=PageOut, responses=ERROR_RESPONSES
+)
+async def list_participants(
+    workspace_id: uuid.UUID,
+    ctx: AuthDep,
+    db: DbDep,
+    limit: int | None = Query(default=None),
+    cursor: str | None = Query(default=None),
+) -> JSONResponse:
+    page = await queries.list_workspace_participants(
+        db, ctx, workspace_id, limit=limit, cursor=cursor
+    )
+    items = [
+        WorkspaceParticipantOut.model_validate(p).model_dump(mode="json", by_alias=True)
+        for p in page.items
+    ]
+    return JSONResponse(page_body(items, page.next_cursor))
 
 
 @router.post(

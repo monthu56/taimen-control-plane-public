@@ -83,7 +83,7 @@ Lint and type checks (the same commands run in CI):
 
 ```bash
 uv run ruff check . && uv run ruff format --check .   # make lint
-uv run mypy src                                       # make typecheck
+uv run mypy                                           # make typecheck
 make fmt                                              # ruff --fix + format
 make check                                            # lint + typecheck + test
 ```
@@ -112,7 +112,7 @@ two `pyproject.toml` versions equal when you bump one.
 
 - One logical change per pull request; keep the history linear (rebase, no
   merge commits).
-- Tests, `ruff check` / `ruff format --check` and `mypy src` must pass;
+- Tests, `ruff check` / `ruff format --check` and `mypy` must pass;
   behaviour changes come with tests.
 - Commit messages explain *why*, not *what*; reference the ADR or issue.
 - Public API changes (routes, schemas, MCP tools, CLI commands, env

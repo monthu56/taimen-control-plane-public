@@ -1287,6 +1287,36 @@ class WorkspaceMemberOut(ApiModel):
     created_at: datetime
 
 
+class ParticipantRoleOut(ApiModel):
+    role_id: uuid.UUID
+    slug: str
+    name: str
+    role_workspace_id: uuid.UUID | None = Field(
+        description="Workspace the role belongs to; null for a tenant-wide role"
+    )
+    assignment_workspace_id: uuid.UUID | None = Field(
+        description="Scope of the assignment: this workspace, its ancestor, or null for tenant"
+    )
+
+
+class WorkspaceParticipantOut(ApiModel):
+    """A participant of a workspace (``GET /workspaces/{id}/participants``,
+    CP-ADR-0010 amendment): an explicit member, a holder of its roles, or both."""
+
+    principal_id: uuid.UUID
+    kind: str
+    display_name: str
+    status: str
+    member: bool = Field(
+        description="Explicit membership (GET /workspaces/{id}/members); false for a "
+        "principal who only holds a role of the workspace"
+    )
+    roles: list[ParticipantRoleOut] = Field(
+        description="Role assignments that count in this workspace; empty for a member "
+        "without roles here"
+    )
+
+
 class PackageLinkOut(ApiModel):
     """The package that installed a catalog object (CP-ADR-0074 §11, amendment TASK-000904)."""
 

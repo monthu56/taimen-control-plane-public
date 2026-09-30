@@ -540,7 +540,12 @@ PATCH /api/v1/workspaces/{id}             workspaces.manage (If-Match "workspace
 POST  /api/v1/workspaces/{id}:archive     workspaces.manage (нужно отсутствие активных детей)
 POST  /api/v1/workspaces/{id}:move        workspaces.manage (body: newParentId|null; циклы -> 422)
 POST  /api/v1/workspaces/{id}/members     workspaces.manage
-GET   /api/v1/workspaces/{id}/members     workspaces.read
+GET   /api/v1/workspaces/{id}/members     workspaces.read   (только явное членство, CP-ADR-0010)
+GET   /api/v1/workspaces/{id}/participants  workspaces.read и (org.read | principals.read)
+                                          (амендмент CP-ADR-0010: явные участники и держатели
+                                          ролей workspace; items[]: principalId, kind,
+                                          displayName, status, member, roles[{roleId, slug,
+                                          name, roleWorkspaceId, assignmentWorkspaceId}])
 POST  /api/v1/workspaces/{id}/members/{principalId}:remove  workspaces.manage
 
 POST  /api/v1/roles                       org.manage   (slug уникален в scope)

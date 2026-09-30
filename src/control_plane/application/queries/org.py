@@ -1,8 +1,9 @@
 """Read-side queries for the organization model."""
 
 import uuid
+from dataclasses import dataclass
 
-from sqlalchemy import ColumnElement, exists, select
+from sqlalchemy import ColumnElement, exists, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from control_plane.application.authorization import AuthContext, authorize
@@ -90,6 +91,124 @@ async def list_workspace_members(
         id_col=WorkspaceMember.id,
         limit=clamp_limit(limit),
         cursor=cursor,
+    )
+
+
+@dataclass(frozen=True)
+class ParticipantRole:
+    """A role assignment that makes a principal a participant of a workspace."""
+
+    role_id: uuid.UUID
+    slug: str
+    name: str
+    role_workspace_id: uuid.UUID | None
+    assignment_workspace_id: uuid.UUID | None
+
+
+@dataclass(frozen=True)
+class WorkspaceParticipant:
+    principal_id: uuid.UUID
+    kind: str
+    display_name: str
+    status: str
+    member: bool
+    roles: list[ParticipantRole]
+
+
+async def list_workspace_participants(
+    session: AsyncSession,
+    ctx: AuthContext,
+    workspace_id: uuid.UUID,
+    *,
+    limit: int | None = None,
+    cursor: str | None = None,
+) -> Page[WorkspaceParticipant]:
+    """Explicit members of the workspace and holders of its roles (CP-ADR-0010
+    amendment): ``member`` tells the two apart, ``roles`` names the assignments.
+
+    A role assignment makes a participant when it counts in the workspace by
+    the rule of ``GET /roles/{id}/principals?workspaceId=`` (CP-ADR-0068) and
+    either the role belongs to this workspace or the assignment is scoped to it.
+    """
+    await authorize(ctx, Permission.WORKSPACES_READ)
+    # Who holds which role is org data, as in GET /roles/{id}/principals.
+    await authorize(ctx, Permission.ORG_READ, Permission.PRINCIPALS_READ)
+    await get_workspace(session, ctx, workspace_id)
+    scope = await role_assignment_scope(session, ctx.tenant_id, workspace_id)
+    role_here = or_(Role.workspace_id == workspace_id, PrincipalRole.workspace_id == workspace_id)
+    is_member = exists().where(
+        WorkspaceMember.tenant_id == ctx.tenant_id,
+        WorkspaceMember.workspace_id == workspace_id,
+        WorkspaceMember.principal_id == Principal.id,
+    )
+    holds_role = (
+        exists()
+        .where(
+            PrincipalRole.principal_id == Principal.id,
+            PrincipalRole.tenant_id == ctx.tenant_id,
+            scope,
+            role_here,
+        )
+        .where(Role.id == PrincipalRole.role_id)
+    )
+    stmt = select(Principal).where(Principal.tenant_id == ctx.tenant_id, or_(is_member, holds_role))
+    page = await _paginate(
+        session,
+        stmt,
+        created_col=Principal.created_at,
+        id_col=Principal.id,
+        limit=clamp_limit(limit),
+        cursor=cursor,
+    )
+    ids = [p.id for p in page.items]
+    members: set[uuid.UUID] = set()
+    roles: dict[uuid.UUID, list[ParticipantRole]] = {pid: [] for pid in ids}
+    if ids:
+        members = set(
+            (
+                await session.scalars(
+                    select(WorkspaceMember.principal_id).where(
+                        WorkspaceMember.tenant_id == ctx.tenant_id,
+                        WorkspaceMember.workspace_id == workspace_id,
+                        WorkspaceMember.principal_id.in_(ids),
+                    )
+                )
+            ).all()
+        )
+        rows = await session.execute(
+            select(PrincipalRole, Role)
+            .join(Role, Role.id == PrincipalRole.role_id)
+            .where(
+                PrincipalRole.tenant_id == ctx.tenant_id,
+                PrincipalRole.principal_id.in_(ids),
+                scope,
+                role_here,
+            )
+            .order_by(PrincipalRole.created_at, PrincipalRole.id)
+        )
+        for assignment, role in rows.all():
+            roles[assignment.principal_id].append(
+                ParticipantRole(
+                    role_id=role.id,
+                    slug=role.slug,
+                    name=role.name,
+                    role_workspace_id=role.workspace_id,
+                    assignment_workspace_id=assignment.workspace_id,
+                )
+            )
+    return Page(
+        items=[
+            WorkspaceParticipant(
+                principal_id=p.id,
+                kind=p.kind,
+                display_name=p.display_name,
+                status=p.status,
+                member=p.id in members,
+                roles=roles[p.id],
+            )
+            for p in page.items
+        ],
+        next_cursor=page.next_cursor,
     )
 
 

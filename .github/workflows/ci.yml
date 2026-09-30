@@ -39,8 +39,9 @@ jobs:
         run: |
           uv run ruff check .
           uv run ruff format --check .
+      # No path: [tool.mypy] packages covers src/ and client/src.
       - name: mypy
-        run: uv run mypy src
+        run: uv run mypy
 
   checks:
     if: github.event_name == 'workflow_dispatch' || github.ref_type == 'tag'
@@ -83,7 +84,7 @@ jobs:
           uv run ruff check .
           uv run ruff format --check .
       - name: Type check
-        run: uv run mypy src
+        run: uv run mypy
       # S3-compatible store for the ContentStore contract test (CP-ADR-0072).
       # A step, not a service: the MinIO image needs a command line.
       # The upstream Docker Hub image is gone; the Chainguard image is pinned by digest

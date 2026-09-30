@@ -4,8 +4,9 @@
 Each case is a probe from the review of TASK-001063 and the refusal it now
 gets: an identity of an issuer the core does not trust, a second identity on
 an agent's principal through ``iam-bindings``, a binding made beside the
-registry that outlives ``identity:replace``, and an identity of a service
-outside the registry moved by a non-admin. The module runs with
+registry that outlives ``identity:replace``, an identity of a service
+outside the registry moved by a non-admin, and the registry's own identity
+re-bound by an admin with rights beside the revision (TASK-001127). The module runs with
 ``CP_IAM_ISSUER`` configured, as a deployment with IAM does.
 """
 
@@ -188,20 +189,54 @@ async def test_the_previous_identity_of_a_service_is_not_reopened_beside_the_reg
     assert reopened["permissions"] == ["events.read", "tasks.read"]
 
 
-async def test_the_registry_identity_itself_is_rebound_only_by_an_admin(
+async def test_the_registry_identity_itself_is_not_rebound_through_iam_bindings(
     client: httpx.AsyncClient,
 ) -> None:
-    """The current bootstrap re-asserts the binding of a service as admin (E4)."""
+    """The probe of TASK-001120: admin re-bound it with ``principals.write`` — was 200.
+
+    The transitional exception for the bootstrap is gone (E4, TASK-001127): the
+    registry's own identity is refused like any other, for an admin too, and
+    its binding keeps the rights of the revision.
+    """
     admin_key, principal_id, first = await _service(client)
     operator_key = await _operator(client, admin_key)
+    before = (await _bindings(client, admin_key, principal_id))[first["iamPrincipalId"]]
 
-    refused = await _upsert(client, operator_key, principal_id, first)
+    for key in (operator_key, admin_key):
+        refused = await _upsert(
+            client, key, principal_id, first, ["events.read", "principals.write", "tasks.read"]
+        )
+        assert refused.status_code == 409, refused.text
+        assert refused.json()["error"]["code"] == "agent_identity_conflict"
+        route = f"/agents/{KEY}/identity"
+        assert refused.json()["error"]["details"] == {"agent": KEY, "route": route}
+
+    after = (await _bindings(client, admin_key, principal_id))[first["iamPrincipalId"]]
+    assert after == before
+    assert after["permissions"] == ["events.read", "tasks.read"]
+    assert len(await _events(client, admin_key, "iam_binding.updated")) == 0
+    # The way that stays: the idempotent link of the same identity.
+    relinked = await _link(client, admin_key, agent=KEY, **first)
+    assert relinked.status_code == 200, relinked.text
+
+
+async def test_a_revoked_registry_identity_is_not_reopened_by_an_admin(
+    client: httpx.AsyncClient,
+) -> None:
+    """Revoked beside the registry, the binding stays shut: no admin reopens it."""
+    admin_key, principal_id, first = await _service(client)
+    binding_id = (await _bindings(client, admin_key, principal_id))[first["iamPrincipalId"]]["id"]
+    revoked = await client.post(
+        f"/api/v1/iam-bindings/{binding_id}:revoke", headers=auth(admin_key)
+    )
+    assert revoked.status_code == 200, revoked.text
+
+    refused = await _upsert(client, admin_key, principal_id, first, ["events.read", "tasks.read"])
     assert refused.status_code == 409, refused.text
     assert refused.json()["error"]["code"] == "agent_identity_conflict"
-
-    rebound = await _upsert(client, admin_key, principal_id, first, ["events.read", "tasks.read"])
-    assert rebound.status_code == 200, rebound.text
-    assert rebound.json()["status"] == "active"
+    assert (await _bindings(client, admin_key, principal_id))[first["iamPrincipalId"]][
+        "status"
+    ] == "revoked"
 
 
 async def test_a_principal_outside_the_registry_still_takes_new_identities(

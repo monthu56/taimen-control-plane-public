@@ -116,6 +116,7 @@ async def test_rejected_platform_access_token_says_what_to_do() -> None:
         await credential.token()
 
     assert exc.value.code == "iam_invalid_token"
+    assert exc.value.status == 401
     assert "iam auth login" in str(exc.value)
 
 
@@ -127,6 +128,62 @@ async def test_audience_denial_is_reported_separately() -> None:
         await credential.token()
 
     assert exc.value.code == "iam_audience_not_allowed"
+    assert exc.value.status == 403
+
+
+@pytest.mark.parametrize("status", [400, 404, 429, 500, 503])
+async def test_failed_exchange_carries_the_http_status(status: int) -> None:
+    """A caller tells retryable from final by the status, not by the text."""
+    credential = _credential({"status": status}, Clock())
+
+    with pytest.raises(IamCredentialError) as exc:
+        await credential.token()
+
+    assert exc.value.code == "iam_exchange_failed"
+    assert exc.value.status == status
+    # skill-sdk still parses the message until it reads the status.
+    assert exc.value.message == f"IAM answered {status} to the exchange"
+
+
+async def test_unreachable_iam_has_no_http_status() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("refused", request=request)
+
+    credential = IamCredential(
+        IAM_URL,
+        TENANT,
+        platform_access_token="iam_pat_x_y",
+        transport=httpx.MockTransport(handler),
+    )
+
+    with pytest.raises(IamCredentialError) as exc:
+        await credential.token()
+
+    assert exc.value.code == "iam_unreachable"
+    assert exc.value.status == 0
+
+
+async def test_malformed_exchange_response_has_no_http_status() -> None:
+    """A 200 with a broken body is not an HTTP rejection to classify."""
+    credential = IamCredential(
+        IAM_URL,
+        TENANT,
+        platform_access_token="iam_pat_x_y",
+        transport=httpx.MockTransport(lambda request: httpx.Response(200, json={})),
+    )
+
+    with pytest.raises(IamCredentialError) as exc:
+        await credential.token()
+
+    assert exc.value.code == "iam_exchange_malformed"
+    assert exc.value.status == 0
+
+
+def test_local_errors_have_no_http_status() -> None:
+    with pytest.raises(IamCredentialError) as exc:
+        IamCredential("", TENANT)
+
+    assert exc.value.status == 0
 
 
 async def test_inherited_environment_variable_is_not_a_silent_credential() -> None:

@@ -641,6 +641,12 @@ async def test_filtered_events_and_role_holders(client: httpx.AsyncClient, sdk: 
         holders = await admin.list_role_holders(role["id"], workspace_id=ops["id"])
         assert [p["id"] for p in holders["items"]] == [holder["id"]]
         assert (await admin.list_role_holders(role["id"], workspace_id=sales["id"]))["items"] == []
+        participants = await admin.list_workspace_participants(ops["id"], limit=10)
+        assert [(p["principalId"], p["member"]) for p in participants["items"]] == [
+            (holder["id"], False)
+        ]
+        assert [r["roleId"] for r in participants["items"][0]["roles"]] == [role["id"]]
+        assert (await admin.list_workspace_participants(sales["id"]))["items"] == []
 
 
 async def test_task_type_migration_methods(client: httpx.AsyncClient, sdk: Make) -> None:

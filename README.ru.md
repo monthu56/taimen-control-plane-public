@@ -205,7 +205,7 @@ uv run pytest                                 # unit + integration + concurrency
   pytest — `make test PYTEST_ARGS="tests/unit -x"`. Автоматическим
   исполнителям тесты запускать через `make test`.
 
-Линт и типы: `uv run ruff check . && uv run ruff format --check . && uv run mypy src`.
+Линт и типы: `uv run ruff check . && uv run ruff format --check . && uv run mypy`.
 
 ## Миграции
 

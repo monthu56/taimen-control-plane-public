@@ -392,13 +392,14 @@ async def test_upsert_does_not_take_the_identity_of_a_registry_agent(
         "status"
     ] == "active"
 
-    # Its own identity an admin may still re-bind: nothing is taken from anyone.
+    # Nor is its own identity re-bound there, for an admin neither (E4, TASK-001127).
     same = await client.post(
         f"/api/v1/principals/{principal_id}/iam-bindings",
         json={**first, "permissions": ["events.read", "tasks.read"]},
         headers=auth(admin_key),
     )
-    assert same.status_code == 200, same.text
+    assert same.status_code == 409, same.text
+    assert same.json()["error"]["code"] == "agent_identity_conflict"
 
     # Once the agent moved away, the previous identity is nobody's registry identity.
     assert (await _replace(client, admin_key, identity())).status_code == 200
