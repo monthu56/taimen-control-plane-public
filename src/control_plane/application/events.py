@@ -17,7 +17,8 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from control_plane.application.common import new_uuid, utcnow
-from control_plane.domain.event_catalog import current_version
+from control_plane.domain.event_catalog import PAYLOAD_TEXT_LIMIT, current_version
+from control_plane.domain.redaction import redact_secret_material
 from control_plane.infrastructure.db.models import (
     Agent,
     Approval,
@@ -36,6 +37,14 @@ from control_plane.infrastructure.db.models import (
 )
 
 NOTIFY_CHANNEL = "cp_events"
+
+
+def event_reason(reason: str) -> str:
+    """A free-text reason fit for a payload: credentials redacted, cut to the limit."""
+    text = redact_secret_material(reason)
+    if len(text) > PAYLOAD_TEXT_LIMIT:
+        text = text[: PAYLOAD_TEXT_LIMIT - 1] + "…"
+    return text
 
 
 # IAM identity of the request actor, set by the IAM authentication path and read

@@ -10,6 +10,7 @@ from control_plane.api.v1 import (
     artifact_types,
     artifacts,
     attention,
+    authz,
     bootstrap,
     calendars,
     child_handles,
@@ -74,6 +75,7 @@ api_v1_router.include_router(artifacts.router)
 api_v1_router.include_router(agents.router)
 api_v1_router.include_router(approvals.router)
 api_v1_router.include_router(attention.router)
+api_v1_router.include_router(authz.router)
 api_v1_router.include_router(events.router)
 api_v1_router.include_router(observations.router)
 api_v1_router.include_router(context.router)

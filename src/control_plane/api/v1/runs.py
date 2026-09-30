@@ -50,9 +50,29 @@ async def list_runs(
     task_id: uuid.UUID | None = Query(default=None, alias="taskId"),
     claim_id: uuid.UUID | None = Query(default=None, alias="claimId"),
     status: str | None = Query(default=None),
+    principal_id: uuid.UUID | None = Query(
+        default=None, alias="principalId", description="Runs of this executor principal."
+    ),
+    agent_key: str | None = Query(
+        default=None,
+        alias="agentKey",
+        description=(
+            "Runs of the principal of this registry agent (CP-ADR-0073); an unknown key "
+            "or an agent without a principal gives an empty page."
+        ),
+    ),
 ) -> JSONResponse:
+    """Newest first by ``(startedAt, id)``; every filter narrows the same order."""
     page = await queries.list_runs(
-        db, ctx, limit=limit, cursor=cursor, task_id=task_id, claim_id=claim_id, status=status
+        db,
+        ctx,
+        limit=limit,
+        cursor=cursor,
+        task_id=task_id,
+        claim_id=claim_id,
+        status=status,
+        principal_id=principal_id,
+        agent_key=agent_key,
     )
     return JSONResponse(page_body([dump(RunOut, r) for r in page.items], page.next_cursor))
 

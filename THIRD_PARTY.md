@@ -38,10 +38,10 @@ The components below are used under the following conditions:
 - greenlet 3.5.5 — MIT AND PSF-2.0
 - h11 0.16.0 — MIT
 - httpcore 1.0.9 — BSD-3-Clause
-- httpcore2 2.10.0 — BSD-3-Clause
+- httpcore2 2.13.1 — BSD-3-Clause
 - httptools 0.8.0 — MIT
 - httpx 0.28.1 — BSD-3-Clause
-- httpx2 2.10.0 — BSD-3-Clause
+- httpx2 2.13.1 — BSD-3-Clause
 - idna 3.18 — BSD-3-Clause
 - jmespath 1.1.0 — MIT
 - jsonschema 4.26.0 — MIT

@@ -13,7 +13,8 @@ without I/O:
   latest value of that field (:func:`diff_fields`). ``version`` of a process
   is its number, never a person's field.
 - **Renames.** ``package.yaml → renames: [{kind, from, to}]`` (like
-  ``moved`` in Terraform) for the kinds the core plans (:func:`renames`).
+  ``moved`` in Terraform) of processes and calendars (:func:`renames`); a
+  rename of another kind the core plans is a warning: nothing moves.
 - **Hashes.** The package is the hash of its files; the catalog etag is the
   hash of the canonical list of the objects the package touches — kind, key,
   latest version and hash, what the last apply wrote and whether the key is
@@ -32,9 +33,18 @@ from typing import Any
 from control_plane.domain.package_source import ParsedPackage
 from control_plane.domain.process_definition import Problem, pointer
 
-# The kinds the core plans and applies, in the order it applies them: a
-# process names calendars (CP-ADR-0074 §9). The installer applies the rest.
-PLANNED_KINDS = ("Calendar", "Process")
+# The kinds the core plans and applies, in the order it applies them (the
+# installer's order): an agent names task types, a process names task types,
+# an agent and calendars (CP-ADR-0074 §9), a rule names task types and acts
+# as an agent (amendment 2026-09-29).
+PLANNED_KINDS = ("TaskType", "Agent", "Calendar", "Process", "WorkRule")
+# The kinds whose keys ``renames`` moves: their versions carry over to the new key.
+RENAMED_KINDS = ("Calendar", "Process")
+# Who applies the kinds of a package the core does not plan: rules of
+# notifications live in the notification service, the rest the installer
+# applies (``cp_packages apply``).
+OUTSIDE = {"NotificationRule": "notification-service"}
+INSTALLER = "installer"
 OWNER_PACKAGE = "package"
 OWNER_CONSOLE = "console"
 ACTIONS = ("create", "update", "rename", "retire", "unchanged")
@@ -139,10 +149,11 @@ class Rename:
 
 
 def renames(package: ParsedPackage) -> tuple[list[Rename], list[Problem]]:
-    """The renames of the kinds the core plans, with the findings of the list.
+    """The renames of processes and calendars, with the findings of the list.
 
     ``to`` is an object of the package, ``from`` is not; a key is renamed
-    once. Renames of other kinds are the installer's.
+    once. A rename of another kind the core plans moves nothing (a warning):
+    the old key stays as it is.
     """
     manifest = package.manifest_object
     if manifest is None:
@@ -159,6 +170,20 @@ def renames(package: ParsedPackage) -> tuple[list[Rename], list[Problem]]:
         if kind not in PLANNED_KINDS or not isinstance(source, str) or not isinstance(target, str):
             continue
         path = pointer("spec", "renames", index)
+        if kind not in RENAMED_KINDS:
+            problems.append(
+                manifest.place(
+                    Problem(
+                        "rename_not_planned",
+                        "warning",
+                        path,
+                        f"a {kind} is not renamed by the plan: {kind}/{source} stays,"
+                        f" {kind}/{target} is applied as its own key",
+                        hint=f"retire {kind}/{source} in the installation if it is gone",
+                    )
+                )
+            )
+            continue
 
         def refuse(message: str, where: str = path) -> None:
             problems.append(manifest.place(Problem("invalid_rename", "error", where, message)))
@@ -215,6 +240,15 @@ def plan_body(processes: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
             ],
         }
         for item in processes
+    ]
+
+
+def outside(package: ParsedPackage) -> list[dict[str, str]]:
+    """``PlanOutsideOut``: the objects the core does not plan, and who applies them."""
+    return [
+        {"kind": obj.kind, "key": obj.key, "appliedBy": OUTSIDE.get(obj.kind, INSTALLER)}
+        for obj in sorted(package.objects, key=lambda o: (o.kind, o.key))
+        if obj.kind not in PLANNED_KINDS and obj.kind not in ("Package", "Installation")
     ]
 
 

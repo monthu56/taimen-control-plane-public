@@ -399,6 +399,17 @@ class Task(Base):
             "id",
             postgresql_where=text("start_date IS NOT NULL"),
         ),
+        # GET /tasks?q= (CP-ADR-0049, amendment TASK-000866): substring search
+        # through ILIKE, one pg_trgm GIN index per searched column.
+        *(
+            Index(
+                f"ix_tasks_{column}_trgm",
+                column,
+                postgresql_using="gin",
+                postgresql_ops={column: "gin_trgm_ops"},
+            )
+            for column in ("title", "description", "public_id")
+        ),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(primary_key=True)
@@ -1175,7 +1186,16 @@ class Run(Base):
             postgresql_where=text("status = 'running'"),
         ),
         UniqueConstraint("task_id", "attempt", name="uq_runs_task_attempt"),
-        Index("ix_runs_tenant_created", "tenant_id", "created_at", "id"),
+        # GET /runs: newest first by (started_at, id), for the tenant and for one
+        # executor (CP-ADR-0073, amendment of 2026-09-29).
+        Index("ix_runs_tenant_started", "tenant_id", text("started_at DESC"), text("id DESC")),
+        Index(
+            "ix_runs_tenant_principal_started",
+            "tenant_id",
+            "principal_id",
+            text("started_at DESC"),
+            text("id DESC"),
+        ),
         Index("ix_runs_claim", "claim_id"),
     )
 
@@ -1383,12 +1403,21 @@ class AgentRevision(Base):
 
     A trigger rejects every UPDATE and DELETE. ``spec`` is stored as applied,
     without the desired state (``state``, ``placement.replicas``);
-    ``spec_hash`` is ``sha256:<hex>`` of its canonical JSON.
+    ``spec_hash`` is ``sha256:<hex>`` of its canonical JSON. ``source_kind``
+    names who published it: ``package`` (with the package key and version the
+    installer sent), ``manual`` (a publication without a package) or
+    ``unknown`` (published before the source was recorded).
     """
 
     __tablename__ = "agent_revisions"
     __table_args__ = (
         CheckConstraint("revision >= 1", name="revision_positive"),
+        CheckConstraint("source_kind IN ('package', 'manual', 'unknown')", name="source_kind"),
+        CheckConstraint(
+            "(source_kind = 'package') = (source_package_key IS NOT NULL) "
+            "AND (source_package_key IS NULL) = (source_package_version IS NULL)",
+            name="source_package",
+        ),
         UniqueConstraint("agent_id", "revision", name="uq_agent_revisions_agent_revision"),
     )
 
@@ -1398,6 +1427,9 @@ class AgentRevision(Base):
     revision: Mapped[int] = mapped_column(Integer)
     spec: Mapped[dict[str, Any]] = mapped_column(JSONB)
     spec_hash: Mapped[str] = mapped_column(Text)
+    source_kind: Mapped[str] = mapped_column(Text)
+    source_package_key: Mapped[str | None] = mapped_column(Text)
+    source_package_version: Mapped[str | None] = mapped_column(Text)
     created_by: Mapped[uuid.UUID] = mapped_column(ForeignKey("principals.id"))
     created_at: Mapped[datetime]
 
@@ -2506,21 +2538,42 @@ class ProcessTimer(Base):
 
 
 class PackageObject(Base):
-    """What a package apply last wrote of a catalog object (CP-ADR-0074 §11).
+    """The package that installed a catalog object (CP-ADR-0074 §11 and its amendment).
 
-    One row per ``(tenant, kind, key)`` of the kinds the core plans
-    (``Process``, ``Calendar``). ``spec`` is the spec the apply published:
-    a field of the latest version that differs from it was changed by a
-    person since, and the plan names its owner ``console``. ``retired_at`` —
-    the key was renamed away by ``renames``: a retired process starts no new
+    One row per ``(tenant, kind, key)`` of the catalog kinds the core holds
+    (:data:`control_plane.domain.package_links.LINKED_KINDS`); an object without
+    a row was created by hand. ``package_key`` / ``package_version`` — the
+    package (``package_version`` is empty for rows applied before it was
+    kept); ``plan_hash`` — the hash of the installation: the plan
+    ``POST /packages:apply`` applied, or what the installer named in
+    ``POST /packages:record``.
+
+    A row ``POST /packages:apply`` wrote is also what the apply wanted:
+    ``version`` and ``spec`` (always for ``Process`` and ``Calendar``; for
+    ``TaskType``, ``Agent`` and ``WorkRule`` — planned since the amendment of
+    2026-09-29 — only when the core applied them, a record of the installer
+    leaves them empty). A field of the latest version that differs from
+    ``spec`` was changed by a person since, and the plan names its owner
+    ``console``; without ``spec`` every field is the package's. ``retired_at`` — the key
+    was renamed away by ``renames``: a retired process starts no new
     instance, its open instances go on; a publication outside a package
     brings the key back.
     """
 
     __tablename__ = "package_objects"
     __table_args__ = (
-        CheckConstraint("kind IN ('Process', 'Calendar')", name="kind_known"),
+        CheckConstraint(
+            "kind IN ('ArtifactType', 'TaskType', 'ProjectTemplate', 'WorkspaceType', 'Role', "
+            "'Capability', 'Skill', 'WorkRule', 'Agent', 'Process', 'Calendar')",
+            name="kind_known",
+        ),
+        CheckConstraint(
+            "kind NOT IN ('Process', 'Calendar') OR (plan_hash IS NOT NULL AND version IS NOT NULL"
+            " AND spec IS NOT NULL AND spec_hash IS NOT NULL)",
+            name="planned_spec",
+        ),
         UniqueConstraint("tenant_id", "kind", "key", name="uq_package_objects_tenant_kind_key"),
+        Index("ix_package_objects_tenant_package", "tenant_id", "package_key", "kind"),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(primary_key=True)
@@ -2528,10 +2581,11 @@ class PackageObject(Base):
     kind: Mapped[str] = mapped_column(Text)
     key: Mapped[str] = mapped_column(Text)
     package_key: Mapped[str] = mapped_column(Text)
-    version: Mapped[int] = mapped_column(Integer)
-    spec_hash: Mapped[str] = mapped_column(Text)
-    spec: Mapped[dict[str, Any]] = mapped_column(JSONB)
-    plan_hash: Mapped[str] = mapped_column(Text)
+    package_version: Mapped[str | None] = mapped_column(Text)
+    version: Mapped[int | None] = mapped_column(Integer)
+    spec_hash: Mapped[str | None] = mapped_column(Text)
+    spec: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
+    plan_hash: Mapped[str | None] = mapped_column(Text)
     applied_by: Mapped[uuid.UUID] = mapped_column(ForeignKey("principals.id"))
     applied_at: Mapped[datetime]
     retired_at: Mapped[datetime | None]

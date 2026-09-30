@@ -34,6 +34,7 @@ N+1 без изменений и игнорирует незнакомые по�
 
 | Тип | Сущность | Версия | Описание |
 |---|---|---|---|
+| [`agent.identity_replaced`](#agentidentity_replaced) | `agent` | 1 | A service agent moved to a new IAM identity; its principal stayed (CP-ADR-0073). |
 | [`agent.retired`](#agentretired) | `agent` | 1 | An agent was retired: stopped, binding revoked, history kept. |
 | [`agent.revision_published`](#agentrevision_published) | `agent` | 1 | A new immutable revision of an agent spec was published (CP-ADR-0073 §2). |
 | [`agent.state_changed`](#agentstate_changed) | `agent` | 1 | The desired state or replica count of an agent changed; no new revision. |
@@ -62,7 +63,7 @@ N+1 без изменений и игнорирует незнакомые по�
 | [`context_adapter.rebuilt`](#context_adapterrebuilt) | `event_consumer` | 1 | The memory context adapter was rewound to rebuild its projection. |
 | [`context_adapter.redriven`](#context_adapterredriven) | `event_consumer` | 1 | The memory context adapter was redriven past a parked event. |
 | [`delegation.created`](#delegationcreated) | `delegation` | 1 | A human delegated permissions to an agent. |
-| [`delegation.revoked`](#delegationrevoked) | `delegation` | 1 | A delegation was revoked. |
+| [`delegation.revoked`](#delegationrevoked) | `delegation` | 2 | A delegation was revoked. |
 | [`event_journal.archived`](#event_journalarchived) | `event_journal` | 1 | Journal events were moved to the archive (ADR-0038). |
 | [`event_journal.pruned`](#event_journalpruned) | `event_journal` | 1 | Archived journal events were deleted. |
 | [`goal.created`](#goalcreated) | `goal` | 1 | A goal was created (CP-ADR-0062). |
@@ -77,6 +78,8 @@ N+1 без изменений и игнорирует незнакомые по�
 | [`knowledge.snapshot_reconciled`](#knowledgesnapshot_reconciled) | `workspace` | 1 | A knowledge snapshot was reconciled into the memory service (CP-ADR-0060). |
 | [`observation.recorded`](#observationrecorded) | `observation` | 1 | An observation was recorded (ADR-0057). |
 | [`principal.created`](#principalcreated) | `principal` | 1 | A principal (human, agent or service) was created. |
+| [`principal.disabled`](#principaldisabled) | `principal` | 1 | A human or agent principal was disabled: bindings and delegations revoked, sessions closed, claims freed, runs failed. |
+| [`principal.enabled`](#principalenabled) | `principal` | 1 | A disabled (or paused) human or agent principal was enabled. Only the status comes back: bindings, delegations, sessions and claims closed by :disable stay closed, IAM entry needs a new binding. |
 | [`process.cancelled`](#processcancelled) | `process_instance` | 1 | An operator cancelled the instance. |
 | [`process.compensated`](#processcompensated) | `process_instance` | 1 | Compensations of completed steps ran in reverse order. |
 | [`process.completed`](#processcompleted) | `process_instance` | 1 | The instance completed with an outcome. |
@@ -136,7 +139,7 @@ N+1 без изменений и игнорирует незнакомые по�
 | [`run.started`](#runstarted) | `run` | 2 | An execution attempt started under a claim. |
 | [`run.succeeded`](#runsucceeded) | `run` | 1 | The run finished successfully. |
 | [`run.suspended`](#runsuspended) | `run` | 1 | The run was suspended, e.g. to wait for a decision. |
-| [`session.closed`](#sessionclosed) | `session` | 1 | A work session was closed. |
+| [`session.closed`](#sessionclosed) | `session` | 2 | A work session was closed. |
 | [`session.expired`](#sessionexpired) | `session` | 1 | A work session expired; its claims were released. |
 | [`session.opened`](#sessionopened) | `session` | 1 | A harness opened a work session. |
 | [`skill.assigned`](#skillassigned) | `principal` | 1 | A skill was assigned. |
@@ -161,6 +164,7 @@ N+1 без изменений и игнорирует незнакомые по�
 | [`task.external_reference_updated`](#taskexternal_reference_updated) | `task` | 1 | An external reference of the task changed. |
 | [`task.relation_added`](#taskrelation_added) | `task` | 1 | A relation to another task was added. |
 | [`task.relation_removed`](#taskrelation_removed) | `task` | 1 | A relation between tasks was removed. |
+| [`task.type_migrated`](#tasktype_migrated) | `task` | 1 | The task was moved to another version of its type (ADR-0048, amendment 2026-09-30). |
 | [`task.updated`](#taskupdated) | `task` | 1 | Task attributes or its status changed. |
 | [`task.verification_failed`](#taskverification_failed) | `task` | 1 | An acceptance check failed; the task went back to its executor or got blocked. |
 | [`task.verification_started`](#taskverification_started) | `task` | 1 | A verification attempt of the task's acceptance checks opened (CP-ADR-0067). |
@@ -179,6 +183,27 @@ N+1 без изменений и игнорирует незнакомые по�
 | [`workspace_type.archived`](#workspace_typearchived) | `workspace_type` | 1 | A workspace type was archived. |
 | [`workspace_type.created`](#workspace_typecreated) | `workspace_type` | 1 | A workspace type was created. |
 | [`workspace_type.updated`](#workspace_typeupdated) | `workspace_type` | 1 | A workspace type changed. |
+
+### agent.identity_replaced
+
+A service agent moved to a new IAM identity; its principal stayed (CP-ADR-0073).
+
+Сущность: `agent`.
+
+Версия 1:
+
+| Поле | Тип | Всегда | Описание |
+|---|---|---|---|
+| `key` | string | да |  |
+| `revision` | integer | да | The revision whose rights the new identity got |
+| `principalId` | string (uuid) | да |  |
+| `issuer` | string | да |  |
+| `iamTenantId` | string (uuid) | да |  |
+| `iamPrincipalId` | string (uuid) | да |  |
+| `previousIssuer` | string \| null | да |  |
+| `previousIamTenantId` | string \| null (uuid) | да |  |
+| `previousIamPrincipalId` | string \| null (uuid) | да |  |
+| `reason` | string | да | Reason given; credential-shaped material redacted, cut to the limit |
 
 ### agent.retired
 
@@ -704,6 +729,12 @@ A delegation was revoked.
 
 Сущность: `delegation`.
 
+Версия 2 (добавлено: reason):
+
+| Поле | Тип | Всегда | Описание |
+|---|---|---|---|
+| `reason` | string | нет | principal_disabled when a side of it was disabled (CP-ADR-0077) |
+
 Версия 1:
 
 Данных нет.
@@ -816,6 +847,7 @@ The permissions of an IAM binding changed.
 | `iamTenantId` | any | да |  |
 | `iamPrincipalId` | any | да |  |
 | `permissions` | array | да |  |
+| `previousPrincipalId` | string (uuid) | нет | Only when the identity moved from another principal |
 
 ### knowledge.changed
 
@@ -952,6 +984,41 @@ A principal (human, agent or service) was created.
 |---|---|---|---|
 | `kind` | string | да |  |
 | `displayName` | string | да |  |
+
+### principal.disabled
+
+A human or agent principal was disabled: bindings and delegations revoked, sessions closed, claims freed, runs failed.
+
+Сущность: `principal`.
+
+Версия 1:
+
+| Поле | Тип | Всегда | Описание |
+|---|---|---|---|
+| `kind` | string | да |  |
+| `previousStatus` | string | да | active or paused |
+| `reason` | string \| null | да | Reason given; credential-shaped material redacted, cut to the limit |
+| `revokedBindings` | integer | да | IAM bindings revoked |
+| `revokedDelegations` | integer | да | Delegations to or from it revoked |
+| `closedSessions` | integer | да | Open sessions of it or on its behalf closed |
+| `releasedClaims` | integer | да | Active claims released to the queue |
+| `failedRuns` | integer | да | Running runs on the released claims failed |
+| `withdrawnInvocations` | integer | да | Skill calls on its authority cancelled, leases it held returned |
+
+### principal.enabled
+
+A disabled (or paused) human or agent principal was enabled. Only the status comes back: bindings, delegations, sessions and claims closed by :disable stay closed, IAM entry needs a new binding.
+
+Сущность: `principal`.
+
+Версия 1:
+
+| Поле | Тип | Всегда | Описание |
+|---|---|---|---|
+| `kind` | string | да |  |
+| `previousStatus` | string | да | disabled or paused |
+| `reason` | string \| null | да | Reason given; credential-shaped material redacted, cut to the limit |
+| `liveApiKeys` | integer | да | Unrevoked, unexpired API keys of it, which authenticate again |
 
 ### process.cancelled
 
@@ -1981,6 +2048,13 @@ A work session was closed.
 
 Сущность: `session`.
 
+Версия 2 (добавлено: reason):
+
+| Поле | Тип | Всегда | Описание |
+|---|---|---|---|
+| `releasedClaims` | array | да |  |
+| `reason` | string | нет | principal_disabled when its principal, or the human it acted for, was disabled (CP-ADR-0077) |
+
 Версия 1:
 
 | Поле | Тип | Всегда | Описание |
@@ -2385,6 +2459,26 @@ A relation between tasks was removed.
 | `fromTaskId` | string (uuid) | да |  |
 | `toTaskId` | string (uuid) | да |  |
 | `type` | string | да |  |
+
+### task.type_migrated
+
+The task was moved to another version of its type (ADR-0048, amendment 2026-09-30).
+
+Сущность: `task`.
+
+Версия 1:
+
+| Поле | Тип | Всегда | Описание |
+|---|---|---|---|
+| `publicId` | string | да |  |
+| `typeKey` | string | да |  |
+| `fromTypeVersion` | integer | да |  |
+| `typeVersion` | integer | да |  |
+| `fromStatus` | string | да |  |
+| `status` | string | да |  |
+| `systemStatusCategory` | string | да |  |
+| `trigger` | string | да | task (one task) or bulk (:migrate-tasks of a version) |
+| `version` | integer | да |  |
 
 ### task.updated
 

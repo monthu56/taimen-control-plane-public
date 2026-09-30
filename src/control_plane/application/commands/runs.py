@@ -43,6 +43,11 @@ from control_plane.application.commands.tasks import (
 from control_plane.application.common import new_uuid, utcnow
 from control_plane.application.event_cursor import EventPosition, encode_position
 from control_plane.application.events import record_event
+from control_plane.application.locking import (
+    lock_caller,
+    lock_claim_session,
+    lock_session_key_share,
+)
 from control_plane.application.queries.instructions import instructions_for_task
 from control_plane.domain.agent_instructions import instruction_refs
 from control_plane.domain.enums import (
@@ -109,6 +114,15 @@ async def start_run(
     # A registered agent runs by a revision of its own spec, anyone else by
     # none (CP-ADR-0073 §7); checked before any lock is taken.
     agent_revision_id = await check_run_agent_revision(session, ctx, agent_revision_id)
+    # The run references the caller (the claim's holder) and the claim's
+    # session. Both go before the task, as ``principals/{id}:disable`` takes
+    # them (CP-ADR-0077 §3, ``application/locking.py``): the caller by rule 1,
+    # the session by rule 2 — a session opened on behalf of a human is closed
+    # by ``:disable`` of that human, whom the caller's lock does not cover. The
+    # claim's session never changes, so it is read without a lock; a claim id
+    # that is not the task's live claim is refused by the gate below.
+    await lock_caller(session, ctx)
+    await lock_claim_session(session, ctx.tenant_id, claim_id)
     task = await resolve_task_for_update(session, ctx, task_ref)
 
     if task.system_status_category in TERMINAL_CATEGORIES:
@@ -223,7 +237,13 @@ async def _get_tenant_run(session: AsyncSession, ctx: AuthContext, run_id: uuid.
 async def _lock_task_then_run(
     session: AsyncSession, ctx: AuthContext, run_probe: Run
 ) -> tuple[Task, Run]:
-    """Re-acquire task then run under locks (global lock order), fresh state."""
+    """Re-acquire task then run under locks (global lock order), fresh state.
+
+    The run's session goes first (rule 2 of ``application/locking.py``): what
+    the caller writes next may reference it, and ``principals/{id}:disable``
+    of the principal the session acts for holds the session before the task.
+    """
+    await lock_session_key_share(session, run_probe.tenant_id, run_probe.session_id)
     task = await session.scalar(select(Task).where(Task.id == run_probe.task_id).with_for_update())
     run = await session.scalar(
         select(Run)
@@ -500,8 +520,12 @@ async def prepare_handoff(
     _validate_handoff_data(checkpoint_data)
 
     run_probe = await _get_tenant_run(session, ctx, run_id)
-    # Global mutation order: task -> claim -> run. The task lock serializes
-    # claim takeover; explicit locks make the handoff transaction auditable.
+    # Global mutation order: session -> task -> claim -> run (CP-ADR-0077 §3).
+    # The task lock serializes claim takeover; explicit locks make the handoff
+    # transaction auditable; the run's session goes first because the
+    # checkpoint written below references its principal and ``:disable`` of
+    # whoever the session acts for holds the session before the task.
+    await lock_session_key_share(session, ctx.tenant_id, run_probe.session_id)
     task = await session.scalar(select(Task).where(Task.id == run_probe.task_id).with_for_update())
     claim = await session.scalar(
         select(TaskClaim)
@@ -641,6 +665,29 @@ async def prepare_handoff(
     )
 
 
+# The gates below are what ``POST /authz:check`` asks too (CP-ADR-0055,
+# amendment of 2026-09-29): a change of who may cancel is made here, once.
+
+
+async def request_cancel_gate(session: AsyncSession, ctx: AuthContext, run_id: uuid.UUID) -> Run:
+    await authorize(ctx, Permission.TASKS_WRITE, Permission.CLAIMS_MANAGE)
+    return await _get_tenant_run(session, ctx, run_id)
+
+
+async def cancel_gate(session: AsyncSession, ctx: AuthContext, run_id: uuid.UUID) -> Run:
+    await authorize(ctx, Permission.TASKS_CLAIM, Permission.CLAIMS_MANAGE)
+    return await _get_tenant_run(session, ctx, run_id)
+
+
+def require_cancel_holder(ctx: AuthContext, run: Run) -> None:
+    if run.principal_id != ctx.principal_id and not ctx.has(Permission.CLAIMS_MANAGE):
+        raise AuthorizationError(
+            "Run belongs to another principal",
+            code="run_holder_mismatch",
+            details={"runId": str(run.id)},
+        )
+
+
 async def request_cancel_run(
     session: AsyncSession,
     ctx: AuthContext,
@@ -655,8 +702,7 @@ async def request_cancel_run(
     ``cancel requested`` != ``execution stopped``: the authoritative stop is
     the terminal run transition, guarded by locks and fencing as usual.
     """
-    await authorize(ctx, Permission.TASKS_WRITE, Permission.CLAIMS_MANAGE)
-    run_probe = await _get_tenant_run(session, ctx, run_id)
+    run_probe = await request_cancel_gate(session, ctx, run_id)
     task, run = await _lock_task_then_run(session, ctx, run_probe)
     _require_run_running(run)
 
@@ -743,16 +789,9 @@ async def cancel_run(
     run_id: uuid.UUID,
     reason: str = "cancelled",
 ) -> Run:
-    await authorize(ctx, Permission.TASKS_CLAIM, Permission.CLAIMS_MANAGE)
-    run_probe = await _get_tenant_run(session, ctx, run_id)
+    run_probe = await cancel_gate(session, ctx, run_id)
     task, run = await _lock_task_then_run(session, ctx, run_probe)
-
-    if run.principal_id != ctx.principal_id and not ctx.has(Permission.CLAIMS_MANAGE):
-        raise AuthorizationError(
-            "Run belongs to another principal",
-            code="run_holder_mismatch",
-            details={"runId": str(run.id)},
-        )
+    require_cancel_holder(ctx, run)
     _require_run_running(run)
 
     now = utcnow()

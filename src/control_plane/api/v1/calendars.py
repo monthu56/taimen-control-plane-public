@@ -15,6 +15,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from control_plane.api.dependencies import AuthDep, DbDep, SessionFactoryDep, SettingsDep
 from control_plane.api.v1.schemas import (
     ERROR_RESPONSES,
+    PACKAGE_FILTER_DESCRIPTION,
     CalendarOut,
     CalendarPublishRequest,
     PageOut,
@@ -25,6 +26,7 @@ from control_plane.application.authorization import AuthContext, authorize
 from control_plane.application.commands import calendars as commands
 from control_plane.application.common import decode_cursor, encode_cursor
 from control_plane.application.queries.lists import clamp_limit
+from control_plane.application.queries.package_links import attach_package, attach_packages
 from control_plane.domain.enums import Permission
 from control_plane.domain.errors import ValidationError
 
@@ -114,7 +116,9 @@ async def publish_calendar(
 
     async def executor(db: AsyncSession) -> tuple[int, dict[str, object]]:
         view = await commands.publish_calendar(db, ctx, key=payload.key, spec=spec_as_sent(payload))
-        return (201 if view.created else 200), calendar_body(view)
+        return (201 if view.created else 200), await attach_package(
+            db, ctx.tenant_id, "Calendar", calendar_body(view)
+        )
 
     return await execute_write(
         request,
@@ -132,6 +136,7 @@ async def list_calendars(
     db: DbDep,
     limit: int | None = Query(default=None),
     cursor: str | None = Query(default=None),
+    package: str | None = Query(default=None, description=PACKAGE_FILTER_DESCRIPTION),
 ) -> JSONResponse:
     # Authentication is the whole check (module docstring).
     after_key: str | None = None
@@ -140,10 +145,12 @@ async def list_calendars(
         if not isinstance(after_key, str):
             raise ValidationError("invalid_cursor", "Malformed pagination cursor")
     views, next_key = await commands.list_calendars(
-        db, ctx, limit=clamp_limit(limit), after_key=after_key
+        db, ctx, limit=clamp_limit(limit), after_key=after_key, package=package
     )
     next_cursor = encode_cursor({"k": next_key}) if next_key is not None else None
-    return JSONResponse(page_body([calendar_body(view) for view in views], next_cursor))
+    items = [calendar_body(view) for view in views]
+    await attach_packages(db, ctx.tenant_id, "Calendar", items)
+    return JSONResponse(page_body(items, next_cursor))
 
 
 @router.get(
@@ -153,4 +160,5 @@ async def list_calendars(
     summary="A calendar by key (latest version) or key@version",
 )
 async def get_calendar(ref: str, ctx: AuthDep, db: DbDep) -> JSONResponse:
-    return JSONResponse(calendar_body(await commands.resolve_calendar(db, ctx, ref)))
+    body = calendar_body(await commands.resolve_calendar(db, ctx, ref))
+    return JSONResponse(await attach_package(db, ctx.tenant_id, "Calendar", body))

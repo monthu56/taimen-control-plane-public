@@ -7,6 +7,7 @@ that records what the executor reports.
 
 import asyncio
 import json
+import time
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -29,7 +30,7 @@ from control_plane_agent.skills import (
     origin_of,
     resolve_path,
 )
-from control_plane_client import ConflictError
+from control_plane_client import ConflictError, ControlPlaneError
 
 OUTPUTS = {
     "type": "object",
@@ -205,6 +206,45 @@ async def test_expired_lease_without_heartbeat_drops_the_result() -> None:
     fake.heartbeat_skill_invocation = unreachable  # type: ignore[method-assign]
     assert await skills.execute_claimed(job, None) == "lease_lost"
     assert fake.completed == [] and fake.failed == []
+
+
+async def test_a_heartbeat_retrying_past_the_lease_does_not_outlive_it() -> None:
+    """The client retries an unreachable core for minutes; the lease is shorter."""
+    fake = FakeControlPlane()
+    skills = executor(fake, local=LocalProtocol(LOCAL_ENTRYPOINTS))
+    job = claimed(local("tests.skill_stubs.arith:run"), {"n": 1, "sleep": 3})
+    job["invocation"]["leaseExpiresAt"] = (datetime.now(UTC) + timedelta(seconds=0.3)).isoformat()
+
+    async def retrying(*args: Any, **kwargs: Any) -> dict:
+        await asyncio.sleep(60)
+        raise AssertionError("not reached")
+
+    fake.heartbeat_skill_invocation = retrying  # type: ignore[method-assign]
+    started = time.monotonic()
+    assert await skills.execute_claimed(job, None) == "lease_lost"
+    assert time.monotonic() - started < 2.0
+    assert fake.completed == [] and fake.failed == []
+
+
+async def test_a_bad_gateway_on_a_skill_heartbeat_keeps_the_lease() -> None:
+    fake = FakeControlPlane()
+    skills = executor(fake, local=LocalProtocol(LOCAL_ENTRYPOINTS))
+    skills.heartbeat_interval = 0.05
+    beats = 0
+    renew = fake.heartbeat_skill_invocation
+
+    async def restarting(invocation_id: str, **kwargs: Any) -> dict:
+        nonlocal beats
+        beats += 1
+        if beats == 1:
+            raise ControlPlaneError("http_error", "Unexpected server error", status=502)
+        return await renew(invocation_id, **kwargs)
+
+    fake.heartbeat_skill_invocation = restarting  # type: ignore[method-assign]
+    job = claimed(local("tests.skill_stubs.arith:run"), {"n": 1, "sleep": 0.4})
+    assert await skills.execute_claimed(job, None) == "succeeded"
+    assert beats >= 2
+    assert len(fake.completed) == 1
 
 
 async def test_timed_out_local_call_is_killed(tmp_path: Path) -> None:
@@ -841,3 +881,54 @@ async def test_mcp_error_envelope_names_code_and_retryability() -> None:
     fake = await run_sdk_like_mcp("busy")
     [failure] = fake.failed
     assert (failure["code"], failure["retryable"]) == ("upstream_busy", True)
+
+
+def idempotent_mcp_server(effects: list[dict[str, Any]]) -> Any:
+    """A skill that does its effect once per ``skill/idempotencyKey``."""
+    from mcp import types
+    from mcp.server.lowlevel import Server
+
+    done: dict[str, dict[str, Any]] = {}
+
+    async def call_tool(_ctx: Any, params: Any) -> Any:
+        meta = dict(params.meta or {})
+        key = meta["skill/idempotencyKey"]
+        if key not in done:
+            effects.append(meta)
+            done[key] = {"double": params.arguments["n"] * 2}
+        output = done[key]
+        return types.CallToolResult(
+            content=[types.TextContent(text=json.dumps(output))], structured_content=output
+        )
+
+    async def list_tools(_ctx: Any, _params: Any) -> Any:
+        schema = {"type": "object", "properties": {"n": {"type": "integer"}}}
+        return types.ListToolsResult(tools=[types.Tool(name="double", input_schema=schema)])
+
+    return Server("idempotent", on_list_tools=list_tools, on_call_tool=call_tool)
+
+
+async def test_mcp_call_carries_invocation_and_idempotency_key_in_meta() -> None:
+    effects: list[dict[str, Any]] = []
+    server = idempotent_mcp_server(effects)
+    protocol = McpProtocol(connect=lambda implementation: server)
+    implementation = {"protocol": "mcp", "endpoint": "stdio:skills", "entrypoint": "double"}
+    fake = FakeControlPlane()
+    await executor(fake, mcp=protocol).execute_claimed(claimed(implementation), None)
+    assert fake.completed[0]["output"] == {"double": 4}
+    [meta] = effects
+    assert meta["skill/invocationId"] == "inv-1"
+    assert meta["skill/idempotencyKey"] == "key-1"
+
+
+async def test_mcp_retry_with_the_same_key_does_not_repeat_the_effect() -> None:
+    effects: list[dict[str, Any]] = []
+    server = idempotent_mcp_server(effects)
+    protocol = McpProtocol(connect=lambda implementation: server)
+    implementation = {"protocol": "mcp", "endpoint": "stdio:skills", "entrypoint": "double"}
+    fake = FakeControlPlane()
+    skills = executor(fake, mcp=protocol)
+    for _ in range(2):
+        await skills.execute_claimed(claimed(implementation), None)
+    assert [c["output"] for c in fake.completed] == [{"double": 4}, {"double": 4}]
+    assert len(effects) == 1

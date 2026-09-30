@@ -43,6 +43,9 @@ ENV_BLOCKED_FILE = "CONTROL_PLANE_BLOCKED_FILE"
 BLOCKED_CATEGORY = "blocked"
 MAX_REASON_CHARS = 2000
 NO_REASON = "the executor gave no reason"
+#: The first words of the daemon's comment on a blocked task; the next run of
+#: the same executor leaves it out of the prompt (``comments.py``).
+BLOCKED_COMMENT_PREFIX = "The executor stopped without doing the work"
 
 
 def _reason(value: Any) -> str:

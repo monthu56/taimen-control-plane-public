@@ -474,3 +474,52 @@ async def test_no_file_no_signal(tmp_path: Path) -> None:
     await adapter_for(fake_cli(tmp_path), tmp_path).execute(TASK, RUN, client, None)
 
     assert [item for item in client.written if item["kind"] == "blocked"] == []
+
+
+class FakeClientBehindARestart(FakeClient):
+    """The core restarts just as the turn ends: the proxy answers 502."""
+
+    async def finish_action(self, run_id: str, action_id: str, **kwargs: Any) -> dict[str, Any]:
+        from control_plane_client import ControlPlaneError
+
+        self.calls.append(f"finish_action:{kwargs['status']}")
+        raise ControlPlaneError("http_error", "Unexpected server error", status=502)
+
+
+@pytest.mark.asyncio
+async def test_a_bad_gateway_on_finishing_the_turn_does_not_fail_finished_work(
+    tmp_path: Path,
+) -> None:
+    """TASK-001138: the 502 used to escape the adapter and the daemon failed the run."""
+    script = fake_cli(tmp_path)
+    client = FakeClientBehindARestart()
+
+    artifacts = await adapter_for(script, tmp_path).execute(TASK, RUN, client, None)
+
+    assert "finish_action:completed" in client.calls
+    assert artifacts[0].content == {"summary": "Changed two files; tests pass."}
+
+
+class FakeClientThatLostTheClaim(FakeClient):
+    """The core answers the bookkeeping itself: the claim is no longer ours."""
+
+    async def finish_action(self, run_id: str, action_id: str, **kwargs: Any) -> dict[str, Any]:
+        from control_plane_client import StaleClaimError
+
+        self.calls.append(f"finish_action:{kwargs['status']}")
+        raise StaleClaimError("stale_claim", "claim lost", status=409)
+
+
+@pytest.mark.asyncio
+async def test_an_answer_of_the_core_on_finishing_the_turn_is_not_swallowed(
+    tmp_path: Path,
+) -> None:
+    """Only an unreachable core is tolerated; a lost claim still stops the run."""
+    from control_plane_client import StaleClaimError
+
+    script = fake_cli(tmp_path)
+    client = FakeClientThatLostTheClaim()
+
+    with pytest.raises(StaleClaimError):
+        await adapter_for(script, tmp_path).execute(TASK, RUN, client, None)
+    assert "finish_action:completed" in client.calls

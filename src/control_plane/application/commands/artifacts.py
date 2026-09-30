@@ -44,6 +44,7 @@ from control_plane.application.commands.relations import resolve_task
 from control_plane.application.commands.task_inputs import is_input_of
 from control_plane.application.common import new_uuid, utcnow
 from control_plane.application.events import record_event
+from control_plane.application.locking import lock_caller
 from control_plane.domain.artifact_type import check_artifact_against_type
 from control_plane.domain.enums import Permission
 from control_plane.domain.errors import (
@@ -342,6 +343,11 @@ async def record_upload(
 ) -> ArtifactContent:
     """Store the spooled file (once per content in the tenant) and record the upload."""
     key = object_key(ctx.tenant_id, spooled.sha256)
+    # The upload references the caller: its principal before the content lock
+    # (rule 1 of ``application/locking.py``, CP-ADR-0077 §3) — this transaction
+    # does not go through the write flow, and an artifact created meanwhile may
+    # hold that content lock after a task row.
+    await lock_caller(session, ctx)
     await _lock_content(session, ctx.tenant_id, spooled.sha256)
     try:
         if not await store.exists(key):

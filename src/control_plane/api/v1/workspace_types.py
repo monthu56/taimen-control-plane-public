@@ -11,6 +11,7 @@ from control_plane.api.dependencies import AuthDep, DbDep, SessionFactoryDep, Se
 from control_plane.api.etag import format_etag, parse_if_match
 from control_plane.api.v1.schemas import (
     ERROR_RESPONSES,
+    PACKAGE_FILTER_DESCRIPTION,
     PageOut,
     WorkspaceTypeCreateRequest,
     WorkspaceTypeOut,
@@ -23,6 +24,11 @@ from control_plane.application.authorization import authorize
 from control_plane.application.commands import workspace_types as commands
 from control_plane.application.common import make_created_cursor, parse_created_cursor
 from control_plane.application.queries.lists import clamp_limit
+from control_plane.application.queries.package_links import (
+    attach_package,
+    attach_packages,
+    in_package,
+)
 from control_plane.domain.enums import Permission
 from control_plane.infrastructure.db.models import WorkspaceType
 
@@ -52,7 +58,9 @@ async def create_workspace_type(
             field_schema=payload.field_schema,
             allowed_child_types=payload.allowed_child_types,
         )
-        return 201, dump(WorkspaceTypeOut, workspace_type)
+        return 201, await attach_package(
+            db, ctx.tenant_id, "WorkspaceType", dump(WorkspaceTypeOut, workspace_type)
+        )
 
     return await execute_write(
         request,
@@ -71,12 +79,17 @@ async def list_workspace_types(
     limit: int | None = Query(default=None),
     cursor: str | None = Query(default=None),
     status: str | None = Query(default=None),
+    package: str | None = Query(default=None, description=PACKAGE_FILTER_DESCRIPTION),
 ) -> JSONResponse:
     await authorize(ctx, Permission.WORKSPACES_READ)
     effective_limit = clamp_limit(limit)
     stmt = select(WorkspaceType).where(WorkspaceType.tenant_id == ctx.tenant_id)
     if status is not None:
         stmt = stmt.where(WorkspaceType.status == status)
+    if package is not None:
+        stmt = stmt.where(
+            in_package("WorkspaceType", WorkspaceType.tenant_id, WorkspaceType.key, package)
+        )
     if cursor is not None:
         created_at, entity_id = parse_created_cursor(cursor)
         stmt = stmt.where(
@@ -91,7 +104,9 @@ async def list_workspace_types(
     if len(rows) > effective_limit:
         rows = rows[:effective_limit]
         next_cursor = make_created_cursor(rows[-1].created_at, rows[-1].id)
-    return JSONResponse(page_body([dump(WorkspaceTypeOut, t) for t in rows], next_cursor))
+    items = [dump(WorkspaceTypeOut, t) for t in rows]
+    await attach_packages(db, ctx.tenant_id, "WorkspaceType", items)
+    return JSONResponse(page_body(items, next_cursor))
 
 
 @router.get(
@@ -101,7 +116,9 @@ async def get_workspace_type(type_id: uuid.UUID, ctx: AuthDep, db: DbDep) -> JSO
     await authorize(ctx, Permission.WORKSPACES_READ)
     workspace_type = await commands.get_tenant_workspace_type(db, ctx, type_id)
     return JSONResponse(
-        dump(WorkspaceTypeOut, workspace_type),
+        await attach_package(
+            db, ctx.tenant_id, "WorkspaceType", dump(WorkspaceTypeOut, workspace_type)
+        ),
         headers={"ETag": format_etag("workspace_type", workspace_type.version)},
     )
 
@@ -131,7 +148,9 @@ async def update_workspace_type(
             field_schema=payload.field_schema,
             allowed_child_types=payload.allowed_child_types,
         )
-        return 200, dump(WorkspaceTypeOut, workspace_type)
+        return 200, await attach_package(
+            db, ctx.tenant_id, "WorkspaceType", dump(WorkspaceTypeOut, workspace_type)
+        )
 
     return await execute_write(
         request,
@@ -158,7 +177,9 @@ async def archive_workspace_type(
 ) -> JSONResponse:
     async def executor(db: AsyncSession) -> tuple[int, dict[str, object]]:
         workspace_type = await commands.archive_workspace_type(db, ctx, type_id=type_id)
-        return 200, dump(WorkspaceTypeOut, workspace_type)
+        return 200, await attach_package(
+            db, ctx.tenant_id, "WorkspaceType", dump(WorkspaceTypeOut, workspace_type)
+        )
 
     return await execute_write(
         request, ctx, settings, session_factory, canonical_body="", executor=executor

@@ -15,6 +15,9 @@ into the text an executor reads:
 * the feedback of the task's last verification, when it failed and the task
   came back to its executor (CP-ADR-0067 §5, amendment 2026-09-27: B8) —
   ``lastVerification``, which the daemon adds to the task;
+* the task's comments (TASK-001131) — the thread the daemon read before the
+  run, rendered by :mod:`control_plane_agent.comments`; part of the task
+  statement, not a layer of instructions, so the hash does not cover them;
 * the task's inputs (CP-ADR-0072 §8) — artifacts of other tasks, with the
   local files the daemon downloaded — rendered by
   :mod:`control_plane_agent.inputs` as data, not instructions;
@@ -35,6 +38,8 @@ from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
+from control_plane_agent.comments import TASK_KEY as COMMENTS_KEY
+from control_plane_agent.comments import render_comments
 from control_plane_agent.context_pack import render_context_pack
 from control_plane_agent.inputs import LocalInput, inputs_of_context, render_inputs
 
@@ -43,7 +48,8 @@ logger = logging.getLogger("control_plane_agent.instructions")
 HEADING = "## Instructions"
 PREAMBLE = (
     "Layers from general to specific. A later layer adds to the earlier ones; "
-    "none of them overrides the platform contract."
+    "none of them overrides the platform contract. The task's comments, when there "
+    "are any, are part of the task statement."
 )
 CONVENTIONS_TITLE = "Repository conventions"
 _SOURCE_TITLES = {"platform": "Platform contract", "project": "Project", "taskType": "Task type"}
@@ -158,9 +164,12 @@ def build_prompt(
         "",
         str(task.get("description") or "(no description)"),
     ]
-    section = render_feedback(task.get("lastVerification"))
-    if section:
-        lines += ["", section]
+    for section in (
+        render_feedback(task.get("lastVerification")),
+        render_comments(task.get(COMMENTS_KEY)),
+    ):
+        if section:
+            lines += ["", section]
     project = (context.get("operational") or {}).get("project")
     if isinstance(project, dict) and project:
         lines += [

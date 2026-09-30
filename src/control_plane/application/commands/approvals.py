@@ -35,6 +35,7 @@ from control_plane.application.commands.workspaces import (
 )
 from control_plane.application.common import new_uuid, utcnow
 from control_plane.application.events import record_event
+from control_plane.application.locking import lock_principals_key_share
 from control_plane.application.queries.approval_gates import pending_gate_approvals
 from control_plane.application.queries.org import role_assignment_scope
 from control_plane.domain.enums import ApprovalStatus, Permission
@@ -101,12 +102,20 @@ async def request_approval(
 
     task_id: uuid.UUID | None = None
     task: Task | None = None
+    # The assignee the approval will reference, before the task (rule 3 of
+    # ``application/locking.py``, CP-ADR-0077 §3): ``:disable`` of the
+    # assignee holds it and may wait for this task. For a gate the task is
+    # locked; without one it is only read, but the insert's foreign-key check
+    # on the task and on the assignee must not be left to the order of the
+    # referential triggers. The requester is the caller, locked by the write
+    # flow (rule 1).
+    await lock_principals_key_share(session, ctx.tenant_id, [assigned_principal_id])
     if task_ref is not None:
         # A gate must serialize with the commands it gates: taking the task
-        # row lock (first in the global order, nothing else is locked here)
-        # means an in-flight :complete either finishes before the gate exists
-        # or blocks until it does — no gate can attach to a task that is
-        # concurrently becoming terminal.
+        # row lock (the first row lock after the principals; no session, claim
+        # or run is locked here) means an in-flight :complete either finishes
+        # before the gate exists or blocks until it does — no gate can attach
+        # to a task that is concurrently becoming terminal.
         task = (
             await resolve_task_for_update(session, ctx, task_ref)
             if gate
@@ -306,14 +315,15 @@ async def _require_decision_eligibility(
         )
 
 
-async def decide_approval(
-    session: AsyncSession,
-    ctx: AuthContext,
-    *,
-    approval_id: uuid.UUID,
-    approve: bool,
-    comment: str | None = None,
+async def decision_gate(
+    session: AsyncSession, ctx: AuthContext, approval_id: uuid.UUID, *, for_decision: bool
 ) -> Approval:
+    """Everything that decides whether ``ctx`` may approve or reject.
+
+    The decision itself goes through here with ``for_decision`` (the row locked,
+    refused unless pending); ``POST /authz:check`` asks the same question
+    without either (CP-ADR-0055, amendment of 2026-09-29).
+    """
     target = ResourceRef("approval", str(approval_id))
     if ctx.purpose_ref is not None and ctx.purpose_ref != target.key:
         # Checked before the row is read: a credential bound to one decision
@@ -323,9 +333,29 @@ async def decide_approval(
             code="outside_purpose",
         )
     await authorize(ctx, Permission.APPROVALS_DECIDE)
-    approval = await _get_locked_pending_approval(session, ctx, approval_id)
+    if for_decision:
+        approval = await _get_locked_pending_approval(session, ctx, approval_id)
+    else:
+        found = await session.scalar(
+            select(Approval).where(Approval.id == approval_id, Approval.tenant_id == ctx.tenant_id)
+        )
+        if found is None:
+            raise NotFoundError("Approval not found", details={"approvalId": str(approval_id)})
+        approval = found
     await authorize(ctx, Permission.APPROVALS_DECIDE, resource=target)
     await _require_decision_eligibility(session, ctx, approval)
+    return approval
+
+
+async def decide_approval(
+    session: AsyncSession,
+    ctx: AuthContext,
+    *,
+    approval_id: uuid.UUID,
+    approve: bool,
+    comment: str | None = None,
+) -> Approval:
+    approval = await decision_gate(session, ctx, approval_id, for_decision=True)
     # What the type declares must hold before an approve (TAI-ADR-0041 p.7):
     # refused, the decision is not recorded and the gate stays pending.
     if approve:

@@ -18,15 +18,19 @@ from control_plane.api.dependencies import AuthDep, DbDep, SessionFactoryDep, Se
 from control_plane.api.v1.principals import forget_binding_cache
 from control_plane.api.v1.schemas import (
     ERROR_RESPONSES,
+    PACKAGE_FILTER_DESCRIPTION,
     AgentIdentityLinkRequest,
+    AgentIdentityReplaceRequest,
     AgentOut,
+    AgentPageOut,
     AgentPublishRequest,
     AgentRetireRequest,
+    AgentRevisionPageOut,
+    AgentRevisionSummaryOut,
     AgentStateUpdateRequest,
     AgentStatusOut,
     AgentStatusReport,
     AgentValidationOut,
-    PageOut,
     page_body,
 )
 from control_plane.api.write_flow import execute_write
@@ -34,7 +38,12 @@ from control_plane.application.authorization import authorize
 from control_plane.application.commands import agents as commands
 from control_plane.application.common import make_created_cursor, parse_created_cursor
 from control_plane.application.queries.lists import clamp_limit
-from control_plane.domain.enums import Permission
+from control_plane.application.queries.package_links import (
+    attach_package,
+    attach_packages,
+    in_package,
+)
+from control_plane.domain.enums import AgentStatus, Permission
 from control_plane.domain.errors import ValidationError
 from control_plane.infrastructure.db.models import Agent, AgentObservedStatus, AgentRevision
 
@@ -131,9 +140,17 @@ async def publish_agent(
     touched: list[tuple[str, uuid.UUID]] = []
 
     async def executor(db: AsyncSession) -> tuple[int, dict[str, object]]:
-        view = await commands.publish_agent(db, ctx, key=payload.key, spec=_spec_as_sent(payload))
+        view = await commands.publish_agent(
+            db,
+            ctx,
+            key=payload.key,
+            spec=_spec_as_sent(payload),
+            package=(payload.package.key, payload.package.version) if payload.package else None,
+        )
         touched.extend(view.touched_identities)
-        return (201 if view.created else 200), agent_body(view.agent, view.revision)
+        return (201 if view.created else 200), await attach_package(
+            db, ctx.tenant_id, "Agent", agent_body(view.agent, view.revision)
+        )
 
     response = await execute_write(
         request,
@@ -166,7 +183,12 @@ async def validate_agent(payload: AgentPublishRequest, ctx: AuthDep, db: DbDep) 
     )
 
 
-@router.get("/agents", response_model=PageOut, responses=ERROR_RESPONSES)
+@router.get(
+    "/agents",
+    response_model=AgentPageOut,
+    responses=ERROR_RESPONSES,
+    summary="A page of agents; include=status adds the observed state of each",
+)
 async def list_agents(
     ctx: AuthDep,
     db: DbDep,
@@ -175,16 +197,24 @@ async def list_agents(
     status: Literal["active", "retired"] | None = Query(default=None),
     state: Literal["running", "stopped"] | None = Query(default=None),
     workspace_id: str | None = Query(default=None, alias="workspaceId"),
+    include: Literal["status"] | None = Query(
+        default=None,
+        description="status: each item carries observedStatus, the body of "
+        "GET /agents/{key}/status, read by the same query as the page",
+    ),
+    package: str | None = Query(default=None, description=PACKAGE_FILTER_DESCRIPTION),
 ) -> JSONResponse:
     await authorize(ctx, Permission.AGENTS_READ)
     effective_limit = clamp_limit(limit)
     stmt = (
-        select(Agent, AgentRevision)
+        select(Agent, AgentRevision, AgentObservedStatus)
         .join(
             AgentRevision,
             (AgentRevision.agent_id == Agent.id)
             & (AgentRevision.revision == Agent.current_revision),
         )
+        # One row per agent at most (agent_id is the key): the page stays one query.
+        .outerjoin(AgentObservedStatus, AgentObservedStatus.agent_id == Agent.id)
         .where(Agent.tenant_id == ctx.tenant_id)
     )
     if status is not None:
@@ -200,6 +230,8 @@ async def list_agents(
                 "workspaceId must be a UUID",
                 details={"workspaceId": workspace_id},
             ) from exc
+    if package is not None:
+        stmt = stmt.where(in_package("Agent", Agent.tenant_id, Agent.key, package))
     if cursor is not None:
         created_at, entity_id = parse_created_cursor(cursor)
         stmt = stmt.where(
@@ -212,7 +244,12 @@ async def list_agents(
     if len(rows) > effective_limit:
         rows = rows[:effective_limit]
         next_cursor = make_created_cursor(rows[-1][0].created_at, rows[-1][0].id)
-    return JSONResponse(page_body([agent_body(a, r) for a, r in rows], next_cursor))
+    if include == "status":
+        items = [{**agent_body(a, r), "observedStatus": status_body(a, o)} for a, r, o in rows]
+    else:
+        items = [agent_body(a, r) for a, r, _ in rows]
+    await attach_packages(db, ctx.tenant_id, "Agent", items)
+    return JSONResponse(page_body(items, next_cursor))
 
 
 # Declared before /agents/{ref}: "me" is not an agent key.
@@ -225,7 +262,9 @@ async def list_agents(
 async def get_my_agent(ctx: AuthDep, db: DbDep) -> JSONResponse:
     # Authentication is the whole check: an executor reads its own spec.
     view = await commands.my_agent(db, ctx)
-    return JSONResponse(agent_body(view.agent, view.revision))
+    return JSONResponse(
+        await attach_package(db, ctx.tenant_id, "Agent", agent_body(view.agent, view.revision))
+    )
 
 
 @router.get(
@@ -236,7 +275,53 @@ async def get_my_agent(ctx: AuthDep, db: DbDep) -> JSONResponse:
 )
 async def get_agent(ref: str, ctx: AuthDep, db: DbDep) -> JSONResponse:
     view = await commands.resolve_agent(db, ctx, ref)
-    return JSONResponse(agent_body(view.agent, view.revision))
+    return JSONResponse(
+        await attach_package(db, ctx.tenant_id, "Agent", agent_body(view.agent, view.revision))
+    )
+
+
+def revision_summary_body(
+    agent: Agent, revision: AgentRevision, previous_spec: dict[str, Any] | None
+) -> dict[str, Any]:
+    package = (
+        {"key": revision.source_package_key, "version": revision.source_package_version}
+        if revision.source_package_key is not None
+        else None
+    )
+    return AgentRevisionSummaryOut.model_validate(
+        {
+            "id": revision.id,
+            "agent_key": agent.key,
+            "revision": revision.revision,
+            "spec_hash": revision.spec_hash,
+            "created_by": revision.created_by,
+            "created_at": revision.created_at,
+            "source": {"kind": revision.source_kind, "package": package},
+            "active": agent.status == AgentStatus.ACTIVE
+            and revision.revision == agent.current_revision,
+            "changed_fields": commands.changed_fields(previous_spec, revision.spec)
+            if previous_spec is not None
+            else None,
+        }
+    ).model_dump(mode="json", by_alias=True)
+
+
+@router.get(
+    "/agents/{key}/revisions",
+    response_model=AgentRevisionPageOut,
+    responses=ERROR_RESPONSES,
+    summary="Revisions of an agent, newest first, without their specs (those are key@revision)",
+)
+async def list_agent_revisions(
+    key: str,
+    ctx: AuthDep,
+    db: DbDep,
+    limit: int | None = Query(default=None),
+    cursor: str | None = Query(default=None),
+) -> JSONResponse:
+    page = await commands.list_revisions(db, ctx, key=key, limit=limit, cursor=cursor)
+    items = [revision_summary_body(page.agent, r, p) for r, p in page.items]
+    return JSONResponse(page_body(items, page.next_cursor))
 
 
 @router.patch(
@@ -259,7 +344,9 @@ async def update_agent_state(
         view = await commands.update_agent_state(
             db, ctx, key=key, state=payload.state, replicas=payload.replicas
         )
-        return 200, agent_body(view.agent, view.revision)
+        return 200, await attach_package(
+            db, ctx.tenant_id, "Agent", agent_body(view.agent, view.revision)
+        )
 
     return await execute_write(
         request,
@@ -291,7 +378,9 @@ async def retire_agent(
     async def executor(db: AsyncSession) -> tuple[int, dict[str, object]]:
         view = await commands.retire_agent(db, ctx, key=key, reason=payload.reason)
         touched.extend(view.touched_identities)
-        return 200, agent_body(view.agent, view.revision)
+        return 200, await attach_package(
+            db, ctx.tenant_id, "Agent", agent_body(view.agent, view.revision)
+        )
 
     response = await execute_write(
         request,
@@ -300,6 +389,8 @@ async def retire_agent(
         session_factory,
         canonical_body=payload.model_dump_json(exclude_unset=True),
         executor=executor,
+        # Takes the caller with the target principal, in id order.
+        lock_caller_first=False,
     )
     _forget(request, touched)
     return response
@@ -330,9 +421,12 @@ async def link_agent_identity(
             issuer=payload.issuer,
             iam_tenant_id=payload.iam_tenant_id,
             iam_principal_id=payload.iam_principal_id,
+            trusted_issuer=settings.iam_issuer,
         )
         touched.extend(view.touched_identities)
-        return 200, agent_body(view.agent, view.revision)
+        return 200, await attach_package(
+            db, ctx.tenant_id, "Agent", agent_body(view.agent, view.revision)
+        )
 
     response = await execute_write(
         request,
@@ -344,6 +438,55 @@ async def link_agent_identity(
     )
     # A negative answer may already be cached for this identity (the executor
     # tried to enter before it was linked): drop it now, not after the TTL.
+    _forget(request, touched)
+    return response
+
+
+@router.post(
+    "/agents/{key}/identity:replace",
+    response_model=AgentOut,
+    responses=ERROR_RESPONSES,
+    summary="Move a service agent to a new IAM identity; the principal stays the same",
+)
+async def replace_agent_identity(
+    key: str,
+    payload: AgentIdentityReplaceRequest,
+    request: Request,
+    ctx: AuthDep,
+    settings: SettingsDep,
+    session_factory: SessionFactoryDep,
+) -> JSONResponse:
+    await authorize(ctx, Permission.AGENTS_MANAGE)
+    touched: list[tuple[str, uuid.UUID]] = []
+
+    async def executor(db: AsyncSession) -> tuple[int, dict[str, object]]:
+        view = await commands.replace_agent_identity(
+            db,
+            ctx,
+            key=key,
+            issuer=payload.issuer,
+            iam_tenant_id=payload.iam_tenant_id,
+            iam_principal_id=payload.iam_principal_id,
+            reason=payload.reason,
+            trusted_issuer=settings.iam_issuer,
+        )
+        touched.extend(view.touched_identities)
+        return 200, await attach_package(
+            db, ctx.tenant_id, "Agent", agent_body(view.agent, view.revision)
+        )
+
+    response = await execute_write(
+        request,
+        ctx,
+        settings,
+        session_factory,
+        canonical_body=payload.model_dump_json(exclude_unset=True),
+        executor=executor,
+        # Takes the caller with the agent's principal, in id order.
+        lock_caller_first=False,
+    )
+    # The previous identity loses entry and the new one gains it now, not
+    # after the cache TTL.
     _forget(request, touched)
     return response
 

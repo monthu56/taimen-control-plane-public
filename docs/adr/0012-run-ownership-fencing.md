@@ -53,7 +53,9 @@ Run   = конкретная попытка исполнения под claim'о
   repo: control-plane
 - grep: {path: src/control_plane/infrastructure/db/models.py, pattern: 'UniqueConstraint\("task_id", "attempt", name="uq_runs_task_attempt"\)'}
   repo: control-plane
-- grep: {path: src/control_plane/application/commands/tasks.py, pattern: 'run\.failure_reason = "superseded"'}
+- grep: {path: src/control_plane/application/commands/tasks.py, pattern: 'reason: str = "superseded"'}
+  repo: control-plane
+- grep: {path: src/control_plane/application/commands/runs.py, pattern: 'await supersede_run\(session, ctx, task, existing\)'}
   repo: control-plane
 - grep: {path: src/control_plane/application/commands/tasks.py, pattern: '"run_in_progress"'}
   repo: control-plane

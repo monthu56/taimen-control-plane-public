@@ -61,7 +61,7 @@ from control_plane_agent.instructions import (
 from control_plane_agent.main import ArtifactSpec
 from control_plane_agent.trace import TraceRecorder, TraceSettings, TranscriptBuilder
 from control_plane_agent.workspace import Workspace, assert_portable, redact_local_paths
-from control_plane_client import ControlPlaneClient, ControlPlaneError
+from control_plane_client import ControlPlaneClient, ControlPlaneError, is_transient
 from control_plane_codex.cli import (
     CodexCLI,
     CodexError,
@@ -211,11 +211,16 @@ class CodexAdapter:
             if not result.is_error:
                 await record_blocked_file(client, run_id, stop_file)
 
-        await client.finish_action(
-            run_id,
-            str(action["id"]),
-            status="completed" if not result.is_error else "failed",
-            external_reference=f"codex:session/{result.session_id}",
+        # Bookkeeping of a turn that has already run: a core unreachable for
+        # the moment must not turn finished work into a failed run.
+        await with_suppressed(
+            client.finish_action(
+                run_id,
+                str(action["id"]),
+                status="completed" if not result.is_error else "failed",
+                external_reference=f"codex:session/{result.session_id}",
+            ),
+            only_transient=True,
         )
         await self._checkpoint(
             client,
@@ -412,17 +417,23 @@ class CodexEventMapper:
             await self.recorder.tool_finished(item_id, output, is_error=failed)
 
 
-async def with_suppressed(awaitable: Awaitable[Any]) -> None:
+async def with_suppressed(awaitable: Awaitable[Any], *, only_transient: bool = False) -> None:
     """Await an auxiliary write, tolerating its failure.
 
     Checkpoints and action bookkeeping must never turn a finished piece of work
     into a failure; the authoritative outcome is decided by the daemon. It is
     still awaited rather than fired and forgotten — a checkpoint that lands
     after the process it describes has died records nothing useful.
+
+    ``only_transient`` tolerates only an unreachable core (:func:`is_transient`):
+    an answer of the core itself — a lost claim, a finished run — still stops
+    the execution.
     """
     try:
         await awaitable
     except ControlPlaneError as exc:
+        if only_transient and not is_transient(exc):
+            raise
         logger.info("auxiliary write failed: %s", exc)
 
 

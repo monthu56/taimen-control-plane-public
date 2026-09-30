@@ -1,6 +1,7 @@
 """Principal and API key management commands."""
 
 import uuid
+from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
@@ -24,6 +25,18 @@ from control_plane.domain.errors import (
 )
 from control_plane.infrastructure.auth.api_keys import GeneratedKey, generate_api_key
 from control_plane.infrastructure.db.models import ApiKey, Principal
+
+
+def ungranted_permissions(ctx: AuthContext, permissions: Iterable[str]) -> list[str]:
+    """What of ``permissions`` the caller does not hold itself, sorted.
+
+    The one escalation rule of every grant — an API key, an IAM binding, and
+    ``principals/{id}:enable``, which gives a principal its live keys back:
+    nobody hands out more than it holds (admin holds everything).
+    """
+    if ctx.has(Permission.ADMIN):
+        return []
+    return sorted(set(permissions) - set(ctx.permissions))
 
 
 async def get_tenant_principal(
@@ -116,7 +129,7 @@ async def create_api_key(
             raise ValidationError(
                 "invalid_permissions", "Only an admin key can create another admin key"
             )
-        missing = sorted(set(permissions) - set(ctx.permissions))
+        missing = ungranted_permissions(ctx, permissions)
         if missing:
             raise AuthorizationError(
                 "Cannot grant permissions the creating key does not hold",

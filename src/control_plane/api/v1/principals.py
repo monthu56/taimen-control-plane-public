@@ -22,12 +22,15 @@ from control_plane.api.v1.schemas import (
     IamBindingUpsertRequest,
     PageOut,
     PrincipalCreateRequest,
+    PrincipalDisableRequest,
+    PrincipalEnabledOut,
+    PrincipalEnableRequest,
     PrincipalOut,
     dump,
     page_body,
 )
 from control_plane.api.write_flow import execute_write
-from control_plane.application.commands import iam_bindings
+from control_plane.application.commands import iam_bindings, principal_disable, principal_enable
 from control_plane.application.commands import principals as commands
 from control_plane.application.queries import lists as queries
 
@@ -84,6 +87,84 @@ async def list_principals(
 async def get_principal(principal_id: uuid.UUID, ctx: AuthDep, db: DbDep) -> JSONResponse:
     principal = await queries.get_principal(db, ctx, principal_id)
     return JSONResponse(dump(PrincipalOut, principal))
+
+
+@router.post(
+    "/principals/{principal_id}:disable",
+    response_model=PrincipalOut,
+    responses=ERROR_RESPONSES,
+    summary="Disable a human or agent: revoke its bindings, close its sessions, free its claims",
+)
+async def disable_principal(
+    principal_id: uuid.UUID,
+    request: Request,
+    ctx: AuthDep,
+    settings: SettingsDep,
+    session_factory: SessionFactoryDep,
+    payload: PrincipalDisableRequest | None = None,
+) -> JSONResponse:
+    touched: list[tuple[str, uuid.UUID]] = []
+
+    async def executor(db: AsyncSession) -> tuple[int, dict[str, object]]:
+        result = await principal_disable.disable_principal(
+            db, ctx, principal_id=principal_id, reason=payload.reason if payload else None
+        )
+        touched.extend(result.touched_identities)
+        return 200, dump(PrincipalOut, result.principal)
+
+    response = await execute_write(
+        request,
+        ctx,
+        settings,
+        session_factory,
+        canonical_body=payload.model_dump_json(exclude_unset=True) if payload else "",
+        executor=executor,
+        # Takes the caller with the target principal, in id order.
+        lock_caller_first=False,
+    )
+    for issuer, iam_principal_id in touched:
+        forget_binding_cache(request, issuer, iam_principal_id)
+    return response
+
+
+@router.post(
+    "/principals/{principal_id}:enable",
+    response_model=PrincipalEnabledOut,
+    responses=ERROR_RESPONSES,
+    summary="Enable a disabled human or agent; IAM bindings revoked by :disable stay revoked",
+)
+async def enable_principal(
+    principal_id: uuid.UUID,
+    request: Request,
+    ctx: AuthDep,
+    settings: SettingsDep,
+    session_factory: SessionFactoryDep,
+    payload: PrincipalEnableRequest | None = None,
+) -> JSONResponse:
+    touched: list[tuple[str, uuid.UUID]] = []
+
+    async def executor(db: AsyncSession) -> tuple[int, dict[str, object]]:
+        result = await principal_enable.enable_principal(
+            db, ctx, principal_id=principal_id, reason=payload.reason if payload else None
+        )
+        touched.extend(result.touched_identities)
+        return 200, dump(PrincipalOut, result.principal, liveApiKeys=result.live_api_keys)
+
+    response = await execute_write(
+        request,
+        ctx,
+        settings,
+        session_factory,
+        canonical_body=payload.model_dump_json(exclude_unset=True) if payload else "",
+        executor=executor,
+        # Takes the caller with the target principal, in id order.
+        lock_caller_first=False,
+    )
+    # Answers cached while it was disabled (``principal_not_active``, a revoked
+    # binding) must not outlive the change: the next request reads the base.
+    for issuer, iam_principal_id in touched:
+        forget_binding_cache(request, issuer, iam_principal_id)
+    return response
 
 
 @router.post(
@@ -194,6 +275,7 @@ async def upsert_iam_binding(
             iam_tenant_id=payload.iam_tenant_id,
             iam_principal_id=payload.iam_principal_id,
             permissions=payload.permissions,
+            trusted_issuer=settings.iam_issuer,
         )
         return (201 if result.created else 200), dump(IamBindingOut, result.binding)
 

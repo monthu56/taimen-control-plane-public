@@ -6,6 +6,7 @@ row (ADR-0050).
 """
 
 import uuid
+from collections.abc import Iterable
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -16,7 +17,7 @@ from control_plane.application.common import make_thread_cursor, parse_thread_cu
 from control_plane.application.queries.lists import Page, clamp_limit
 from control_plane.domain.enums import Permission
 from control_plane.domain.errors import NotFoundError
-from control_plane.infrastructure.db.models import TaskComment, TaskCommentRevision
+from control_plane.infrastructure.db.models import Principal, TaskComment, TaskCommentRevision
 
 
 async def list_comments(
@@ -59,6 +60,25 @@ async def list_comments(
         rows = rows[:effective_limit]
         next_cursor = make_thread_cursor(rows[-1].created_at, rows[-1].id)
     return Page(items=rows, next_cursor=next_cursor)
+
+
+async def comment_authors(
+    session: AsyncSession, ctx: AuthContext, comments: Iterable[TaskComment]
+) -> dict[uuid.UUID, Principal]:
+    """The authors of these comments by id, in one query, within the tenant.
+
+    Who wrote a reply is part of the thread (ADR-0050): it is read with the
+    comments under ``tasks.read``, so a reader without ``principals.read``
+    still tells the owner from an agent. Only the comments' own authors are
+    read, never a principal the caller named.
+    """
+    ids = {comment.author_principal_id for comment in comments}
+    if not ids:
+        return {}
+    rows = await session.scalars(
+        select(Principal).where(Principal.tenant_id == ctx.tenant_id, Principal.id.in_(ids))
+    )
+    return {principal.id: principal for principal in rows}
 
 
 async def get_comment(

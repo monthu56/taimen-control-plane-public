@@ -20,6 +20,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
+from control_plane_agent.comments import own_principal_id, with_comments
 from control_plane_agent.instructions import (
     build_prompt,
     prompt_file_from_environment,
@@ -97,6 +98,8 @@ class OpenCodeAdapter:
         self.agent = agent
         self.max_cycles = max_cycles
         self.prompt_file = prompt_file
+        # Read once: its own "blocked" comments stay out of the prompt.
+        self._own_principal: str | None = None
         # A cancel request or a run without progress stops the prompt
         # (control_plane_agent.supervision), as for every other adapter.
         self.supervision = supervision or SupervisionSettings()
@@ -205,6 +208,10 @@ class OpenCodeAdapter:
             context = await self.client.get_working_context(
                 task_ref=task["id"], run_id=run["id"], project_id=self.project_id
             )
+            # The thread of the task, as every adapter's prompt shows it.
+            if self._own_principal is None:
+                self._own_principal = await own_principal_id(self.client)
+            task = await with_comments(self.client, task, own_principal=self._own_principal)
             opencode_session, resumed = await self._resume_opencode_session(
                 run["id"], title=task.get("publicId") or task["title"]
             )

@@ -2809,13 +2809,17 @@ def _message(message: Message) -> Any:
         return message.value  # type: ignore[attr-defined]
     if name in ("google.protobuf.Struct", "google.protobuf.Value", "google.protobuf.ListValue"):
         return json_format.MessageToDict(message)
+    # Not ListFields(): it leaves out empty lists and maps and zero plain scalars,
+    # and a recall with no nodes must still read ``nodes == []`` (TASK-001134).
+    # Only a field that tracks presence and is unset is left out.
     out: dict[str, Any] = {}
-    for descriptor, value in message.ListFields():
+    for descriptor in message.DESCRIPTOR.fields:
+        value = getattr(message, descriptor.name)
         if descriptor.message_type is not None and descriptor.message_type.GetOptions().map_entry:
             out[descriptor.name] = {str(k): _native(v) for k, v in value.items()}
         elif descriptor.is_repeated:
             out[descriptor.name] = [_native(v) for v in value]
-        else:
+        elif not descriptor.has_presence or message.HasField(descriptor.name):
             out[descriptor.name] = _native(value)
     return out
 

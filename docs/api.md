@@ -29,6 +29,41 @@ application-слоя.
 может решить approval). Claim требует одновременно: API permission
 `tasks.claim` ∧ eligibility ∧ readiness ∧ concurrency-правила.
 
+**Могу ли я X на Y** ([CP-ADR-0055](adr/0055-policy-authorize-and-shadow-mode.md),
+амендмент 2026-09-29). Интерфейс не выводит доступность действия из плоских
+permissions: право бывает выдано на один воркспейс, а решение approval
+зависит ещё от eligibility и separation of duties. Он спрашивает ядро:
+
+```
+POST /api/v1/authz:check      (любой аутентифицированный; о себе; без Idempotency-Key)
+{"checks": [{"action": "approve", "resourceType": "approval", "resourceId": "<uuid>"},
+            {"action": "update-state", "resourceType": "agent", "resourceId": "<key>"}]}
+→ 200 {"results": [{"action": "approve", "resourceType": "approval", "resourceId": "<uuid>",
+                    "allowed": false,
+                    "reason": {"code": "separation_of_duties_violation", "message": "…",
+                               "details": {"approvalId": "<uuid>"}}},
+                   {"action": "update-state", …, "allowed": true, "reason": null}]}
+```
+
+Действия: `approval` — `approve|reject`; `process_instance` —
+`suspend|resume|cancel`; `run` — `request-cancel|cancel`; `rule` —
+`enable|disable`; `agent` — `update-state` (`PATCH /agents/{key}/state`);
+`principal` — `enable|disable` (`POST /principals/{id}:enable|:disable`).
+Ответ считает тот же код, что и эндпоинт: `allowed: true` — эндпоинт не
+ответит 403/404; отказ несёт код и details отказа эндпоинта. У `approve`
+это включает чтение того, на что ссылаются preconditions типа задачи
+(`tasks.read` на задачу и `spawnedBy`, `artifacts.read`), — но не их
+выполнение: невыполненное условие — `409 approval_precondition_failed`. Состояние
+ресурса (решённый approval, завершённый прогон) проверкой не покрывается —
+это 409 эндпоинта. Исключение — principal: его ворота отвечают и за то, чем
+цель является и останется (`422 principal_kind_not_enableable|_disableable`,
+`409 cannot_disable_self`, `409 use_agent_publish|use_agent_retire`), — по
+карточке principal'а интерфейс этого не прочтёт; повтор (включить активного,
+отключить отключённого) эндпоинт отвечает `200`, и проверка его разрешает. 1–100 элементов (`400`), незнакомый глагол или
+тип — `400 invalid_request` на весь пакет, известные глагол и тип вне реестра —
+`422 unknown_action`, id не UUID — `422 invalid_check`. Токен решения
+(`control-plane:decide`) проверку не вызывает: `403 outside_purpose`.
+
 ## Заголовки протокола
 
 | Заголовок | Где | Семантика |
@@ -44,7 +79,8 @@ application-слоя.
 
 `?limit=50&cursor=<opaque>` (default 50, max 200; больше → `422 invalid_limit`).
 Ответ: `{"items": [...], "nextCursor": "..." | null}`. Сортировка стабильная:
-списки сущностей — по `(created_at, id)` (новые первыми). Журналы run'а
+списки сущностей — по `(created_at, id)` (новые первыми), список run'ов — по
+`(started_at, id)` (новые первыми, CP-ADR-0073 Г2). Журналы run'а
 (`/runs/{id}/checkpoints`, `/runs/{id}/actions`) идут по `seq` (старые первыми);
 их курсор — последний выданный `seq`, привязан к run'у (чужой → `422 invalid_cursor`),
 поэтому записи, дописанные между запросами, опрос по `nextCursor` не пропускает.
@@ -59,6 +95,13 @@ application-слоя.
 значение `sort` → `422 invalid_sort`. Границы `startFrom|startTo|dueFrom|dueTo`
 включающие и применяются до пагинации; задачи без соответствующей даты под такой
 фильтр не попадают.
+
+`GET /tasks?q=<текст>` — текстовый поиск (ADR-0049, амендмент 2026-09-29): каждый
+терм `q` (через пробел) должен встретиться подстрокой без учёта регистра в
+`title`, `description` или `publicId`; `%`, `_`, `\` — буквальный текст. Пустой
+`q` — без фильтра; больше 200 символов или 10 термов → `422 invalid_search`.
+Сочетается со всеми фильтрами, `sort` и курсором (фильтр до пагинации); права —
+как у списка. Индексы — `pg_trgm` GIN на трёх полях.
 
 Комментарии к задаче (v0.8, ADR-0050) — единственная выборка, идущая **от
 старых к новым**: тред читают вперёд, и реплика, написанная во время листания,
@@ -75,7 +118,12 @@ application-слоя.
 (префиксы типа) и `workspaceId` (поддерево) сужают выборку, не меняя порядок и
 смысл курсора. Legacy
 `?after=<sequence>` (v0.3) принимается и адаптируется; `?tail=N` возвращает
-последние N стабильных событий. Малформированный курсор → `422
+последние N стабильных событий. Назад журнал читается через
+`?before=<cursor>` — события строго до курсора; `prevCursor` ответа — `before`
+для предыдущей страницы (`null` у `tail`/`before` — начало журнала),
+`order=desc` отдаёт события страницы от новых к старым; `before` вместе с
+`cursor`/`after`/`tail` — `422 conflicting_cursors` (CP-ADR-0024, амендмент
+2026-09-29). Малформированный курсор → `422
 invalid_cursor`; будущая версия курсора → `422 unsupported_cursor_version`.
 Потребителю с сохранением курсора, дедупом и пробуждением по WebSocket —
 SDK `control_plane_client.events` ([docs/events/consumer.md](events/consumer.md),
@@ -119,11 +167,33 @@ endpoint не объявляет, — опечатка или фильтр, до
 ```
 POST /api/v1/bootstrap                    (Bearer <CP_BOOTSTRAP_TOKEN>; одноразово)
 
+POST /api/v1/authz:check                  аутентифицированный (о себе; 1–100 проверок, CP-ADR-0055
+                                                              амендмент 2026-09-29; см. «Могу ли я X на Y»)
+
 POST /api/v1/principals                   principals.write
 GET  /api/v1/principals                   principals.read
 GET  /api/v1/principals/{id}              principals.read
 POST /api/v1/principals/{id}/api-keys     principals.write   (полный ключ — один раз)
 POST /api/v1/api-keys/{id}:revoke         principals.write
+POST /api/v1/principals/{id}:disable      principals.write   (CP-ADR-0077: human/agent, не себя, не агента
+                                                              реестра; администратора — только admin;
+                                                              связки и делегирования → revoked, сессии
+                                                              его и от его имени → closed, claims
+                                                              освобождены, прогоны на них → failed,
+                                                              вызовы навыков от его имени отменены,
+                                                              principal.disabled; повтор — 200 без изменений)
+POST /api/v1/principals/{id}:enable       principals.write   (CP-ADR-0077, амендмент «Включение»: disabled|paused
+                                                              → active; связки, отозванные :disable, НЕ
+                                                              восстанавливаются — вход через IAM новой связкой
+                                                              POST …/iam-bindings; неотозванные неистёкшие
+                                                              API-ключи снова работают, поэтому их права
+                                                              (и права неотозванных связок) вызывающий
+                                                              обязан иметь сам — иначе 403 permission_escalation
+                                                              с details.missing, как при выдаче ключа;
+                                                              агент реестра → 409 use_agent_publish;
+                                                              ответ — PrincipalOut + liveApiKeys (число живых
+                                                              ключей); principal.enabled; повтор — 200 без
+                                                              изменений)
 
 POST /api/v1/delegations                  delegations.manage
 GET  /api/v1/delegations                  delegations.manage
@@ -189,6 +259,18 @@ GET   /api/v1/task-types                  task_types.read   (?key=&status=)
 GET   /api/v1/task-types/{id}             task_types.read
 POST  /api/v1/task-types/{id}:deprecate   task_types.manage (идемпотентно; задачи, ссылающиеся
                                           на версию, продолжают работать)
+POST  /api/v1/task-types/{id}:migrate-tasks task_types.manage + tasks.write (ADR-0048,
+                                          амендмент 2026-09-30: открытые задачи версии
+                                          {id} → toVersion? (по умолчанию новейшая active
+                                          того же ключа), statusMap?, limit? 1..500
+                                          (100), cursor? — страница по id; ответ
+                                          {typeKey, fromTypeVersion, typeVersion, typeId,
+                                          migrated[{taskId, publicId, fromStatus, status,
+                                          version}], skipped[{taskId, code, message,
+                                          details}], nextCursor}; цель = источник или
+                                          по умолчанию старше источника —
+                                          422 invalid_migration_target; задача без
+                                          tasks.write у вызывающего в страницу не входит)
 
 POST  /api/v1/tasks                       tasks.write  (optional parentTask создаёт parent relation
                                                         атомарно; requirements.skills: "name" |
@@ -211,7 +293,7 @@ POST  /api/v1/tasks                       tasks.write  (optional parentTask со
 GET   /api/v1/tasks                       tasks.read   (?status=&systemStatusCategory=&typeKey=
                                           &priority=&ownerId=&assigneeId=&workspaceId=
                                           &includeDescendants=&startFrom=&startTo=&dueFrom=&dueTo=
-                                          &sort=createdAt|startDate|dueDate&goalId=)
+                                          &sort=createdAt|startDate|dueDate&goalId=&q=)
 GET   /api/v1/tasks/{id|publicId}         tasks.read   (+ETag)
 GET   /api/v1/tasks/{ref}/claimability    tasks.read   (диагностика: claimable + reasons; ADR-0067:
                                           verification_pending {verificationId, status};
@@ -301,11 +383,30 @@ GET   /api/v1/rules/{id}/evaluations      rules.read   (история оцен�
                                           cancelRequested); после — already_done|
                                           already_closed|verification_pending|
                                           claim_not_released)
+GET   /api/v1/rule-evaluations/{id}       rules.read   (одна оценка, та же форма, что в
+                                          /rules/{id}/evaluations; цель origin.ref =
+                                          rule_evaluation:<id> задачи правила; право — на
+                                          workspace правила; чужой tenant — 404; CP-ADR-0063 Е1)
 POST  /api/v1/tasks/{id|publicId}:claim   tasks.claim  (body: sessionId, ttlSeconds?, intent?;
                                           409 verification_pending, пока идёт проверка;
                                           CP-ADR-0072: нет обязательного входа
                                           типа — 409 input_missing, details.missing[{key,
                                           type, from}])
+POST  /api/v1/tasks/{id|publicId}:migrate-type task_types.manage + tasks.write на задачу
+                                          (If-Match; ADR-0048, амендмент 2026-09-30:
+                                          перевод открытой задачи на другую версию
+                                          своего ключа; body {typeVersion?, statusMap?};
+                                          по умолчанию новейшая active, но не старше
+                                          текущей — иначе 422 invalid_migration_target;
+                                          уже на этой версии — 200 без изменений;
+                                          409 task_terminal | task_claimed (и для
+                                          держателя) | run_in_progress |
+                                          verification_pending | approval_pending |
+                                          incompatible_status; 422 invalid_status_map
+                                          (в т.ч. ключ, которого нет в текущей версии)
+                                          | custom_fields_invalid | invalid_acceptance;
+                                          событие task.type_migrated, task.updated не
+                                          шлётся)
 POST  /api/v1/tasks/{id|publicId}:complete tasks.write (If-Match; claimId+fencingToken при живом claim;
                                           задача с acceptance или с обязательными
                                           выходами типа не выполняется сразу —
@@ -492,7 +593,10 @@ POST /api/v1/tasks/{ref}:start-run        tasks.claim  (body: claimId, fencingTo
                                           агента, обязательна principal'у агента, иначе
                                           422 agent_revision_required|mismatch; у run —
                                           agentRevisionId, null не у агента, CP-ADR-0073 §7)
-GET  /api/v1/runs                         tasks.read   (?taskId=&claimId=&status=)
+GET  /api/v1/runs                         tasks.read   (?taskId=&claimId=&status=&principalId=
+                                          &agentKey=; новые первыми по (startedAt, id);
+                                          agentKey — principal агента реестра, неизвестный
+                                          или без principal — пустая страница; CP-ADR-0073 Г1)
 GET  /api/v1/runs/{id}                    tasks.read
 GET  /api/v1/runs/{id}/context            tasks.read   (Run Context: task/claim/requirements/
                                           artifacts/checkpoints всех прошлых runs/skills/cursor;
@@ -627,7 +731,7 @@ GET  /api/v1/artifact-types/{key}[@version]  artifact_types.read (без вер�
                                           нет такой — 404)
 
 Реестр агентов (CP-ADR-0073):
-POST /api/v1/agents                       agents.manage (body {key, spec} — spec объекта
+POST /api/v1/agents                       agents.manage (body {key, spec, package?} — spec объекта
                                           каталога вида Agent; ревизия только при отличии
                                           sha256 канонического JSON spec без state и
                                           placement.replicas: 201 новая, 200 без изменений;
@@ -647,7 +751,9 @@ POST /api/v1/agents:validate              agents.manage (те же провер�
                                           wouldCreateRevision, wouldChangeState}; отказ — та же
                                           ошибка, что у POST /agents)
 GET  /api/v1/agents                       agents.read (?status=active|retired&state=
-                                          running|stopped&workspaceId=)
+                                          running|stopped&workspaceId=&include=status;
+                                          include=status — у каждого элемента observedStatus,
+                                          тело GET …/{key}/status, одним запросом на страницу)
 GET  /api/v1/agents/me                    аутентификация (агент вызывающего с текущей
                                           ревизией; не агент — 404; ретайрнутый — status
                                           retired)
@@ -663,7 +769,25 @@ PUT  /api/v1/agents/{key}/identity        agents.status.write ({issuer, iamTenan
                                           iamPrincipalId}; ядро заводит principal, роли и
                                           связку по ревизии идемпотентно: повтор — 200 без
                                           изменений; другая идентичность — 409
-                                          agent_identity_conflict)
+                                          agent_identity_conflict; issuer не CP_IAM_ISSUER —
+                                          422 iam_issuer_untrusted)
+POST /api/v1/agents/{key}/identity:replace agents.manage ({issuer, iamTenantId,
+                                          iamPrincipalId, reason}; только identity.kind
+                                          service: principal тот же, прежняя связка
+                                          и все прочие связки principal отозваны, новая —
+                                          с правами текущей ревизии; issuer не
+                                          CP_IAM_ISSUER (без него — не issuer агента) —
+                                          422 iam_issuer_untrusted;
+                                          права ревизии ⊆ права вызывающего; та же
+                                          идентичность — 200 без изменений; не service —
+                                          409 agent_identity_conflict; не привязан — 409
+                                          agent_identity_not_linked; событие
+                                          agent.identity_replaced)
+GET  /api/v1/agents/{key}/revisions       agents.read (?limit=&cursor=; от новых к старым,
+                                          без spec: revision, specHash, createdBy, createdAt,
+                                          source{kind package|manual|unknown, package{key,
+                                          version}}, active, changedFields — поля spec,
+                                          изменённые против N−1, у ревизии 1 null)
 GET  /api/v1/agents/{key}/status          agents.read (phase unknown до первого отчёта)
 PUT  /api/v1/agents/{key}/status          agents.status.write ({phase, reason?,
                                           observedRevision?, node?, instances{desired, ready},
@@ -763,7 +887,9 @@ POST /api/v1/packages:test                packages.test ({package: {files[{path,
                                           — реализован
 POST /api/v1/packages:plan                packages.plan ({package, workspaceId?,
                                           replayLimit=50, overwriteConsole=false}; виды
-                                          Calendar и Process; ничего не пишет; changes —
+                                          TaskType, Agent, Calendar, Process, WorkRule
+                                          (CP-ADR-0074 п.11, амендмент 2026-09-29), прочие
+                                          виды пакета — в outside; ничего не пишет; changes —
                                           create | update | rename | unchanged с полями
                                           before/after и владельцем package | console
                                           (поле консоли не перетирается без
@@ -777,7 +903,9 @@ POST /api/v1/packages:plan                packages.plan ({package, workspaceId?,
                                           ${…} в spec.workspaceId и processes.read на него)
                                           — реализован
 POST /api/v1/packages:apply               packages.plan + право вида каждого изменения
-                                          (processes.write, calendars.write) ({package,
+                                          (task_types.manage, agents.manage,
+                                          calendars.write, processes.write, rules.write)
+                                          ({package,
                                           planHash, workspaceId?, overwriteConsole?}; план
                                           строится заново под блокировкой: другой хэш —
                                           409 plan_stale с details.currentPlanHash и
@@ -787,6 +915,25 @@ POST /api/v1/packages:apply               packages.plan + право вида к
                                           migrate с process.migrated, вывод
                                           переименованного ключа; ответ applied[kind, key,
                                           action, version] и catalogEtag после) — реализован
+POST /api/v1/packages:record              packages.plan + право записи каждого вида
+                                          (CP-ADR-0074 Е2; {package: {key, version},
+                                          installHash?, objects: [{kind, key}]} — объекты
+                                          видов ArtifactType, TaskType, ProjectTemplate,
+                                          WorkspaceType, Role (tenant), Capability, Skill,
+                                          WorkRule, Agent, которые установщик применил, и
+                                          неизменившиеся тоже; связь объекта переходит на эту
+                                          версию пакета; Process/Calendar связывает
+                                          packages:apply — 400; TaskType, Agent, WorkRule
+                                          — переходный путь установщика (Е6), запись
+                                          очищает spec прошлого apply; объекта нет в каталоге —
+                                          422 unknown_object, ничего не пишется; ответ
+                                          {package, installHash, recorded})
+
+Привязка к пакету (CP-ADR-0074 Е3): списки и карточки task-types, artifact-types,
+project-templates, workspace-types, roles, capabilities, skills, rules, agents,
+process-definitions и calendars отдают package {key, version, installHash,
+installedAt} — пакет, который поставил объект (ключ, все его версии), или null у
+созданного вручную; списки этих видов принимают ?package=<key>.
 
 POST /api/v1/approvals                    approvals.manage (ровно одно из requiredRoleId |
                                           assignedPrincipalId; gate=true требует task и
@@ -859,8 +1006,11 @@ POST /api/v1/me/attention/{itemKey}:feedback  право чтения прави
                                           attention.feedback_recorded)
 
 GET  /api/v1/events                       events.read  (?cursor=<opaque>|after=<seq legacy>
-                                          &tail=N&entityType=&entityId=; ответ: items[]
-                                          c cursor у каждого события, nextCursor, hasMore;
+                                          |before=<opaque>|tail=N, &order=asc|desc
+                                          &entityType=&entityId=; ответ: items[]
+                                          c cursor у каждого события, nextCursor,
+                                          prevCursor, hasMore; before — назад,
+                                          с cursor/after/tail -> 422 conflicting_cursors;
                                           CP-ADR-0068: types=<префикс>[,…] (повторяемый,
                                           до 20; иначе 422 invalid_event_type_filter),
                                           workspaceId= — поддерево workspace, events.read
@@ -1308,10 +1458,10 @@ bootstrap-admin они входят автоматически (как все п
 | 401 | `invalid_credentials` |
 | 403 | `permission_denied`, `principal_not_active`, `delegation_required`, `claim_holder_mismatch`, `session_owner_mismatch`, `bootstrap_disabled`, `permission_escalation`, `not_eligible`, `run_holder_mismatch`, `tool_not_authorized`, `child_grant_exceeded`, `skill_permission_denied`, `skill_side_effect_not_authorized`, `run_owner_mismatch`, `run_id_required` |
 | 404 | `not_found`, `tool_not_found` (в т.ч. чужой tenant и инструмент вне effective policy — существование не раскрывается), `content_not_found` (у артефакта нет содержимого, CP-ADR-0072) |
-| 409 | `project_exists`, `workspace_type_exists`, `external_reference_conflict`, `retention_blocked_by_consumer`, `task_already_claimed`, `version_conflict`, `stale_claim`, `task_claimed`, `session_expired`, `session_not_active`, `claim_expired`, `claim_not_active`, `claim_not_expired`, `idempotency_key_reused`, `idempotency_in_flight`, `already_bootstrapped`, `task_already_completed`, `task_not_ready`, `run_already_active`, `run_not_active`, `run_in_progress`, `workspace_slug_conflict`, `role_slug_conflict`, `capability_exists`, `skill_exists`, `relation_exists`, `approval_already_decided`, `approval_required` (v0.3 gate), `verification_pending` (ADR-0067), `budget_exceeded`, `action_already_finished`, `child_handle_revoked`, `child_handle_expired`, `child_run_already_bound`, `skill_not_invocable`, `skill_version_immutable`, `invalid_status_transition`, `idempotency_key_reuse`, `stale_invocation_lease`, `approval_already_used`, `task_terminal`, `outcome_not_replayable`, `approval_precondition_failed`, `snapshot_stale`, `pack_version_conflict`, `input_missing` (CP-ADR-0072), `content_not_stored` (CP-ADR-0072) |
+| 409 | `project_exists`, `workspace_type_exists`, `external_reference_conflict`, `retention_blocked_by_consumer`, `task_already_claimed`, `version_conflict`, `stale_claim`, `task_claimed`, `session_expired`, `session_not_active`, `claim_expired`, `claim_not_active`, `claim_not_expired`, `idempotency_key_reused`, `idempotency_in_flight`, `already_bootstrapped`, `task_already_completed`, `task_not_ready`, `run_already_active`, `run_not_active`, `run_in_progress`, `workspace_slug_conflict`, `role_slug_conflict`, `capability_exists`, `skill_exists`, `relation_exists`, `approval_already_decided`, `approval_required` (v0.3 gate), `verification_pending` (ADR-0067), `budget_exceeded`, `action_already_finished`, `child_handle_revoked`, `child_handle_expired`, `child_run_already_bound`, `skill_not_invocable`, `skill_version_immutable`, `invalid_status_transition`, `idempotency_key_reuse`, `stale_invocation_lease`, `approval_already_used`, `task_terminal`, `outcome_not_replayable`, `approval_precondition_failed`, `snapshot_stale`, `pack_version_conflict`, `input_missing` (CP-ADR-0072), `content_not_stored` (CP-ADR-0072), `cannot_disable_self`, `use_agent_retire`, `use_agent_publish` (CP-ADR-0077), `incompatible_status`, `approval_pending` (ADR-0048, амендмент 2026-09-30) |
 | 410 | `content_purged` (содержимое удалено `:purge-content`, CP-ADR-0072) |
 | 413 | `request_too_large` (в т.ч. загрузка сверх `CP_ARTIFACT_MAX_BYTES`) |
-| 422 | `invalid_*` (доменная валидация), `task_not_claimable`, `task_cancelled`, `empty_update`, `unknown_requirement`, `dependency_cycle`, `workspace_cycle`, `workspace_archived`, `workspace_has_active_children`, `task_not_runnable`, `artifact_mismatch`, `invalid_approval`, `skill_disabled`, `unsupported_protocol_version`, `invalid_harness`, `invalid_budget`, `invalid_checkpoint`, `invalid_action`, `invalid_tool_query`, `invalid_correlation_id`, `invalid_child_grant`, `invalid_child_result`, `invalid_child_handle_ref`, `invalid_child_handle_token`, `invalid_entity_type`, `invalid_entity_reference`, `invalid_external_lookup`, `status_not_in_lifecycle`, `invalid_transition`, `invalid_lifecycle_schema`, `invalid_status_category`, `system_task_type_required`, `child_grant_exceeds_parent`, `child_depth_exceeded`, `child_result_too_large`, `invalid_skill_contract`, `unsupported_skill_condition`, `secret_material_rejected`, `invalid_approval_schema`, `workspace_not_root`, `pack_invalid`, `pack_not_found`, `pack_version_required`, `snapshot_invalid`, `invalid_context_schema`, `invalid_recall_request`, `entities_query_invalid` (`/knowledge/entities:query`, CP-ADR-0060 K031); CP-ADR-0072: `invalid_artifact_content`, `content_ref_not_found`, `invalid_artifact_metadata`, `media_type_not_allowed`, `artifact_too_large`, `invalid_artifact_type`, `invalid_artifact_schema`, `unknown_artifact_type` |
+| 422 | `invalid_*` (доменная валидация), `task_not_claimable`, `task_cancelled`, `empty_update`, `unknown_requirement`, `dependency_cycle`, `workspace_cycle`, `workspace_archived`, `workspace_has_active_children`, `task_not_runnable`, `artifact_mismatch`, `invalid_approval`, `skill_disabled`, `unsupported_protocol_version`, `invalid_harness`, `invalid_budget`, `invalid_checkpoint`, `invalid_action`, `invalid_tool_query`, `invalid_correlation_id`, `invalid_child_grant`, `invalid_child_result`, `invalid_child_handle_ref`, `invalid_child_handle_token`, `invalid_entity_type`, `invalid_entity_reference`, `invalid_external_lookup`, `status_not_in_lifecycle`, `invalid_transition`, `invalid_lifecycle_schema`, `invalid_status_category`, `system_task_type_required`, `child_grant_exceeds_parent`, `child_depth_exceeded`, `child_result_too_large`, `invalid_skill_contract`, `unsupported_skill_condition`, `secret_material_rejected`, `invalid_approval_schema`, `workspace_not_root`, `pack_invalid`, `pack_not_found`, `pack_version_required`, `snapshot_invalid`, `invalid_context_schema`, `invalid_recall_request`, `entities_query_invalid` (`/knowledge/entities:query`, CP-ADR-0060 K031); CP-ADR-0072: `invalid_artifact_content`, `content_ref_not_found`, `invalid_artifact_metadata`, `media_type_not_allowed`, `artifact_too_large`, `invalid_artifact_type`, `invalid_artifact_schema`, `unknown_artifact_type`; CP-ADR-0077: `principal_kind_not_disableable`, `principal_kind_not_enableable` |
 | 428 | `if_match_required` |
 | 500 | `internal_error` (без стектрейса) |
 | 502 | `memory_unavailable` (память не обработала проксируемый запрос, в т.ч. отвергла credential ядра — `403`; `details.memoryStatus`, `details.retryable`; текст ответа памяти клиенту не отдаётся) |
@@ -1319,7 +1469,7 @@ bootstrap-admin они входят автоматически (как все п
 
 ## События
 
-`type` в журнале: `tenant.bootstrapped`, `principal.created`,
+`type` в журнале: `tenant.bootstrapped`, `principal.created|disabled|enabled`,
 `api_key.created|revoked`, `delegation.created|revoked`,
 `session.opened|closed|expired`, `task.created|updated|claimed|completed|context_pack_recorded`,
 `claim.released|expired`, `workspace.created|updated|archived|moved`,
@@ -1394,6 +1544,9 @@ v0.8 (ADR-0050): `task.comment_added|comment_edited` — по потоку **з�
 никогда. Прежние версии текста живут в append-only `task_comment_revisions`
 (UPDATE/DELETE запрещены триггером) и читаются через
 `/tasks/{ref}/comments/{id}/revisions`.
+Ответ комментария (создание, правка, один, страница ленты) рядом с
+`authorPrincipalId` несёт `author {kind, displayName}` — текущие вид и имя
+автора, читаемые с одним `tasks.read` (поправка ADR-0050 от 2026-09-30).
 
 M1.1 (ADR-0062): `goal.created|updated` (entity `goal`). `goal.created` несёт
 `title`, `status`, `workspaceId`, `ownerId`, `parentGoalId`, `criteriaCount` и

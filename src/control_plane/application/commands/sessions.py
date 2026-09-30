@@ -19,6 +19,7 @@ from control_plane.application.commands.delegations import find_active_delegatio
 from control_plane.application.commands.principals import get_tenant_principal
 from control_plane.application.common import clamp_ttl, new_uuid, utcnow
 from control_plane.application.events import record_event
+from control_plane.application.locking import lock_principal_key_share
 from control_plane.config import Settings
 from control_plane.domain.enums import (
     KNOWN_HARNESS_CAPABILITIES,
@@ -100,8 +101,15 @@ async def open_session(
 
     delegation_id: uuid.UUID | None = None
     if on_behalf_of_id is not None:
-        human = await get_tenant_principal(session, ctx, on_behalf_of_id)
-        if human.status != PrincipalStatus.ACTIVE:
+        await get_tenant_principal(session, ctx, on_behalf_of_id)
+        # The session references the human: its principal is locked now, and
+        # its status and the delegation are read under that lock. A
+        # ``principals/{id}:disable`` of the human in flight holds it ``FOR
+        # UPDATE``; this waits, then sees ``disabled`` and a revoked delegation
+        # instead of opening an active session on behalf of a disabled
+        # principal (CP-ADR-0077 §3, ``application/locking.py``).
+        human_status = await lock_principal_key_share(session, ctx.tenant_id, on_behalf_of_id)
+        if human_status != PrincipalStatus.ACTIVE:
             raise AuthorizationError(
                 "Delegating principal is not active", code="delegation_required"
             )

@@ -28,6 +28,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from control_plane.api.dependencies import AuthDep, DbDep, SessionFactoryDep, SettingsDep
 from control_plane.api.v1.schemas import (
     ERROR_RESPONSES,
+    PACKAGE_FILTER_DESCRIPTION,
     ErrorEnvelope,
     PageOut,
     ProcessCancelRequest,
@@ -55,6 +56,7 @@ from control_plane.application.commands import process_instances as instances
 from control_plane.application.commands import process_replays as replays
 from control_plane.application.common import decode_cursor, encode_cursor
 from control_plane.application.queries.lists import clamp_limit
+from control_plane.application.queries.package_links import attach_package, attach_packages
 from control_plane.domain.enums import Permission
 from control_plane.domain.errors import NotImplementedYetError, ValidationError
 from control_plane.domain.process_definition import SpecError, split_document
@@ -176,7 +178,9 @@ async def publish_process_definition(
         view = await commands.publish_process_definition(
             db, ctx, key=payload.key, spec=payload.spec
         )
-        return (201 if view.created else 200), definition_body(view)
+        return (201 if view.created else 200), await attach_package(
+            db, ctx.tenant_id, "Process", definition_body(view)
+        )
 
     return await execute_write(
         request,
@@ -201,6 +205,7 @@ async def list_process_definitions(
         alias="governedBy",
         description="Only processes whose elements refer to this document (CP-ADR-0076 §6)",
     ),
+    package: str | None = Query(default=None, description=PACKAGE_FILTER_DESCRIPTION),
 ) -> JSONResponse:
     after_key: str | None = None
     if cursor is not None:
@@ -215,9 +220,12 @@ async def list_process_definitions(
         key=key,
         workspace_id=workspace_id,
         governed_by=governed_by,
+        package=package,
     )
     next_cursor = encode_cursor({"k": next_key}) if next_key is not None else None
-    return JSONResponse(page_body([definition_body(view) for view in views], next_cursor))
+    items = [definition_body(view) for view in views]
+    await attach_packages(db, ctx.tenant_id, "Process", items)
+    return JSONResponse(page_body(items, next_cursor))
 
 
 @router.get(
@@ -228,7 +236,7 @@ async def list_process_definitions(
 )
 async def get_process_definition(ref: str, ctx: AuthDep, db: DbDep) -> JSONResponse:
     view = await commands.resolve_process_definition(db, ctx, ref)
-    return JSONResponse(definition_body(view))
+    return JSONResponse(await attach_package(db, ctx.tenant_id, "Process", definition_body(view)))
 
 
 @router.get(

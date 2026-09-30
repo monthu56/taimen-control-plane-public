@@ -117,12 +117,14 @@ def _ref(schema: dict[str, Any]) -> str:
 ROUTES: dict[tuple[str, str], tuple[str | None, str]] = {
     ("post", "/api/v1/agents"): ("AgentPublishRequest", "AgentOut"),
     ("post", "/api/v1/agents:validate"): ("AgentPublishRequest", "AgentValidationOut"),
-    ("get", "/api/v1/agents"): (None, "PageOut"),
+    ("get", "/api/v1/agents"): (None, "AgentPageOut"),
     ("get", "/api/v1/agents/me"): (None, "AgentOut"),
     ("get", "/api/v1/agents/{ref}"): (None, "AgentOut"),
     ("patch", "/api/v1/agents/{key}/state"): ("AgentStateUpdateRequest", "AgentOut"),
     ("post", "/api/v1/agents/{key}:retire"): ("AgentRetireRequest", "AgentOut"),
     ("put", "/api/v1/agents/{key}/identity"): ("AgentIdentityLinkRequest", "AgentOut"),
+    ("post", "/api/v1/agents/{key}/identity:replace"): ("AgentIdentityReplaceRequest", "AgentOut"),
+    ("get", "/api/v1/agents/{key}/revisions"): (None, "AgentRevisionPageOut"),
     ("get", "/api/v1/agents/{key}/status"): (None, "AgentStatusOut"),
     ("put", "/api/v1/agents/{key}/status"): ("AgentStatusReport", "AgentStatusOut"),
 }
@@ -153,6 +155,17 @@ def test_openapi_carries_the_revision_of_a_run() -> None:
     assert "agentRevisionId" in schemas["RunOut"]["properties"]
     assert "agentRevisionId" in schemas["RunStartRequest"]["properties"]
     assert "agentRevisionId" not in schemas["RunStartRequest"].get("required", [])
+
+
+def test_openapi_lists_runs_by_executor() -> None:
+    """``GET /runs?principalId=&agentKey=`` (amendment of 2026-09-29, Г1)."""
+    operation = _openapi()["paths"]["/api/v1/runs"]["get"]
+    params = {p["name"]: p for p in operation["parameters"]}
+    assert {"taskId", "claimId", "status", "limit", "cursor"} <= set(params)
+    assert params["principalId"]["schema"]["anyOf"][0] == {"type": "string", "format": "uuid"}
+    assert params["agentKey"]["schema"]["anyOf"][0] == {"type": "string"}
+    assert not params["principalId"]["required"] and not params["agentKey"]["required"]
+    assert "startedAt" in operation["description"]
 
 
 def test_openapi_has_no_harness_manifests() -> None:

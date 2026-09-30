@@ -89,6 +89,7 @@ from control_plane.application.commands.work_rules import (
 from control_plane.application.common import new_uuid, utcnow
 from control_plane.application.event_cursor import EventPosition
 from control_plane.application.events import record_event
+from control_plane.application.locking import lock_principal_key_share, lock_rule_principals
 from control_plane.application.queries.events import JournalEvent, fetch_events_after
 from control_plane.domain.enums import (
     AgentStatus,
@@ -316,6 +317,20 @@ class _Acting:
 
 
 async def _acting(
+    session: AsyncSession, rule: WorkRule, *, trace_run_id: str, causation_id: str | None
+) -> _Acting:
+    acting = await _acting_unlocked(
+        session, rule, trace_run_id=trace_run_id, causation_id=causation_id
+    )
+    # The rule acts as this principal: it goes before any task row the
+    # evaluation touches (rule 1 of ``application/locking.py``, CP-ADR-0077
+    # §3). Only the rule's own rows are held here, which
+    # ``principals/{id}:disable`` never takes.
+    await lock_principal_key_share(session, acting.ctx.tenant_id, acting.ctx.principal_id)
+    return acting
+
+
+async def _acting_unlocked(
     session: AsyncSession, rule: WorkRule, *, trace_run_id: str, causation_id: str | None
 ) -> _Acting:
     if rule.identity_agent_key is not None:
@@ -2039,6 +2054,10 @@ async def process_tenant_events(
     )
     if not events:
         return 0
+    # Every evaluation of the batch shares this transaction, and the task
+    # rows an earlier one locks stay locked until the commit: every principal
+    # a rule may act as goes first (``lock_rule_principals``, CP-ADR-0077 §3).
+    await lock_rule_principals(session, tenant_id)
     rules = (
         await session.scalars(
             select(WorkRule)

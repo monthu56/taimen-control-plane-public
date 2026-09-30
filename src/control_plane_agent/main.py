@@ -56,15 +56,22 @@ import asyncio
 import contextlib
 import inspect
 import logging
+import math
 import os
 import signal
 import time
-from collections.abc import Coroutine
+from collections.abc import Coroutine, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Protocol
 
-from control_plane_agent.blocked import BLOCKED_CATEGORY, FAILURE_REASON, blocked_reason
+from control_plane_agent.blocked import (
+    BLOCKED_CATEGORY,
+    BLOCKED_COMMENT_PREFIX,
+    FAILURE_REASON,
+    blocked_reason,
+)
+from control_plane_agent.comments import own_principal_id, with_comments
 from control_plane_agent.inputs import (
     LocalInput,
     discard_inputs,
@@ -109,7 +116,7 @@ from control_plane_client import (
     PermissionDeniedError,
     SessionExpiredError,
     StaleClaimError,
-    TransportError,
+    is_transient,
     resolve_credential,
 )
 
@@ -121,6 +128,11 @@ WORK_SCAN = 10
 #: How often an idle daemon asks whether its agent has a newer revision; after
 #: a run it asks right away.
 REVISION_CHECK_SECONDS = 30.0
+#: How long a repeatable call of the core (a read, a command with an
+#: Idempotency-Key) is retried while the core is unreachable — a restart
+#: behind the proxy answers 502 for a few seconds. As long as the default
+#: claim TTL: past it the lease is gone anyway, and the run is failed then.
+RETRY_WINDOW_SECONDS = 300.0
 
 
 class _TypeUnreadable(Exception):
@@ -288,6 +300,9 @@ class Agent:
         # Work, and Work whose type is executed by a skill.
         self.skills = skills
         self._executions: dict[str, dict[str, Any] | None] = {}
+        # This principal's id, read once for the comments of a task
+        # (comments.py): its own "blocked" comments are left out of the prompt.
+        self._own_principal: str | None = None
         self._unreadable_types: set[str] = set()
         self._session_lock = asyncio.Lock()
         self._skills_stop = asyncio.Event()
@@ -468,11 +483,11 @@ class Agent:
                 cycles += 1
                 try:
                     worked = await self.run_once()
-                except TransportError as exc:
-                    logger.warning("transport failure, backing off: %s", exc)
-                    worked = False
                 except ControlPlaneError as exc:
-                    logger.warning("cycle error: %s", exc)
+                    if is_transient(exc):
+                        logger.warning("core unreachable, backing off: %s", exc)
+                    else:
+                        logger.warning("cycle error: %s", exc)
                     worked = False
                 if not worked:
                     with contextlib.suppress(TimeoutError):
@@ -619,7 +634,7 @@ class Agent:
                         await self.client.fail_run(str(run["id"]), failure_reason="workspace_busy")
                     return False
                 inputs = await self._fetch_inputs(task, run)
-                task = await self._with_feedback(task)
+                task = await self._with_comments(await self._with_feedback(task))
                 supervisor = RunSupervisor(
                     self.client,
                     str(run["id"]),
@@ -823,7 +838,7 @@ class Agent:
             await self.client.add_task_comment(
                 task_id,
                 body=(
-                    f"The executor stopped without doing the work ({FAILURE_REASON}): {reason}\n"
+                    f"{BLOCKED_COMMENT_PREFIX} ({FAILURE_REASON}): {reason}\n"
                     + (
                         f"The task waits for a person in {status!r}; return it to work "
                         "to have it taken again."
@@ -856,6 +871,12 @@ class Agent:
         if not items or items[0].get("status") != "failed":
             return task
         return {**task, "lastVerification": items[0]}
+
+    async def _with_comments(self, task: dict[str, Any]) -> dict[str, Any]:
+        """The task with its comments for the prompt (``comments.py``)."""
+        if self._own_principal is None:
+            self._own_principal = await own_principal_id(self.client)
+        return await with_comments(self.client, task, own_principal=self._own_principal)
 
     # -- execution workspace ---------------------------------------------------
 
@@ -1070,6 +1091,30 @@ def _agent_from_environment(
     )
 
 
+class RetryWindowError(ValueError):
+    """``CONTROL_PLANE_AGENT_RETRY_WINDOW`` is not a number of seconds."""
+
+
+def retry_window_from_env(environ: Mapping[str, str]) -> float:
+    """``CONTROL_PLANE_AGENT_RETRY_WINDOW``, else :data:`RETRY_WINDOW_SECONDS`.
+
+    A finite number of seconds, zero or more (0 — no retries at all).
+    """
+    raw = environ.get("CONTROL_PLANE_AGENT_RETRY_WINDOW", "").strip()
+    if not raw:
+        return RETRY_WINDOW_SECONDS
+    try:
+        window = float(raw)
+    except ValueError:
+        window = math.nan
+    if not math.isfinite(window) or window < 0:
+        raise RetryWindowError(
+            "CONTROL_PLANE_AGENT_RETRY_WINDOW must be a number of seconds, zero or more "
+            f"(got {raw!r}); unset it for the default of {RETRY_WINDOW_SECONDS:g}"
+        )
+    return window
+
+
 def _env_adapter() -> Adapter | int:  # pragma: no cover - wiring
     adapter_name = os.environ.get("CONTROL_PLANE_AGENT_ADAPTER", "echo")
     try:
@@ -1108,8 +1153,14 @@ def main() -> int:  # pragma: no cover - process entrypoint
         print(exc)
         return EXIT_MISCONFIGURED
 
+    try:
+        retry_window = retry_window_from_env(os.environ)
+    except RetryWindowError as exc:
+        print(exc)
+        return EXIT_MISCONFIGURED
+
     async def _run() -> int:
-        async with ControlPlaneClient(server, credential) as client:
+        async with ControlPlaneClient(server, credential, retry_window=retry_window) as client:
             # A principal bound to an agent must name its revision on every
             # run (CP-ADR-0073 §7), so "auto" is not a convenience: the env
             # mode would fail every start-run of an agent.

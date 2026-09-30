@@ -146,3 +146,24 @@ def error_from_response(status: int, body: dict[str, Any]) -> ControlPlaneError:
     details = envelope.get("details") or {}
     cls = _CODE_MAP.get(code) or _STATUS_MAP.get(status, ControlPlaneError)
     return cls(code, message, status=status, details=details)
+
+
+#: Answers of a proxy or gateway whose upstream is down or restarting: the
+#: Control Plane itself said nothing, so nothing about ownership is known.
+UNAVAILABLE_STATUSES = frozenset({502, 503, 504})
+
+
+def is_transient(exc: BaseException) -> bool:
+    """Is ``exc`` a failure to reach the Control Plane rather than its answer?
+
+    A transport failure, a 502/503/504 of the proxy in front of it, or a 5xx
+    without the server's error envelope (``http_error``) — a restart of the
+    core looks like this for a few seconds. Such a failure is no verdict on a
+    lease or a command and is worth repeating; an answer of the core itself
+    (409, 404, 403, a 500 with its own code) is not.
+    """
+    if isinstance(exc, TransportError):
+        return True
+    if not isinstance(exc, ControlPlaneError):
+        return False
+    return exc.status in UNAVAILABLE_STATUSES or (exc.code == "http_error" and exc.status >= 500)

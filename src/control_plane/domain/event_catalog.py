@@ -319,7 +319,12 @@ _register(
             "iamTenantId": ANY,
             "iamPrincipalId": ANY,
             "permissions": ARR,
-        }
+        },
+        {
+            "previousPrincipalId": described(
+                UUID, "Only when the identity moved from another principal"
+            ),
+        },
     ),
 )
 _register(
@@ -334,12 +339,71 @@ _register(
     "A human delegated permissions to an agent.",
     data({"humanPrincipalId": UUID, "agentPrincipalId": UUID, "permissions": ARR}),
 )
-_register("delegation.revoked", "delegation", "A delegation was revoked.", data())
+_register(
+    "delegation.revoked",
+    "delegation",
+    "A delegation was revoked.",
+    data(),
+    (
+        data(
+            optional={
+                "reason": described(
+                    STR, "principal_disabled when a side of it was disabled (CP-ADR-0077)"
+                )
+            }
+        ),
+        "reason",
+    ),
+)
 _register(
     "principal.created",
     "principal",
     "A principal (human, agent or service) was created.",
     data({"kind": STR, "displayName": STR}),
+)
+_register(
+    "principal.disabled",
+    "principal",
+    "A human or agent principal was disabled: bindings and delegations revoked,"
+    " sessions closed, claims freed, runs failed.",
+    data(
+        {
+            "kind": STR,
+            "previousStatus": described(STR, "active or paused"),
+            "reason": described(
+                {"type": ["string", "null"], "maxLength": PAYLOAD_TEXT_LIMIT},
+                "Reason given; credential-shaped material redacted, cut to the limit",
+            ),
+            "revokedBindings": described(INT, "IAM bindings revoked"),
+            "revokedDelegations": described(INT, "Delegations to or from it revoked"),
+            "closedSessions": described(INT, "Open sessions of it or on its behalf closed"),
+            "releasedClaims": described(INT, "Active claims released to the queue"),
+            "failedRuns": described(INT, "Running runs on the released claims failed"),
+            "withdrawnInvocations": described(
+                INT, "Skill calls on its authority cancelled, leases it held returned"
+            ),
+        }
+    ),
+)
+_register(
+    "principal.enabled",
+    "principal",
+    "A disabled (or paused) human or agent principal was enabled. Only the status"
+    " comes back: bindings, delegations, sessions and claims closed by :disable stay"
+    " closed, IAM entry needs a new binding.",
+    data(
+        {
+            "kind": STR,
+            "previousStatus": described(STR, "disabled or paused"),
+            "reason": described(
+                {"type": ["string", "null"], "maxLength": PAYLOAD_TEXT_LIMIT},
+                "Reason given; credential-shaped material redacted, cut to the limit",
+            ),
+            "liveApiKeys": described(
+                INT, "Unrevoked, unexpired API keys of it, which authenticate again"
+            ),
+        }
+    ),
 )
 _register(
     "tenant.bootstrapped",
@@ -791,6 +855,24 @@ _register(
     ),
 )
 _register(
+    "task.type_migrated",
+    "task",
+    "The task was moved to another version of its type (ADR-0048, amendment 2026-09-30).",
+    data(
+        {
+            "publicId": STR,
+            "typeKey": STR,
+            "fromTypeVersion": INT,
+            "typeVersion": INT,
+            "fromStatus": STR,
+            "status": STR,
+            "systemStatusCategory": STR,
+            "trigger": described(STR, "task (one task) or bulk (:migrate-tasks of a version)"),
+            "version": INT,
+        }
+    ),
+)
+_register(
     "task.claimed",
     "task",
     "An executor claimed the task under a lease.",
@@ -979,7 +1061,25 @@ _register(
     "A work session expired; its claims were released.",
     data({"expiresAt": ANY}, {"releasedClaims": ARR}),
 )
-_register("session.closed", "session", "A work session was closed.", data({"releasedClaims": ARR}))
+_register(
+    "session.closed",
+    "session",
+    "A work session was closed.",
+    data({"releasedClaims": ARR}),
+    (
+        data(
+            {"releasedClaims": ARR},
+            {
+                "reason": described(
+                    STR,
+                    "principal_disabled when its principal, or the human it acted for,"
+                    " was disabled (CP-ADR-0077)",
+                )
+            },
+        ),
+        "reason",
+    ),
+)
 
 _RUN = {"taskId": UUID}
 _RUN_STARTED_V1 = {
@@ -1318,6 +1418,28 @@ _register(
                 "Reason given; credential-shaped material redacted, cut to the limit",
             ),
             "releasedClaims": described(INT, "Active claims of the agent released to the queue"),
+        }
+    ),
+)
+_register(
+    "agent.identity_replaced",
+    "agent",
+    "A service agent moved to a new IAM identity; its principal stayed (CP-ADR-0073).",
+    data(
+        {
+            "key": STR,
+            "revision": described(INT, "The revision whose rights the new identity got"),
+            "principalId": UUID,
+            "issuer": STR,
+            "iamTenantId": UUID,
+            "iamPrincipalId": UUID,
+            "previousIssuer": STR_N,
+            "previousIamTenantId": UUID_N,
+            "previousIamPrincipalId": UUID_N,
+            "reason": described(
+                {"type": "string", "maxLength": PAYLOAD_TEXT_LIMIT},
+                "Reason given; credential-shaped material redacted, cut to the limit",
+            ),
         }
     ),
 )

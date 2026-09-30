@@ -21,6 +21,7 @@ from control_plane.application.queries.lists import Page, _paginate, clamp_limit
 from control_plane.domain.enums import ApprovalStatus, Permission, RunStatus
 from control_plane.domain.errors import NotFoundError, ValidationError
 from control_plane.infrastructure.db.models import (
+    Agent,
     Approval,
     Artifact,
     Capability,
@@ -153,7 +154,16 @@ async def list_runs(
     task_id: uuid.UUID | None = None,
     claim_id: uuid.UUID | None = None,
     status: str | None = None,
+    principal_id: uuid.UUID | None = None,
+    agent_key: str | None = None,
 ) -> Page[Run]:
+    """Runs of the tenant, newest first by ``(started_at, id)``.
+
+    ``agent_key`` narrows to the principal of that registry agent, retired or
+    not (CP-ADR-0073, amendment of 2026-09-29): an unknown key or an agent
+    without a principal yet has no runs, so the page is empty rather than a
+    404 - the listing does not tell a reader of runs which agents exist.
+    """
     await authorize(ctx, Permission.TASKS_READ)
     if status is not None and status not in set(RunStatus):
         raise ValidationError("invalid_status", f"Unknown run status: {status}")
@@ -164,10 +174,21 @@ async def list_runs(
         stmt = stmt.where(Run.claim_id == claim_id)
     if status is not None:
         stmt = stmt.where(Run.status == status)
+    if principal_id is not None:
+        stmt = stmt.where(Run.principal_id == principal_id)
+    if agent_key is not None:
+        agent_principal = await session.scalar(
+            select(Agent.principal_id).where(
+                Agent.tenant_id == ctx.tenant_id, Agent.key == agent_key
+            )
+        )
+        if agent_principal is None:
+            return Page(items=[], next_cursor=None)
+        stmt = stmt.where(Run.principal_id == agent_principal)
     return await _paginate(
         session,
         stmt,
-        created_col=Run.created_at,
+        created_col=Run.started_at,
         id_col=Run.id,
         limit=clamp_limit(limit),
         cursor=cursor,

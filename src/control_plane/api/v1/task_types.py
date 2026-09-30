@@ -15,8 +15,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from control_plane.api.dependencies import AuthDep, DbDep, SessionFactoryDep, SettingsDep
 from control_plane.api.v1.schemas import (
     ERROR_RESPONSES,
+    PACKAGE_FILTER_DESCRIPTION,
     PageOut,
     TaskTypeCreateRequest,
+    TaskTypeMigrateTasksOut,
+    TaskTypeMigrateTasksRequest,
     TaskTypeOut,
     dump,
     page_body,
@@ -24,9 +27,15 @@ from control_plane.api.v1.schemas import (
 )
 from control_plane.api.write_flow import execute_write
 from control_plane.application.authorization import authorize
+from control_plane.application.commands import task_type_migration as migration_commands
 from control_plane.application.commands import task_types as commands
 from control_plane.application.common import make_created_cursor, parse_created_cursor
 from control_plane.application.queries.lists import clamp_limit
+from control_plane.application.queries.package_links import (
+    attach_package,
+    attach_packages,
+    in_package,
+)
 from control_plane.domain.enums import Permission
 from control_plane.infrastructure.db.models import TaskType
 
@@ -64,7 +73,9 @@ async def create_task_type(
             artifact_schema=payload.artifact_schema,
             acceptance=work_document(payload.acceptance),
         )
-        return 201, dump(TaskTypeOut, task_type)
+        return 201, await attach_package(
+            db, ctx.tenant_id, "TaskType", dump(TaskTypeOut, task_type)
+        )
 
     return await execute_write(
         request,
@@ -84,6 +95,7 @@ async def list_task_types(
     cursor: str | None = Query(default=None),
     key: str | None = Query(default=None),
     status: str | None = Query(default=None),
+    package: str | None = Query(default=None, description=PACKAGE_FILTER_DESCRIPTION),
 ) -> JSONResponse:
     await authorize(ctx, Permission.TASK_TYPES_READ)
     effective_limit = clamp_limit(limit)
@@ -92,6 +104,8 @@ async def list_task_types(
         stmt = stmt.where(TaskType.key == key)
     if status is not None:
         stmt = stmt.where(TaskType.status == status)
+    if package is not None:
+        stmt = stmt.where(in_package("TaskType", TaskType.tenant_id, TaskType.key, package))
     if cursor is not None:
         created_at, entity_id = parse_created_cursor(cursor)
         stmt = stmt.where(
@@ -104,13 +118,16 @@ async def list_task_types(
     if len(rows) > effective_limit:
         rows = rows[:effective_limit]
         next_cursor = make_created_cursor(rows[-1].created_at, rows[-1].id)
-    return JSONResponse(page_body([dump(TaskTypeOut, t) for t in rows], next_cursor))
+    items = [dump(TaskTypeOut, t) for t in rows]
+    await attach_packages(db, ctx.tenant_id, "TaskType", items)
+    return JSONResponse(page_body(items, next_cursor))
 
 
 @router.get("/task-types/{type_id}", response_model=TaskTypeOut, responses=ERROR_RESPONSES)
 async def get_task_type(type_id: uuid.UUID, ctx: AuthDep, db: DbDep) -> JSONResponse:
     await authorize(ctx, Permission.TASK_TYPES_READ)
-    return JSONResponse(dump(TaskTypeOut, await commands.get_tenant_task_type(db, ctx, type_id)))
+    body = dump(TaskTypeOut, await commands.get_tenant_task_type(db, ctx, type_id))
+    return JSONResponse(await attach_package(db, ctx.tenant_id, "TaskType", body))
 
 
 @router.post(
@@ -125,8 +142,48 @@ async def deprecate_task_type(
 ) -> JSONResponse:
     async def executor(db: AsyncSession) -> tuple[int, dict[str, object]]:
         task_type = await commands.deprecate_task_type(db, ctx, type_id=type_id)
-        return 200, dump(TaskTypeOut, task_type)
+        return 200, await attach_package(
+            db, ctx.tenant_id, "TaskType", dump(TaskTypeOut, task_type)
+        )
 
     return await execute_write(
         request, ctx, settings, session_factory, canonical_body="", executor=executor
+    )
+
+
+@router.post(
+    "/task-types/{type_id}:migrate-tasks",
+    response_model=TaskTypeMigrateTasksOut,
+    responses=ERROR_RESPONSES,
+    summary="Move the open tasks of this version to another version of its key (ADR-0048)",
+)
+async def migrate_type_tasks(
+    type_id: uuid.UUID,
+    request: Request,
+    ctx: AuthDep,
+    settings: SettingsDep,
+    session_factory: SessionFactoryDep,
+    payload: TaskTypeMigrateTasksRequest | None = None,
+) -> JSONResponse:
+    body = payload or TaskTypeMigrateTasksRequest()
+
+    async def executor(db: AsyncSession) -> tuple[int, dict[str, object]]:
+        result = await migration_commands.migrate_type_tasks(
+            db,
+            ctx,
+            type_id=type_id,
+            to_version=body.to_version,
+            status_map=body.status_map,
+            limit=body.limit,
+            cursor=body.cursor,
+        )
+        return 200, result
+
+    return await execute_write(
+        request,
+        ctx,
+        settings,
+        session_factory,
+        canonical_body=body.model_dump_json(exclude_unset=True),
+        executor=executor,
     )

@@ -508,3 +508,60 @@ async def test_an_agent_binding_admits_despite_a_cached_refusal(
     )
     assert retired.status_code == 200, retired.text
     assert (await iam_client.get("/api/v1/tasks", headers=auth(token))).status_code == 401
+
+
+async def test_a_replaced_agent_identity_switches_entry_despite_a_warm_cache(
+    iam_app: FastAPI, iam_client: httpx.AsyncClient, signing_key: SigningKey
+) -> None:
+    """``identity:replace`` (CP-ADR-0073, amendment 2026-09-30) drops both cache entries.
+
+    The re-created service account knocks before the registry knows it, and
+    the previous one was just admitted: neither answer may outlive the switch.
+    """
+    enable_iam(iam_app, signing_key, ttl_seconds=600.0)
+    admin_key = (await do_bootstrap(iam_client))["apiKey"]["key"]
+    spec = {
+        "displayName": "Notifier",
+        "identity": {"kind": "service", "permissions": ["tasks.read"]},
+        "placement": "none",
+    }
+    published = await iam_client.post(
+        "/api/v1/agents", json={"key": "notifier", "spec": spec}, headers=auth(admin_key)
+    )
+    assert published.status_code == 201, published.text
+    iam_tenant, old_principal, new_principal = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
+    old_token, new_token = (
+        signing_key.issue(
+            subject=subject, tenant_id=iam_tenant, scopes=[SCOPE_READ], ttl_seconds=3600
+        )
+        for subject in (old_principal, new_principal)
+    )
+    linked = await iam_client.put(
+        "/api/v1/agents/notifier/identity",
+        json={
+            "issuer": ISSUER,
+            "iamTenantId": str(iam_tenant),
+            "iamPrincipalId": str(old_principal),
+        },
+        headers=auth(admin_key),
+    )
+    assert linked.status_code == 200, linked.text
+    assert (await iam_client.get("/api/v1/tasks", headers=auth(old_token))).status_code == 200
+    assert (await iam_client.get("/api/v1/tasks", headers=auth(new_token))).status_code == 401
+
+    replaced = await iam_client.post(
+        "/api/v1/agents/notifier/identity:replace",
+        json={
+            "issuer": ISSUER,
+            "iamTenantId": str(iam_tenant),
+            "iamPrincipalId": str(new_principal),
+            "reason": "service account re-created",
+        },
+        headers=auth(admin_key),
+    )
+    assert replaced.status_code == 200, replaced.text
+    assert (await iam_client.get("/api/v1/tasks", headers=auth(old_token))).status_code == 401
+    assert (await iam_client.get("/api/v1/tasks", headers=auth(new_token))).status_code == 200
+    me = await iam_client.get("/api/v1/agents/me", headers=auth(new_token))
+    assert me.status_code == 200, me.text
+    assert me.json()["principalId"] == linked.json()["principalId"]

@@ -42,6 +42,7 @@ from control_plane.application.commands.task_types import (
 )
 from control_plane.application.common import new_uuid, utcnow
 from control_plane.application.events import record_event
+from control_plane.application.locking import lock_claim_session, lock_principals_key_share
 from control_plane.domain.enums import (
     ClaimStatus,
     Permission,
@@ -222,6 +223,11 @@ async def create_task(
     validate_planned_dates(start_date, due_date)
 
     assignee_id = await resolve_assignee(session, ctx.tenant_id, assignee_id, field=assignee_field)
+    # Principals the new task references (rule 3 of ``application/locking.py``,
+    # CP-ADR-0077 §3): taken before any row of its own. A caller that already
+    # holds another task (an outcome, a rule, a launch) must take them earlier
+    # still; this keeps the task's own writes in order.
+    await lock_principals_key_share(session, ctx.tenant_id, [owner_id, assignee_id])
     for ref in (owner_id, assignee_id):
         if ref is not None:
             await get_tenant_principal(session, ctx, ref)
@@ -488,6 +494,17 @@ async def update_task(
     evidence: list[dict[str, Any]] | Any = _UNSET,
 ) -> Task:
     await authorize(ctx, Permission.TASKS_WRITE)
+    if isinstance(assignee_id, str):
+        assignee_id = await agent_principal(session, ctx.tenant_id, assignee_id, field="assigneeId")
+    # Principals the task will reference, before the task (rule 3 of
+    # ``application/locking.py``, CP-ADR-0077 §3): their foreign-key lock would
+    # otherwise come after the task row, which ``:disable`` of one of them may
+    # be waiting for while holding the principal.
+    await lock_principals_key_share(
+        session,
+        ctx.tenant_id,
+        [v for v in (owner_id, assignee_id) if isinstance(v, uuid.UUID)],
+    )
     task = await resolve_task_for_update(session, ctx, task_ref)
     await authorize(ctx, Permission.TASKS_WRITE, resource=ResourceRef("task", str(task.id)))
     check_expected_version(task, expected_version)
@@ -507,8 +524,6 @@ async def update_task(
     previous_status = task.status
     if status is not _UNSET:
         changes.update(await _plan_transition(session, task, str(status)))
-    if isinstance(assignee_id, str):
-        assignee_id = await agent_principal(session, ctx.tenant_id, assignee_id, field="assigneeId")
     for field_name, value in (("owner_id", owner_id), ("assignee_id", assignee_id)):
         if value is not _UNSET:
             if value is not None:
@@ -645,6 +660,11 @@ async def complete_task(
     implicit_checks: list[dict[str, Any]] | None = None,
 ) -> Task:
     await authorize(ctx, Permission.TASKS_WRITE)
+    # The claim's session before the task (rule 2 of ``application/locking.py``,
+    # CP-ADR-0077 §3): ``:disable`` of the principal a session acts for holds
+    # it before the task. The completer itself — referenced by the attempt and
+    # the completion work written below — was locked by the write flow (rule 1).
+    await lock_claim_session(session, ctx.tenant_id, claim_id)
     task = await resolve_task_for_update(session, ctx, task_ref)
     await authorize(ctx, Permission.TASKS_WRITE, resource=ResourceRef("task", str(task.id)))
     check_expected_version(task, expected_version)
@@ -720,11 +740,14 @@ async def get_running_run_locked(session: AsyncSession, task: Task) -> Run | Non
     return run
 
 
-async def supersede_run(session: AsyncSession, ctx: AuthContext, task: Task, run: Run) -> None:
-    """Fail a (locked) zombie run left behind by a previous claim epoch."""
+async def supersede_run(
+    session: AsyncSession, ctx: AuthContext, task: Task, run: Run, *, reason: str = "superseded"
+) -> None:
+    """Fail a (locked) run whose claim is gone: a zombie left behind by a
+    previous claim epoch, or a run of a principal that was disabled."""
     now = utcnow()
     run.status = RunStatus.FAILED
-    run.failure_reason = "superseded"
+    run.failure_reason = reason
     run.finished_at = now
     run.updated_at = now
     run.version += 1
@@ -739,7 +762,7 @@ async def supersede_run(session: AsyncSession, ctx: AuthContext, task: Task, run
         request_id=ctx.request_id,
         correlation_id=ctx.correlation_id,
         trace_run_id=ctx.trace_run_id,
-        payload={"taskId": str(task.id), "reason": "superseded", "attempt": run.attempt},
+        payload={"taskId": str(task.id), "reason": reason, "attempt": run.attempt},
     )
 
 

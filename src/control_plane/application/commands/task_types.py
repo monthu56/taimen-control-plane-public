@@ -5,7 +5,9 @@ project template (ADR-0030): the only mutation the database trigger permits is
 ``active -> deprecated``. Editing a type therefore always means "create the
 next version", and a task keeps pointing at the exact version it was created
 against — which is what makes it safe to let a tenant reshape its process
-while work is in flight.
+while work is in flight. Moving an open task to another version of its key is
+a separate, explicit action (``task_type_migration``, ADR-0048 amendment
+2026-09-30).
 """
 
 import uuid

@@ -27,6 +27,7 @@ from control_plane.application.commands._child_ceiling import enforce_run_ceilin
 from control_plane.application.commands.tasks import enforce_claim_gate
 from control_plane.application.common import new_uuid, utcnow
 from control_plane.application.events import record_event
+from control_plane.application.locking import lock_session_key_share
 from control_plane.application.queries.tool_policy import (
     resolve_effective_tool_policy,
     resolve_tool_decision,
@@ -58,12 +59,21 @@ logger = logging.getLogger(__name__)
 async def _locked_owned_running_run(
     session: AsyncSession, ctx: AuthContext, run_id: uuid.UUID
 ) -> tuple[Task, Run]:
-    """Lock task then run; require RUNNING status, ownership and a live claim."""
+    """Lock task then run; require RUNNING status, ownership and a live claim.
+
+    The run's session goes before the task (rule 2 of
+    ``application/locking.py``, CP-ADR-0077 §3): the checkpoint or action
+    written next references the run's session and principal, and
+    ``principals/{id}:disable`` of whoever the session acts for holds the
+    session before the task. The caller's principal is already locked by the
+    write flow (rule 1).
+    """
     run_probe = await session.scalar(
         select(Run).where(Run.id == run_id, Run.tenant_id == ctx.tenant_id)
     )
     if run_probe is None:
         raise NotFoundError("Run not found", details={"runId": str(run_id)})
+    await lock_session_key_share(session, ctx.tenant_id, run_probe.session_id)
     task = await session.scalar(select(Task).where(Task.id == run_probe.task_id).with_for_update())
     run = await session.scalar(
         select(Run)

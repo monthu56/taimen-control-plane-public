@@ -37,6 +37,7 @@ from control_plane.application.commands.relations import resolve_task
 from control_plane.application.commands.task_types import task_type_of
 from control_plane.application.common import clamp_ttl, new_uuid, utcnow
 from control_plane.application.events import record_event
+from control_plane.application.locking import lock_principal_key_share
 from control_plane.application.queries.approval_gates import pending_gate_approvals
 from control_plane.application.queries.tool_policy import (
     decide_for_skill,
@@ -870,6 +871,70 @@ async def revoke_lost_basis(
     return reason
 
 
+async def withdraw_principal_invocations(
+    session: AsyncSession, ctx: AuthContext, *, principal_id: uuid.UUID, reason: str
+) -> int:
+    """Stop the live calls of a principal that leaves (CP-ADR-0077).
+
+    A call made on its authority loses its basis: cancelled (``basis_revoked``)
+    whether it waits or runs, so no executor performs it later. A lease it holds
+    as executor on someone else's call goes back the way an expired one does
+    (``_retry_or_fail``): the attempt is spent, the call retries if it may.
+    The caller already holds the task, claim and run locks it needs; call rows
+    are locked last. Returns how many calls were touched.
+    """
+    rows = (
+        await session.scalars(
+            select(SkillInvocation)
+            .where(
+                SkillInvocation.tenant_id == ctx.tenant_id,
+                SkillInvocation.status.in_(LIVE_STATUSES),
+                or_(
+                    SkillInvocation.authority_principal_id == principal_id,
+                    and_(
+                        SkillInvocation.status == SkillInvocationStatus.RUNNING,
+                        SkillInvocation.executor_principal_id == principal_id,
+                    ),
+                ),
+            )
+            .order_by(SkillInvocation.id)
+            .with_for_update()
+        )
+    ).all()
+    for invocation in rows:
+        skill = await session.get(Skill, invocation.skill_id)
+        assert skill is not None
+        if invocation.authority_principal_id == principal_id:
+            await _finish_cancelled(
+                session,
+                invocation,
+                skill,
+                reason=reason,
+                code="basis_revoked",
+                initiator=CANCELLED_BY_SYSTEM,
+                actor_id=ctx.principal_id,
+                request_id=ctx.request_id,
+                correlation_id=ctx.correlation_id,
+                trace_run_id=ctx.trace_run_id,
+            )
+        else:
+            await _retry_or_fail(
+                session,
+                invocation,
+                error={
+                    "code": reason,
+                    "retryable": True,
+                    "message": "The executor holding the lease was disabled",
+                },
+                actor_id=ctx.principal_id,
+                request_id=ctx.request_id,
+                correlation_id=ctx.correlation_id,
+                trace_run_id=ctx.trace_run_id,
+                skill=skill,
+            )
+    return len(rows)
+
+
 _ORIGIN_RE = re.compile(r"^https?://(\[[0-9a-f:.]+\]|[a-z0-9.-]+)(:[0-9]{1,5})?$")
 _STDIO_RE = re.compile(r"^stdio:[A-Za-z0-9_.-]{1,100}$")
 
@@ -1097,6 +1162,8 @@ async def _locked_own_lease(
     invocation_id: uuid.UUID,
     fencing_token: int,
     session_id: uuid.UUID | None,
+    *,
+    lock_authority: bool = False,
 ) -> tuple[SkillInvocation, Skill]:
     """Lock the row and prove the caller still holds the current lease.
 
@@ -1105,8 +1172,42 @@ async def _locked_own_lease(
     claimed — is ``409 stale_invocation_lease``: the caller must stop, whatever
     it computed is no longer authoritative. A lease taken under a session is
     held by that session, not by every process sharing the API key.
+
+    Lock order: the executor session (``FOR SHARE``) before the call row, as in
+    ``claim_skill_invocation``. ``principals/{id}:disable`` locks sessions
+    ``FOR UPDATE`` and call rows last (CP-ADR-0077 §3); taking the call row
+    first here would deadlock a heartbeat against the disable of its executor.
+
+    ``lock_authority`` (``:complete``) puts the call's authority principal
+    (``FOR KEY SHARE``) in front of both: the result artifact it inserts is
+    authored by that principal and points at the call's task and run, so its
+    foreign-key checks would otherwise take those rows last, after the call
+    row, while ``:disable`` of the authority holds them and waits for the call.
+    ``authority_principal_id`` never changes, so it is read without a lock.
     """
     await authorize(ctx, Permission.SKILLS_EXECUTE)
+    if lock_authority:
+        authority_id = await session.scalar(
+            select(SkillInvocation.authority_principal_id).where(
+                SkillInvocation.id == invocation_id,
+                SkillInvocation.tenant_id == ctx.tenant_id,
+            )
+        )
+        if authority_id is not None:
+            await lock_principal_key_share(session, ctx.tenant_id, authority_id)
+    if session_id is not None:
+        # Only the lock, and only on the caller's own session: whether it may
+        # hold this lease is checked below, after the lease itself, so a stale
+        # lease stays 409 as before.
+        await session.execute(
+            select(Session.id)
+            .where(
+                Session.id == session_id,
+                Session.tenant_id == ctx.tenant_id,
+                Session.principal_id == ctx.principal_id,
+            )
+            .with_for_update(read=True)
+        )
     invocation = await session.scalar(
         select(SkillInvocation)
         .where(
@@ -1196,7 +1297,7 @@ async def complete_skill_invocation(
 ) -> tuple[SkillInvocation, Skill]:
     """Accept a result — after checking it against the contract ourselves."""
     invocation, skill = await _locked_own_lease(
-        session, ctx, invocation_id, fencing_token, session_id
+        session, ctx, invocation_id, fencing_token, session_id, lock_authority=True
     )
     assert skill.contract is not None
     guard_json_document(output, label="output", max_bytes=MAX_PAYLOAD_BYTES)

@@ -25,6 +25,7 @@ from control_plane.application.commands.task_types import lifecycle_of
 from control_plane.application.commands.tasks import resolve_task_for_update
 from control_plane.application.common import clamp_ttl, new_uuid, utcnow
 from control_plane.application.events import record_event
+from control_plane.application.locking import lock_caller
 from control_plane.config import Settings
 from control_plane.domain.enums import ClaimStatus, Permission, SessionStatus
 from control_plane.domain.errors import (
@@ -46,7 +47,16 @@ async def _require_live_own_session(
     task -> claim, same as close_session), so a concurrent session close
     cannot slip between validation and claim creation and leave an active
     claim attached to a closed session.
+
+    The caller's principal goes before the session (``lock_caller``, rule 1
+    of ``application/locking.py``): the claim inserted later references it as
+    its holder, and ``principals/{id}:disable`` locks the principal before the
+    session (CP-ADR-0077 §3). The HTTP write flow has already taken it; taken
+    again here it costs nothing and keeps the command safe for any other
+    caller. It also re-reads the status: a principal disabled while the request
+    was in flight takes no claim.
     """
+    await lock_caller(session, ctx)
     work_session = await session.scalar(
         select(Session)
         .where(Session.id == session_id, Session.tenant_id == ctx.tenant_id)

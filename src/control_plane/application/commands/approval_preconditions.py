@@ -175,20 +175,25 @@ async def _unmet(
     return None if holds else unmet(CAUSE_CONDITION_FALSE, observation_id)
 
 
-async def require_preconditions(
+async def read_preconditions(
     session: AsyncSession, ctx: AuthContext, approval: Approval
-) -> None:
-    """Refuse ``approve`` of a gate whose type's preconditions do not hold."""
+) -> tuple[tuple[Precondition, ...], DecisionContext] | None:
+    """The preconditions of an ``approve`` and their context, read as ``ctx``.
+
+    Refused (403) when the decider may not read what the expressions
+    reference; ``POST /authz:check`` asks this for ``approve`` without
+    evaluating the preconditions (CP-ADR-0055, amendment of 2026-09-29).
+    """
     if not approval.gate or approval.task_id is None:
-        return
+        return None
     task = await session.get(Task, approval.task_id)
     if task is None:  # pragma: no cover - forbidden by the foreign key
-        return
+        return None
     task_type = await task_type_of(session, task)
     schema = parse_approval_schema(dict(task_type.approval_schema or {}))
     preconditions = schema.preconditions_for(DEFAULT_GATE, "approved")
     if not preconditions:
-        return
+        return None
     context = await base_context(session, approval, "approved")
     await read_context(
         session,
@@ -197,6 +202,17 @@ async def require_preconditions(
         (),
         extra=tuple(path for item in preconditions for path in item.paths()),
     )
+    return preconditions, context
+
+
+async def require_preconditions(
+    session: AsyncSession, ctx: AuthContext, approval: Approval
+) -> None:
+    """Refuse ``approve`` of a gate whose type's preconditions do not hold."""
+    read = await read_preconditions(session, ctx, approval)
+    if read is None:
+        return
+    preconditions, context = read
     failed = [
         unmet
         for index, precondition in enumerate(preconditions)

@@ -15,7 +15,7 @@ from datetime import UTC, datetime
 from enum import StrEnum
 from typing import Any
 
-from control_plane.domain.errors import ValidationError
+from control_plane.domain.errors import ConflictError, ValidationError
 from control_plane.domain.project import (
     Lifecycle,
     parse_lifecycle,
@@ -268,6 +268,85 @@ def transition_targets(lifecycle: WorkItemLifecycle, status_key: str) -> list[Tr
         for target in lifecycle.targets_from(status_key)
         if target != status_key
     ]
+
+
+# --- moving a task to another version of its type (ADR-0048, amendment 2026-09-30)
+
+
+def validate_status_map(
+    source: WorkItemLifecycle, target: WorkItemLifecycle, status_map: Any
+) -> dict[str, str]:
+    """``statusMap`` of a type migration: status of ``source`` -> status of ``target``.
+
+    A key the source version does not declare is refused rather than ignored:
+    a typo there would otherwise silently leave the tasks unmapped.
+
+    Every value is checked, not only the one the task needs: a bulk migration
+    applies one map to many tasks, and a map that would strand some of them in
+    an undeclared status is wrong as a whole. A value must be non-terminal —
+    a migration is not a way to close work.
+    """
+    if status_map is None:
+        return {}
+    if not isinstance(status_map, dict):
+        raise ValidationError("invalid_status_map", "statusMap must be an object")
+    result: dict[str, str] = {}
+    for key, value in status_map.items():
+        if not isinstance(key, str) or not key or not isinstance(value, str):
+            raise ValidationError(
+                "invalid_status_map",
+                "statusMap maps status keys to status keys",
+                details={"field": f"statusMap.{key}"},
+            )
+        if not source.declares(key):
+            raise ValidationError(
+                "invalid_status_map",
+                f"statusMap: {key!r} is not declared by the source version",
+                details={
+                    "field": f"statusMap.{key}",
+                    "statusKey": key,
+                    "known": sorted(source.statuses),
+                },
+            )
+        if not target.declares(value):
+            raise ValidationError(
+                "invalid_status_map",
+                f"statusMap.{key}: {value!r} is not declared by the target version",
+                details={
+                    "field": f"statusMap.{key}",
+                    "statusKey": value,
+                    "known": sorted(target.statuses),
+                },
+            )
+        if target.is_terminal(value):
+            raise ValidationError(
+                "invalid_status_map",
+                f"statusMap.{key}: {value!r} is terminal; a migration does not close work",
+                details={"field": f"statusMap.{key}", "statusKey": value},
+            )
+        result[key] = value
+    return result
+
+
+def migrated_status(target: WorkItemLifecycle, current: str, status_map: dict[str, str]) -> str:
+    """The status a task in ``current`` gets under ``target``.
+
+    The explicit mapping wins; otherwise the same key, if ``target`` declares
+    it as a non-terminal status. Anything else is ``409 incompatible_status``:
+    the caller has to say where the task goes, core does not guess.
+    """
+    status = status_map.get(current, current)
+    if target.declares(status) and not target.is_terminal(status):
+        return status
+    raise ConflictError(
+        "incompatible_status",
+        f"Status {current!r} has no non-terminal counterpart in the target version; "
+        "map it in statusMap",
+        details={
+            "statusKey": current,
+            "known": sorted(k for k in target.statuses if not target.is_terminal(k)),
+        },
+    )
 
 
 def parse_work_item_lifecycle(schema: Any) -> WorkItemLifecycle:

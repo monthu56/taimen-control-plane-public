@@ -11,13 +11,18 @@ Both readers take the same narrowing filters (CP-ADR-0068): ``types`` —
 event type prefixes, ``workspaceId`` — the events of a workspace subtree,
 ``events.read`` checked on that workspace. A filter never changes the order
 or the meaning of a cursor: a filtered reader resumes where it stopped.
+
+The page reads backward too (CP-ADR-0024, amendment 2026-09-29):
+``before=<cursor>`` gives the events strictly before it, ``prevCursor`` of a
+page is the ``before`` of the preceding one; ``order=desc`` only flips the
+items of a page, never which events it holds.
 """
 
 import asyncio
 import contextlib
 import logging
 import uuid
-from typing import cast
+from typing import Literal, cast
 
 from fastapi import APIRouter, Query, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse
@@ -61,6 +66,8 @@ async def list_events(
     limit: int | None = Query(default=None),
     cursor: str | None = Query(default=None),
     after: int | None = Query(default=None, ge=0),
+    before: str | None = Query(default=None),
+    order: Literal["asc", "desc"] = Query(default="asc"),
     tail: int | None = Query(default=None, ge=1),
     entity_type: str | None = Query(default=None, alias="entityType"),
     entity_id: uuid.UUID | None = Query(default=None, alias="entityId"),
@@ -73,6 +80,7 @@ async def list_events(
         limit=limit,
         cursor=cursor,
         after=after,
+        before=before,
         tail=tail,
         entity_type=entity_type,
         entity_id=entity_id,
@@ -81,10 +89,14 @@ async def list_events(
     )
     observability.inc("event_replay_requests_total")
     observability.inc("event_replay_events_total", len(page.events))
+    items = [_event_body(e) for e in page.events]
+    if order == "desc":
+        items.reverse()
     return JSONResponse(
         {
-            "items": [_event_body(e) for e in page.events],
+            "items": items,
             "nextCursor": page.next_cursor,
+            "prevCursor": page.prev_cursor,
             "hasMore": page.has_more,
         }
     )

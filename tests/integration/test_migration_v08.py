@@ -30,8 +30,9 @@ V08_TYPES = "c8a51d70b394"
 # Second revision of the v0.8 line: custom fields and planned dates (ADR-0049).
 V08_FIELDS = "a1c7e94b2f60"
 # The current head of the chain the v0.8 tests upgrade back to (the last
-# revision lets a published skill move its endpoint, ADR-0056 amendment 2026-09-29).
-V08_HEAD = "e6b3d8f1a2c9"
+# revision links every catalog kind to its package, CP-ADR-0074 amendment of
+# 2026-09-29, on top of the runs per executor index of the same day).
+V08_HEAD = "b5d1e7a3c9f4"
 # The revision right before the agent registry.
 BEFORE_AGENT_REGISTRY = "c3f8a2d6e1b7"
 # The revision right before attention feedback (CP-ADR-0068 approval workspaces).
@@ -365,6 +366,36 @@ async def test_process_recalls_revision_is_additive_and_reversible(
             text("SELECT context_profile FROM tasks WHERE id = :id"), {"id": task["id"]}
         ).scalar_one()
     assert profile is None
+
+
+# The source of an agent revision (CP-ADR-0073, amendment 2026-09-29) and the
+# revision right before it.
+BEFORE_AGENT_REVISION_SOURCE = "e3b7d1a9c5f2"
+
+
+async def test_agent_revision_source_is_additive_and_reversible(
+    client: httpx.AsyncClient, sync_engine: Engine, v08_alembic_config: Config
+) -> None:
+    """Revisions from before the step read as unknown: the immutable rows are not rewritten."""
+    admin_key = (await do_bootstrap(client))["apiKey"]["key"]
+    spec = {
+        "displayName": "Bridge",
+        "identity": {"kind": "service", "permissions": ["tasks.read"]},
+        "placement": "none",
+    }
+    published = await client.post(
+        "/api/v1/agents", json={"key": "bridge", "spec": spec}, headers=auth(admin_key)
+    )
+    assert published.status_code == 201, published.text
+
+    alembic_command.downgrade(v08_alembic_config, BEFORE_AGENT_REVISION_SOURCE)
+    columns = {c["name"] for c in inspect(sync_engine).get_columns("agent_revisions")}
+    assert not {"source_kind", "source_package_key", "source_package_version"} & columns
+    alembic_command.upgrade(v08_alembic_config, V08_HEAD)
+
+    history = await client.get("/api/v1/agents/bridge/revisions", headers=auth(admin_key))
+    assert history.status_code == 200, history.text
+    assert [i["source"] for i in history.json()["items"]] == [{"kind": "unknown", "package": None}]
 
 
 async def test_head_matches_code(sync_engine: Engine) -> None:

@@ -342,8 +342,15 @@ async def test_the_sdk_speaks_the_agents_contract(client: httpx.AsyncClient, sdk
         first = await admin.publish_agent("echo", spec)
         assert first["currentRevision"] == 1
         assert (await admin.publish_agent("echo", spec))["currentRevision"] == 1
-        second = await admin.publish_agent("echo", {**spec, "description": "v2"})
+        second = await admin.publish_agent(
+            "echo", {**spec, "description": "v2"}, package={"key": "selfdev", "version": "1.2.0"}
+        )
         assert second["revision"]["revision"] == 2
+        history = await admin.list_agent_revisions("echo", limit=1)
+        assert [r["revision"] for r in history["items"]] == [2]
+        assert history["items"][0]["source"]["package"] == {"key": "selfdev", "version": "1.2.0"}
+        rest = await admin.list_agent_revisions("echo", cursor=history["nextCursor"])
+        assert ([r["revision"] for r in rest["items"]], rest["nextCursor"]) == ([1], None)
         assert (await admin.get_agent("echo@1"))["revision"]["id"] == first["revision"]["id"]
         assert [a["key"] for a in (await admin.list_agents(status="active"))["items"]] == ["echo"]
         assert (await admin.update_agent_state("echo", replicas=2))["replicas"] == 2
@@ -364,5 +371,42 @@ async def test_the_sdk_speaks_the_agents_contract(client: httpx.AsyncClient, sdk
         )
         assert reported["phase"] == "running"
         assert (await admin.get_agent_status("echo"))["observedRevision"] == 2
+        page = await admin.list_agents(status="active", include="status")
+        assert [a["observedStatus"] for a in page["items"]] == [
+            await admin.get_agent_status("echo")
+        ]
         retired = await admin.retire_agent("echo", reason="replaced")
         assert retired["status"] == "retired"
+
+
+async def test_the_sdk_moves_a_service_agent_to_a_new_identity(
+    client: httpx.AsyncClient, sdk: Make
+) -> None:
+    admin_key = (await do_bootstrap(client))["apiKey"]["key"]
+    spec = {
+        "displayName": "Notifier",
+        "identity": {"kind": "service", "permissions": ["tasks.read"]},
+        "placement": "none",
+    }
+
+    async with sdk(admin_key) as admin:
+        await admin.publish_agent("notifier", spec)
+        linked = await admin.link_agent_identity(
+            "notifier",
+            issuer="https://iam.example.test",
+            iam_tenant_id="5f0c9a52-1a8e-4c43-9a55-3d1b8c1e0a01",
+            iam_principal_id="5f0c9a52-1a8e-4c43-9a55-3d1b8c1e0a02",
+        )
+        replaced = await admin.replace_agent_identity(
+            "notifier",
+            issuer="https://iam.example.test",
+            iam_tenant_id="5f0c9a52-1a8e-4c43-9a55-3d1b8c1e0a01",
+            iam_principal_id="5f0c9a52-1a8e-4c43-9a55-3d1b8c1e0a03",
+            reason="service account re-created",
+        )
+        assert replaced["principalId"] == linked["principalId"]
+        bindings = await admin.list_iam_bindings(linked["principalId"])
+        assert sorted((b["iamPrincipalId"][-2:], b["status"]) for b in bindings["items"]) == [
+            ("02", "revoked"),
+            ("03", "active"),
+        ]

@@ -22,6 +22,14 @@ cursor from the origin), which is the documented one-time migration advice.
 The journal page for `/events` always returns a ``nextCursor`` (echoing the
 input cursor when nothing new is visible) plus ``hasMore``, so followers can
 poll without interpreting cursor internals.
+
+Reading backward (``before=<cursor>``, and ``tail`` which is a backward read
+from the horizon) walks the same ``(tx_id, sequence)`` order in reverse, hot
+journal first, then the archive, and hands out ``prevCursor`` — the oldest
+event of the page — as the ``before`` of the preceding page (CP-ADR-0024,
+amendment 2026-09-29). Everything strictly below a delivered position is
+already final (point 2 of event_cursor.py), so a backward walk can neither
+skip nor repeat an event.
 """
 
 import re
@@ -49,11 +57,13 @@ from control_plane.application.commands.workspaces import (
     workspace_subtree_ids,
 )
 from control_plane.application.event_cursor import (
+    ORIGIN,
     EventCursor,
     EventPosition,
     LegacyFloor,
     decode_cursor,
     encode_cursor,
+    encode_position,
 )
 from control_plane.application.queries.lists import clamp_limit
 from control_plane.domain.enums import Permission
@@ -356,6 +366,119 @@ async def _fetch_page(
     return _Page(events=events, journal_floor=journal_floor)
 
 
+def _archive_before_stmt(
+    *,
+    tenant_id: uuid.UUID,
+    before: EventPosition | None,
+    limit: int,
+    filters: EventFilter,
+) -> Select[tuple[EventArchive]]:
+    stmt = (
+        select(EventArchive)
+        .where(EventArchive.tenant_id == tenant_id)
+        .order_by(EventArchive.tx_id.desc(), EventArchive.sequence.desc())
+        .limit(limit)
+    )
+    if before is not None:
+        stmt = stmt.where(
+            tuple_(EventArchive.tx_id, EventArchive.sequence) < (before.tx_id, before.sequence)
+        )
+    return filters.apply(stmt, EventArchive)
+
+
+def _hot_before_stmt(
+    *,
+    tenant_id: uuid.UUID,
+    before: EventPosition | None,
+    limit: int,
+    filters: EventFilter,
+) -> Select[tuple[Event]]:
+    stmt = (
+        select(Event)
+        .where(Event.tenant_id == tenant_id, Event.tx_id < _stable_horizon())
+        .order_by(Event.tx_id.desc(), Event.sequence.desc())
+        .limit(limit)
+    )
+    if before is not None:
+        stmt = stmt.where(tuple_(Event.tx_id, Event.sequence) < (before.tx_id, before.sequence))
+    return filters.apply(stmt, Event)
+
+
+async def fetch_events_before(
+    session: AsyncSession,
+    *,
+    tenant_id: uuid.UUID,
+    before: EventPosition | None,
+    limit: int,
+    filters: EventFilter | None = None,
+) -> list[JournalEvent]:
+    """Up to ``limit`` stable events strictly below ``before``, NEWEST FIRST.
+
+    ``before=None`` reads back from the stable horizon (the tail). Hot rows
+    all sort above the journal floor and archived rows at or below it, so
+    "hot first, then archive" keeps the reverse order. A concurrent archive
+    run is handled as in :func:`fetch_events_after`: the page is redone once
+    if the floor moved while it was assembled.
+    """
+    filters = filters or EventFilter()
+    page = await _fetch_page_before(
+        session, tenant_id=tenant_id, before=before, limit=limit, filters=filters
+    )
+    journal_floor, _archive_floor = await journal_floors(session, tenant_id)
+    if page.floor_moved(journal_floor):
+        page = await _fetch_page_before(
+            session, tenant_id=tenant_id, before=before, limit=limit, filters=filters
+        )
+    return page.events
+
+
+async def _fetch_page_before(
+    session: AsyncSession,
+    *,
+    tenant_id: uuid.UUID,
+    before: EventPosition | None,
+    limit: int,
+    filters: EventFilter,
+) -> _Page:
+    journal_floor, archive_floor = await journal_floors(session, tenant_id)
+    if (
+        before is not None
+        and archive_floor > ORIGIN
+        and (before.tx_id, before.sequence) <= (archive_floor.tx_id, archive_floor.sequence)
+    ):
+        # Everything below such a cursor was pruned: an empty page would read
+        # as "start of the journal reached", which is not what happened.
+        raise ValidationError(
+            "cursor_below_journal_floor",
+            "The requested cursor is older than the retained journal",
+            details={
+                "floorCursor": encode_cursor(archive_floor),
+                "requestedCursor": encode_cursor(before),
+            },
+        )
+    events: list[JournalEvent] = list(
+        (
+            await session.scalars(
+                _hot_before_stmt(tenant_id=tenant_id, before=before, limit=limit, filters=filters)
+            )
+        ).all()
+    )
+    if len(events) < limit and journal_floor > ORIGIN:
+        events.extend(
+            (
+                await session.scalars(
+                    _archive_before_stmt(
+                        tenant_id=tenant_id,
+                        before=before,
+                        limit=limit - len(events),
+                        filters=filters,
+                    )
+                )
+            ).all()
+        )
+    return _Page(events=events, journal_floor=journal_floor)
+
+
 async def current_position(session: AsyncSession, tenant_id: uuid.UUID) -> EventPosition:
     """Highest delivered-or-deliverable position for the tenant right now.
 
@@ -384,9 +507,28 @@ async def current_position(session: AsyncSession, tenant_id: uuid.UUID) -> Event
 
 @dataclass(frozen=True)
 class EventPage:
+    """One journal page, events always in delivery (ascending) order.
+
+    ``prev_cursor`` is the ``before`` of the preceding page. Backward reads
+    (``before``, ``tail``) know exactly whether something precedes the page
+    and give ``None`` at the start of the journal; a forward page gives the
+    cursor of its first event (the page before it may turn out empty) and
+    ``None`` when it is empty.
+    """
+
     events: list[JournalEvent]
     next_cursor: str
     has_more: bool
+    prev_cursor: str | None = None
+
+
+def _conflicting_cursors(*names: str) -> ValidationError:
+    return ValidationError(
+        "conflicting_cursors",
+        "A page is read either forward or backward: give one of "
+        + ", ".join(f"'{n}'" for n in names),
+        details={"parameters": list(names)},
+    )
 
 
 async def list_events(
@@ -396,12 +538,30 @@ async def list_events(
     limit: int | None = None,
     cursor: str | None = None,
     after: int | None = None,
+    before: str | None = None,
     tail: int | None = None,
     entity_type: str | None = None,
     entity_id: uuid.UUID | None = None,
     types: tuple[str, ...] = (),
     workspace_id: uuid.UUID | None = None,
 ) -> EventPage:
+    backward_to: EventPosition | None = None
+    if before is not None:
+        given = [
+            name
+            for name, value in (("cursor", cursor), ("after", after), ("tail", tail))
+            if value is not None
+        ]
+        if given:
+            raise _conflicting_cursors("before", *given)
+        decoded = decode_cursor(before)
+        if not isinstance(decoded, EventPosition):
+            raise ValidationError(
+                "invalid_cursor",
+                "'before' takes an event cursor, not a legacy sequence",
+            )
+        backward_to = decoded
+
     filters = await authorize_event_read(
         session,
         ctx,
@@ -411,6 +571,15 @@ async def list_events(
         types=types,
     )
     effective_limit = clamp_limit(limit)
+
+    if backward_to is not None:
+        return await _events_before(
+            session,
+            tenant_id=ctx.tenant_id,
+            before=backward_to,
+            limit=effective_limit,
+            filters=filters,
+        )
 
     if tail is not None:
         return await _tail_events(
@@ -448,7 +617,61 @@ async def list_events(
     if not has_more:
         last = past_filtered_out(last, frontier)
     next_cursor = encode_cursor(last)
-    return EventPage(events=events, next_cursor=next_cursor, has_more=has_more)
+    return EventPage(
+        events=events,
+        next_cursor=next_cursor,
+        has_more=has_more,
+        prev_cursor=encode_position(position_of(events[0])) if events else None,
+    )
+
+
+async def _backward_page(
+    session: AsyncSession,
+    *,
+    tenant_id: uuid.UUID,
+    before: EventPosition | None,
+    limit: int,
+    filters: EventFilter,
+) -> tuple[list[JournalEvent], str | None]:
+    """``limit`` events below ``before`` in delivery order, plus ``prevCursor``.
+
+    One extra event is read to tell "the start of the journal" (``None``)
+    from "more precede this page" (the cursor of its oldest event).
+    """
+    newest_first = await fetch_events_before(
+        session, tenant_id=tenant_id, before=before, limit=limit + 1, filters=filters
+    )
+    more_before = len(newest_first) > limit
+    events = newest_first[:limit]
+    events.reverse()
+    prev_cursor = encode_position(position_of(events[0])) if more_before else None
+    return events, prev_cursor
+
+
+async def _events_before(
+    session: AsyncSession,
+    *,
+    tenant_id: uuid.UUID,
+    before: EventPosition,
+    limit: int,
+    filters: EventFilter,
+) -> EventPage:
+    """The page that ends just before ``before``; ``hasMore`` looks backward.
+
+    ``nextCursor`` is the newest event of the page — reading forward from it
+    reaches the events the reader already holds. An empty page echoes
+    ``before``, the forward analogue of the echo on an empty forward page.
+    """
+    events, prev_cursor = await _backward_page(
+        session, tenant_id=tenant_id, before=before, limit=limit, filters=filters
+    )
+    newest = position_of(events[-1]) if events else before
+    return EventPage(
+        events=events,
+        next_cursor=encode_position(newest),
+        has_more=prev_cursor is not None,
+        prev_cursor=prev_cursor,
+    )
 
 
 async def _tail_events(
@@ -458,21 +681,22 @@ async def _tail_events(
     tail: int,
     filters: EventFilter,
 ) -> EventPage:
-    """Last ``tail`` stable events in delivery order (for CLI/diagnostics)."""
+    """Last ``tail`` stable events in delivery order (for CLI/diagnostics).
+
+    A backward read from the horizon: it reaches into the archive when the
+    hot journal holds fewer events, and its ``prevCursor`` starts the walk
+    back with ``before``.
+    """
     # The fallback cursor is taken BEFORE the page query: under READ
     # COMMITTED each statement gets its own snapshot, and a cursor from a
     # LATER snapshot could sort past an event that stabilized between the
     # two statements while the (empty) page never showed it. Cursor-first
     # errs toward re-delivery, never toward a permanent skip.
     fallback = await current_position(session, tenant_id)
-    stmt = (
-        select(Event)
-        .where(Event.tenant_id == tenant_id, Event.tx_id < _stable_horizon())
-        .order_by(Event.tx_id.desc(), Event.sequence.desc())
-        .limit(tail)
+    events, prev_cursor = await _backward_page(
+        session, tenant_id=tenant_id, before=None, limit=tail, filters=filters
     )
-    stmt = filters.apply(stmt, Event)
-    events: list[JournalEvent] = list((await session.scalars(stmt)).all())
-    events.reverse()
     next_cursor = encode_cursor(position_of(events[-1]) if events else fallback)
-    return EventPage(events=events, next_cursor=next_cursor, has_more=False)
+    return EventPage(
+        events=events, next_cursor=next_cursor, has_more=False, prev_cursor=prev_cursor
+    )

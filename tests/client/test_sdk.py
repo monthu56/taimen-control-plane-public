@@ -555,6 +555,8 @@ async def test_goal_methods_and_work_graph_task_fields(
         )
         assert updated["evidence"][0]["check"] == "green"
         assert (await api.list_tasks(goal_id=subgoal["id"]))["items"][0]["id"] == task["id"]
+        found = await api.list_tasks(q=task["publicId"].lower())
+        assert [t["id"] for t in found["items"]] == [task["id"]]
 
         assert (await api.list_goal_work(goal["id"]))["items"] == []
         tree = await api.list_goal_work(goal["id"], include_subgoals=True)
@@ -639,3 +641,20 @@ async def test_filtered_events_and_role_holders(client: httpx.AsyncClient, sdk: 
         holders = await admin.list_role_holders(role["id"], workspace_id=ops["id"])
         assert [p["id"] for p in holders["items"]] == [holder["id"]]
         assert (await admin.list_role_holders(role["id"], workspace_id=sales["id"]))["items"] == []
+
+
+async def test_task_type_migration_methods(client: httpx.AsyncClient, sdk: Make) -> None:
+    admin_key = (await do_bootstrap(client))["apiKey"]["key"]
+
+    async with sdk(admin_key) as operator:
+        v1 = await operator.create_task_type(key="flow", display_name="Flow")
+        first = await operator.create_task(title="One", type_key="flow")
+        second = await operator.create_task(title="Two", type_key="flow")
+        await operator.create_task_type(key="flow", display_name="Flow")
+
+        moved = await operator.migrate_task_type(first["id"], version=first["version"])
+        assert (moved["typeVersion"], moved["version"]) == (2, first["version"] + 1)
+
+        page = await operator.migrate_type_tasks(v1["id"], to_version=2, limit=10)
+        assert [m["taskId"] for m in page["migrated"]] == [second["id"]]
+        assert page["nextCursor"] is None

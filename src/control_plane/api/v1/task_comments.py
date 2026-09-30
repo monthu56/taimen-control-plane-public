@@ -6,6 +6,7 @@ work item is a mistake, not a shortcut.
 """
 
 import uuid
+from typing import Any
 
 from fastapi import APIRouter, Header, Query, Request
 from fastapi.responses import JSONResponse
@@ -16,6 +17,7 @@ from control_plane.api.etag import format_etag, parse_if_match
 from control_plane.api.v1.schemas import (
     ERROR_RESPONSES,
     PageOut,
+    TaskCommentAuthorOut,
     TaskCommentCreateRequest,
     TaskCommentOut,
     TaskCommentRevisionOut,
@@ -24,12 +26,34 @@ from control_plane.api.v1.schemas import (
     page_body,
 )
 from control_plane.api.write_flow import execute_write
+from control_plane.application.authorization import AuthContext
 from control_plane.application.commands import task_comments as commands
 from control_plane.application.queries import task_comments as queries
+from control_plane.infrastructure.db.models import Principal, TaskComment
 
 router = APIRouter(tags=["task-comments"])
 
 _COMMENT_ENTITY = "comment"
+
+
+def comment_body(comment: TaskComment, authors: dict[uuid.UUID, Principal]) -> dict[str, Any]:
+    """A comment with its author in words (ADR-0050, amendment of 2026-09-30).
+
+    The author is the caller at write time, a principal of the same tenant
+    under a foreign key, so it is always among ``authors``.
+    """
+    principal = authors[comment.author_principal_id]
+    author = TaskCommentAuthorOut(kind=principal.kind, display_name=principal.display_name)
+    fields = {
+        name: getattr(comment, name) for name in TaskCommentOut.model_fields if name != "author"
+    }
+    return TaskCommentOut.model_validate({**fields, "author": author}).model_dump(
+        mode="json", by_alias=True
+    )
+
+
+async def _one_body(db: AsyncSession, ctx: AuthContext, comment: TaskComment) -> dict[str, Any]:
+    return comment_body(comment, await queries.comment_authors(db, ctx, [comment]))
 
 
 @router.post(
@@ -56,7 +80,7 @@ async def add_comment(
             run_id=payload.run_id,
             artifact_id=payload.artifact_id,
         )
-        return 201, dump(TaskCommentOut, comment)
+        return 201, await _one_body(db, ctx, comment)
 
     return await execute_write(
         request,
@@ -82,7 +106,8 @@ async def list_comments(
     cursor: str | None = Query(default=None),
 ) -> JSONResponse:
     page = await queries.list_comments(db, ctx, task_ref=task_ref, limit=limit, cursor=cursor)
-    return JSONResponse(page_body([dump(TaskCommentOut, c) for c in page.items], page.next_cursor))
+    authors = await queries.comment_authors(db, ctx, page.items)
+    return JSONResponse(page_body([comment_body(c, authors) for c in page.items], page.next_cursor))
 
 
 @router.get(
@@ -95,7 +120,7 @@ async def get_comment(
 ) -> JSONResponse:
     comment = await queries.get_comment(db, ctx, task_ref=task_ref, comment_id=comment_id)
     return JSONResponse(
-        dump(TaskCommentOut, comment),
+        await _one_body(db, ctx, comment),
         headers={"ETag": format_etag(_COMMENT_ENTITY, comment.version)},
     )
 
@@ -127,7 +152,7 @@ async def edit_comment(
             body=payload.body,
             expected_version=expected_version,
         )
-        return 200, dump(TaskCommentOut, comment)
+        return 200, await _one_body(db, ctx, comment)
 
     return await execute_write(
         request,

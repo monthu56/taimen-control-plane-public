@@ -1481,6 +1481,119 @@ def test_memory_reports_no_answer_as_a_timed_out_recall() -> None:
     assert run.events("process.recall_timed_out")[0]["reason"] == "memory_unavailable"
 
 
+RECALL_WHOLE = """
+memory:
+  case: {key: "'case:' + data.number"}
+data:
+  type: object
+  properties:
+    number: {type: string}
+    amount: {type: number}
+    deadline: {type: string, format: date-time}
+    author: {type: string}
+    counterparty: {type: object}
+    note: {type: string}
+stages:
+  - id: s
+    steps:
+      - id: counterparty
+        recall: {anchors: [{case: true}]}
+        output: {as: {counterparty: step.result}}
+      - id: agreements
+        set:
+          note: >-
+            string(size(data.counterparty.nodes.filter(n, n.kind == 'agreement')))
+            + '/' + string(size(data.counterparty.edges))
+"""
+
+
+def test_an_empty_recall_answer_keeps_its_empty_lists_in_the_data() -> None:
+    # TASK-001134: an unknown supplier gave {"truncated": false} and the next step failed.
+    run = Run(RECALL_WHOLE)
+    run.start()
+    activity = run.activity("counterparty")
+    empty = {"nodes": [], "edges": [], "truncated": False}
+    run.feed("recall", {"activityId": activity["id"], "status": "completed", "result": empty})
+    assert run.data["counterparty"] == empty
+    assert run.data["note"] == "0/0"
+    assert run.status == "completed"
+
+
+def test_a_recall_answer_without_lists_reads_as_empty_lists() -> None:
+    run = Run(RECALL_WHOLE)
+    run.start()
+    activity = run.activity("counterparty")
+    run.feed("recall", {"activityId": activity["id"], "status": "completed", "result": None})
+    assert run.data["counterparty"] == {"nodes": [], "edges": [], "truncated": False}
+    assert run.data["note"] == "0/0"
+
+
+def test_a_non_empty_recall_answer_is_written_whole() -> None:
+    run = Run(RECALL_WHOLE)
+    run.start()
+    activity = run.activity("counterparty")
+    answer = {
+        "nodes": [{"kind": "agreement", "key": "a-1", "attrs": {}, "tags": []}],
+        "edges": [{"from": "a-1", "to": "case:N-1", "relation": "about"}],
+        "truncated": True,
+    }
+    run.feed("recall", {"activityId": activity["id"], "status": "completed", "result": answer})
+    assert run.data["counterparty"] == answer
+    assert run.data["note"] == "1/1"
+
+
+COPY_TYPED = """
+data:
+  type: object
+  properties:
+    number: {type: string}
+    amount: {type: number}
+    deadline: {type: string, format: date-time}
+    author: {type: string}
+    party:
+      type: object
+      required: [count, name]
+      properties:
+        count: {type: integer}
+        name: {type: string}
+        label: {type: string}
+        tags: {type: array, items: {type: string}}
+        inner:
+          type: object
+          properties:
+            items: {type: array}
+            extra: {type: object}
+        byKey:
+          type: object
+          additionalProperties: {type: object, properties: {v: {type: integer}}}
+    copy: {type: object}
+stages:
+  - id: s
+    steps:
+      - id: fill
+        set:
+          party: >-
+            {'count': 0, 'name': '', 'tags': [], 'inner': {'items': [], 'extra': {}}, 'byKey': {}}
+      - id: copy
+        set: {copy: data.party}
+"""
+
+
+def test_a_typed_object_copied_whole_keeps_empty_and_zero_fields() -> None:
+    run = Run(COPY_TYPED)
+    run.start()
+    assert run.status == "completed"
+    # Empty lists, maps and objects and zero required scalars survive; an unset
+    # optional field (label) stays absent rather than becoming "".
+    assert run.data["copy"] == {
+        "count": 0,
+        "name": "",
+        "tags": [],
+        "inner": {"items": [], "extra": {}},
+        "byKey": {},
+    }
+
+
 def test_remember_is_an_intent_with_the_case_and_a_dedup_key() -> None:
     run = Run(
         """

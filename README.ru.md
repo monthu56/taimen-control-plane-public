@@ -554,6 +554,13 @@ permission_escalation` (`details.missing`); не-active principal — `422
 principal_not_active`. Сверх этого principal вида `agent`/`service` не
 получает `admin` и `approvals.decide` — `422 permissions_not_allowed_for_kind`.
 Identity, привязанная в другом tenant, — `409 iam_identity_bound_elsewhere`.
+Issuer, отличный от `CP_IAM_ISSUER` (если он задан), — `422 iam_issuer_untrusted`.
+Перенос identity с другого principal — только `admin` (`403
+permission_escalation`, `details.previousOwnerKind`). Principal действующего
+агента реестра через этот маршрут identity не получает — `409
+agent_identity_conflict` с `details.route` `/agents/{key}/identity`; повторно
+привязать identity, уже записанную в реестре, может только `admin` (CP-ADR-0073,
+амендмент 2026-09-30, Е4).
 
 События журнала: `iam_binding.created` / `updated` / `revoked` с
 `principalId`, `issuer`, `iamPrincipalId` и правами. После коммита роутер

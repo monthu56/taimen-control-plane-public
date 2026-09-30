@@ -11,6 +11,7 @@ import asyncio
 import hashlib
 import json
 import os
+import time
 import uuid
 from collections.abc import AsyncIterator, Callable, Sequence
 from importlib import metadata as importlib_metadata
@@ -21,11 +22,20 @@ from typing import Any
 import httpx
 
 from control_plane_client.credentials import CredentialProvider, StaticCredential
-from control_plane_client.errors import ControlPlaneError, TransportError, error_from_response
+from control_plane_client.errors import (
+    ControlPlaneError,
+    TransportError,
+    error_from_response,
+    is_transient,
+)
 
 PROTOCOL_VERSION = "2"
-_RETRIES = 3
 _RETRY_BACKOFF = 0.5
+_RETRY_BACKOFF_MAX = 5.0
+#: How long, in pauses between attempts, a repeatable request is retried by
+#: default: 0.5 + 1.0 s, three attempts. A daemon that must outlive a restart
+#: of the core asks for more (``retry_window``).
+DEFAULT_RETRY_WINDOW = 1.5
 # Artifact content travels in chunks of this size, both ways: neither an upload
 # nor a download is ever held in memory whole (CP-ADR-0072 §2, §5).
 _CONTENT_CHUNK = 1024 * 1024
@@ -66,8 +76,10 @@ class ControlPlaneClient:
         timeout: float = 30.0,
         transport: httpx.AsyncBaseTransport | None = None,
         user_agent: str | None = None,
+        retry_window: float = DEFAULT_RETRY_WINDOW,
     ) -> None:
         self.server_url = server_url.rstrip("/")
+        self.retry_window = retry_window
         # A plain string stays a plain string for every existing caller; an IAM
         # identity arrives as a provider because its token outlives neither the
         # session nor, usually, the command after next.
@@ -111,54 +123,76 @@ class ControlPlaneClient:
         idempotent: bool = False,
     ) -> Json:
         """One logical command. With ``idempotent=True`` the client attaches a
-        generated Idempotency-Key and retries transport failures with the SAME
-        key: a retried HTTP request is never a second business command."""
+        generated Idempotency-Key and retries with the SAME key: a retried HTTP
+        request is never a second business command.
+
+        Retried are the failures that say nothing about the command
+        (:func:`is_transient`: the network, a 502/503/504 of a restarting core)
+        and only where a repeat cannot become a second command — a GET, or a
+        request with an Idempotency-Key. The pauses between attempts grow and
+        stop once they would exceed ``retry_window`` seconds.
+        """
         request_headers = dict(headers or {})
         if idempotent and "Idempotency-Key" not in request_headers:
             request_headers["Idempotency-Key"] = uuid.uuid4().hex
-        attempts = _RETRIES if idempotent else 1
-        last_error: Exception | None = None
+        repeatable = method == "GET" or "Idempotency-Key" in request_headers
+        waited = 0.0
+        attempt = 0
         reauthenticated = False
-        for attempt in range(attempts):
+        while True:
             request_headers["Authorization"] = f"Bearer {await self._credential.token()}"
+            cause: Exception | None = None
             try:
                 response = await self._http.request(
                     method, path, json=json_body, params=params, headers=request_headers
                 )
+                if (
+                    response.status_code == 401
+                    and self._credential.refreshable
+                    and not reauthenticated
+                ):
+                    # The credential expired between commands. Exactly one
+                    # retry, with the same Idempotency-Key: a re-sent request
+                    # must stay the same business command, and a second 401 is
+                    # a real denial rather than something to keep retrying.
+                    reauthenticated = True
+                    await self._credential.refresh()
+                    response = await self._http.request(
+                        method,
+                        path,
+                        json=json_body,
+                        params=params,
+                        headers={
+                            **request_headers,
+                            "Authorization": f"Bearer {await self._credential.token()}",
+                        },
+                    )
             except httpx.HTTPError as exc:
-                last_error = exc
-                if attempt + 1 < attempts:
-                    await asyncio.sleep(_RETRY_BACKOFF * (2**attempt))
-                    continue
-                raise TransportError(f"{type(exc).__name__}: {exc}") from exc
-            if response.status_code == 401 and self._credential.refreshable and not reauthenticated:
-                # The credential expired between commands. Exactly one retry,
-                # with the same Idempotency-Key: a re-sent request must stay
-                # the same business command, and a second 401 is a real denial
-                # rather than something to keep retrying.
-                reauthenticated = True
-                await self._credential.refresh()
-                response = await self._http.request(
-                    method,
-                    path,
-                    json=json_body,
-                    params=params,
-                    headers={
-                        **request_headers,
-                        "Authorization": f"Bearer {await self._credential.token()}",
-                    },
-                )
-            if response.status_code >= 400:
+                cause = exc
+                error: ControlPlaneError = TransportError(f"{type(exc).__name__}: {exc}")
+            else:
+                if response.status_code < 400:
+                    if response.status_code == 204 or not response.content:
+                        return {}
+                    result: Json = response.json()
+                    return result
                 try:
                     body = response.json()
                 except ValueError:
                     body = {}
-                raise error_from_response(response.status_code, body)
-            if response.status_code == 204 or not response.content:
-                return {}
-            result: Json = response.json()
-            return result
-        raise TransportError(str(last_error))  # pragma: no cover - loop always returns
+                error = error_from_response(response.status_code, body)
+            delay = min(_RETRY_BACKOFF * (2**attempt), _RETRY_BACKOFF_MAX)
+            # After a failure that may have reached the core, the first attempt
+            # can still be in flight there: its key answers "in flight" until
+            # it ends, and then the stored result.
+            retryable = is_transient(error) or (
+                attempt > 0 and error.code == "idempotency_in_flight"
+            )
+            if not repeatable or not retryable or waited + delay > self.retry_window:
+                raise error from cause
+            await asyncio.sleep(delay)
+            waited += delay
+            attempt += 1
 
     async def _send(
         self,
@@ -179,6 +213,8 @@ class ControlPlaneClient:
         :meth:`_request` does.
         """
         refreshed = False
+        waited = 0.0
+        attempt = 0
         while True:
             request = self._http.build_request(
                 method,
@@ -190,16 +226,20 @@ class ControlPlaneClient:
                     "Authorization": f"Bearer {await self._credential.token()}",
                 },
             )
+            cause: Exception | None = None
             try:
                 response = await self._http.send(request, stream=stream)
             except httpx.HTTPError as exc:
-                raise TransportError(f"{type(exc).__name__}: {exc}") from exc
-            if response.status_code == 401 and self._credential.refreshable and not refreshed:
-                refreshed = True
-                await response.aclose()
-                await self._credential.refresh()
-                continue
-            if response.status_code >= 400:
+                cause = exc
+                error: ControlPlaneError = TransportError(f"{type(exc).__name__}: {exc}")
+            else:
+                if response.status_code == 401 and self._credential.refreshable and not refreshed:
+                    refreshed = True
+                    await response.aclose()
+                    await self._credential.refresh()
+                    continue
+                if response.status_code < 400:
+                    return response
                 try:
                     await response.aread()
                     body = response.json()
@@ -207,8 +247,15 @@ class ControlPlaneClient:
                     body = {}
                 finally:
                     await response.aclose()
-                raise error_from_response(response.status_code, body)
-            return response
+                error = error_from_response(response.status_code, body)
+            # A download is read again from the start; an upload is not
+            # repeated here — a second one is a new version.
+            delay = min(_RETRY_BACKOFF * (2**attempt), _RETRY_BACKOFF_MAX)
+            if method != "GET" or not is_transient(error) or waited + delay > self.retry_window:
+                raise error from cause
+            await asyncio.sleep(delay)
+            waited += delay
+            attempt += 1
 
     # -- identity / context ----------------------------------------------------
 
@@ -412,6 +459,7 @@ class ControlPlaneClient:
         due_to: str | None = None,
         sort: str | None = None,
         goal_id: str | None = None,
+        q: str | None = None,
     ) -> Json:
         params: Json = {}
         for name, value in (
@@ -431,6 +479,7 @@ class ControlPlaneClient:
             ("dueTo", due_to),
             ("sort", sort),
             ("goalId", goal_id),
+            ("q", q),
         ):
             if value is not None:
                 params[name] = value
@@ -752,7 +801,11 @@ class ControlPlaneClient:
         )
 
     async def list_task_comments(self, task_ref: str, **params: Any) -> Json:
-        """A page of the thread, oldest first; the cursor is its own format."""
+        """A page of the thread, oldest first; the cursor is its own format.
+
+        Every comment carries ``author {kind, displayName}`` (ADR-0050): who
+        wrote it is readable with ``tasks.read``, without ``principals.read``.
+        """
         return await self._request("GET", f"/tasks/{task_ref}/comments", params=params or None)
 
     async def get_task_comment(self, task_ref: str, comment_id: str) -> Json:
@@ -1174,6 +1227,31 @@ class ControlPlaneClient:
         return await self._request(
             "POST",
             f"/tasks/{task_ref}:complete",
+            json_body=body,
+            headers={"If-Match": f'"task-{version}"'},
+            idempotent=True,
+        )
+
+    async def migrate_task_type(
+        self,
+        task_ref: str,
+        *,
+        version: int,
+        type_version: int | None = None,
+        status_map: dict[str, str] | None = None,
+    ) -> Json:
+        """Move an open task to another version of its type (ADR-0048).
+
+        Needs ``task_types.manage`` besides ``tasks.write`` on the task.
+        """
+        body: Json = {}
+        if type_version is not None:
+            body["typeVersion"] = type_version
+        if status_map is not None:
+            body["statusMap"] = status_map
+        return await self._request(
+            "POST",
+            f"/tasks/{task_ref}:migrate-type",
             json_body=body,
             headers={"If-Match": f'"task-{version}"'},
             idempotent=True,
@@ -1610,6 +1688,8 @@ class ControlPlaneClient:
         *,
         cursor: str | None = None,
         after: int | None = None,
+        before: str | None = None,
+        order: str | None = None,
         limit: int | None = None,
         tail: int | None = None,
         types: Sequence[str] | None = None,
@@ -1624,7 +1704,9 @@ class ControlPlaneClient:
         by the server during the compatibility window. ``types`` (type
         prefixes, e.g. ``approval.``) and ``workspace_id`` (a workspace
         subtree) narrow the page (CP-ADR-0068); ``nextCursor`` of a narrowed
-        page is resumed with the same filters.
+        page is resumed with the same filters. ``before`` (a ``prevCursor``
+        of a previous page, e.g. of a ``tail`` page) reads the page that
+        precedes it; ``order="desc"`` returns the items newest first.
         """
         query: Json = dict(params)
         if types:
@@ -1635,6 +1717,10 @@ class ControlPlaneClient:
             query["cursor"] = cursor
         elif after is not None:
             query["after"] = after
+        if before is not None:
+            query["before"] = before
+        if order is not None:
+            query["order"] = order
         if limit is not None:
             query["limit"] = limit
         if tail is not None:
@@ -1729,6 +1815,29 @@ class ControlPlaneClient:
     async def deprecate_task_type(self, type_id: str) -> Json:
         return await self._request(
             "POST", f"/task-types/{type_id}:deprecate", json_body={}, idempotent=True
+        )
+
+    async def migrate_type_tasks(
+        self,
+        type_id: str,
+        *,
+        to_version: int | None = None,
+        status_map: dict[str, str] | None = None,
+        limit: int | None = None,
+        cursor: str | None = None,
+    ) -> Json:
+        """Move one page of open tasks of a type version (ADR-0048)."""
+        body: Json = {}
+        if to_version is not None:
+            body["toVersion"] = to_version
+        if status_map is not None:
+            body["statusMap"] = status_map
+        if limit is not None:
+            body["limit"] = limit
+        if cursor is not None:
+            body["cursor"] = cursor
+        return await self._request(
+            "POST", f"/task-types/{type_id}:migrate-tasks", json_body=body, idempotent=True
         )
 
     # -- skills (ADR-0056) -----------------------------------------------------
@@ -2190,6 +2299,10 @@ class ControlPlaneClient:
             query["kind"] = kind
         return await self._request("GET", "/principals", params=query or None)
 
+    async def get_principal(self, principal_id: str) -> Json:
+        """One principal (``PrincipalOut``); needs ``principals.read``."""
+        return await self._request("GET", f"/principals/{principal_id}")
+
     # -- IAM identity bindings (ADR-0053) --------------------------------------
 
     async def list_iam_bindings(self, principal_ref: str) -> Json:
@@ -2242,7 +2355,9 @@ class ControlPlaneClient:
         workspace_id: str | None = None,
         limit: int | None = None,
         cursor: str | None = None,
+        include: str | None = None,
     ) -> Json:
+        """A page of agents; ``include="status"`` adds ``observedStatus`` to each."""
         params: Json = {}
         for key, value in (
             ("status", status),
@@ -2250,16 +2365,33 @@ class ControlPlaneClient:
             ("workspaceId", workspace_id),
             ("limit", limit),
             ("cursor", cursor),
+            ("include", include),
         ):
             if value is not None:
                 params[key] = value
         return await self._request("GET", "/agents", params=params or None)
 
-    async def publish_agent(self, key: str, spec: Json) -> Json:
-        """Apply a spec: a new revision only when its canonical hash differs."""
-        return await self._request(
-            "POST", "/agents", json_body={"key": key, "spec": spec}, idempotent=True
-        )
+    async def publish_agent(self, key: str, spec: Json, *, package: Json | None = None) -> Json:
+        """Apply a spec: a new revision only when its canonical hash differs.
+
+        ``package`` — ``{"key", "version"}`` of the package being applied: the
+        source a new revision records; without it the revision is a manual edit.
+        """
+        body: Json = {"key": key, "spec": spec}
+        if package is not None:
+            body["package"] = package
+        return await self._request("POST", "/agents", json_body=body, idempotent=True)
+
+    async def list_agent_revisions(
+        self, key: str, *, limit: int | None = None, cursor: str | None = None
+    ) -> Json:
+        """A page of the revisions of ``key``, newest first, without their specs."""
+        params: Json = {}
+        if limit is not None:
+            params["limit"] = limit
+        if cursor is not None:
+            params["cursor"] = cursor
+        return await self._request("GET", f"/agents/{key}/revisions", params=params or None)
 
     async def validate_agent(self, key: str, spec: Json) -> Json:
         """Every check of :meth:`publish_agent`, nothing saved."""
@@ -2292,6 +2424,28 @@ class ControlPlaneClient:
                 "issuer": issuer,
                 "iamTenantId": iam_tenant_id,
                 "iamPrincipalId": iam_principal_id,
+            },
+            idempotent=True,
+        )
+
+    async def replace_agent_identity(
+        self,
+        key: str,
+        *,
+        issuer: str,
+        iam_tenant_id: str,
+        iam_principal_id: str,
+        reason: str,
+    ) -> Json:
+        """Move a service agent to a new IAM identity; the principal stays the same."""
+        return await self._request(
+            "POST",
+            f"/agents/{key}/identity:replace",
+            json_body={
+                "issuer": issuer,
+                "iamTenantId": iam_tenant_id,
+                "iamPrincipalId": iam_principal_id,
+                "reason": reason,
             },
             idempotent=True,
         )
@@ -2457,10 +2611,14 @@ class HeartbeatRunner:
 
     A DOMAIN failure (expired lease, lost ownership) is terminal and is NOT
     hidden: it is stored in ``error`` and the loop stops — the harness must
-    check ``error``/``alive`` and stop authoritative writes. A TRANSPORT
-    failure is not evidence of lost ownership, so it is retried on the next
-    tick and only becomes terminal after ``max_transport_failures`` in a row
-    (by then the lease is likely gone anyway).
+    check ``error``/``alive`` and stop authoritative writes. A TRANSIENT
+    failure (:func:`is_transient`: the network, a 502/503/504 of a restarting
+    core) is not evidence of lost ownership: it is retried after
+    ``retry_seconds`` rather than a whole interval — the lease keeps running
+    out meanwhile — and becomes terminal only once ``outage_budget_seconds``
+    have passed since the last successful heartbeat (or the start). The budget
+    defaults to ``interval_seconds * max_transport_failures``: the patience of
+    three missed beats, 180 s with the defaults, whatever the retry pace.
     """
 
     def __init__(
@@ -2471,21 +2629,34 @@ class HeartbeatRunner:
         claim_id: str | None = None,
         interval_seconds: float = 60.0,
         max_transport_failures: int = 3,
+        retry_seconds: float = 10.0,
+        outage_budget_seconds: float | None = None,
     ) -> None:
         self._client = client
         self.session_id = session_id
         self.claim_id = claim_id
         self.interval = interval_seconds
-        self.max_transport_failures = max_transport_failures
+        self.retry_seconds = retry_seconds
+        self.outage_budget = (
+            interval_seconds * max_transport_failures
+            if outage_budget_seconds is None
+            else outage_budget_seconds
+        )
         self.error: ControlPlaneError | None = None
         self.transport_failures = 0
+        self._clock: Callable[[], float] = time.monotonic
+        self._last_success = 0.0
         self._task: asyncio.Task[None] | None = None
         self._stop = asyncio.Event()
 
     async def _loop(self) -> None:
         while not self._stop.is_set():
+            if self.transport_failures == 0:
+                pause = self.interval
+            else:
+                pause = min(self.retry_seconds, self.interval)
             try:
-                await asyncio.wait_for(self._stop.wait(), self.interval)
+                await asyncio.wait_for(self._stop.wait(), pause)
                 return
             except TimeoutError:
                 pass
@@ -2493,21 +2664,23 @@ class HeartbeatRunner:
                 await self._client.heartbeat_session(self.session_id)
                 if self.claim_id is not None:
                     await self._client.heartbeat_claim(self.claim_id)
-            except TransportError as exc:
-                self.transport_failures += 1
-                if self.transport_failures >= self.max_transport_failures:
+            except ControlPlaneError as exc:
+                if not is_transient(exc):
                     self.error = exc
                     return
-            except ControlPlaneError as exc:
-                self.error = exc
-                return
+                self.transport_failures += 1
+                if self._clock() - self._last_success >= self.outage_budget:
+                    self.error = exc
+                    return
             else:
                 self.transport_failures = 0
+                self._last_success = self._clock()
 
     def start(self) -> None:
         self._stop.clear()
         self.error = None
         self.transport_failures = 0
+        self._last_success = self._clock()
         self._task = asyncio.get_running_loop().create_task(self._loop())
 
     async def stop(self) -> None:

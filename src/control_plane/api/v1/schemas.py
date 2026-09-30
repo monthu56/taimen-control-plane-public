@@ -57,6 +57,18 @@ class PrincipalCreateRequest(ApiModel):
     metadata: dict[str, Any] = Field(default_factory=dict)
 
 
+class PrincipalDisableRequest(ApiModel):
+    """Optional body of ``:disable``; the reason goes to ``principal.disabled``."""
+
+    reason: str | None = Field(default=None, min_length=1, max_length=500)
+
+
+class PrincipalEnableRequest(ApiModel):
+    """Optional body of ``:enable``; the reason goes to ``principal.enabled``."""
+
+    reason: str | None = Field(default=None, min_length=1, max_length=500)
+
+
 class ApiKeyCreateRequest(ApiModel):
     permissions: list[str] = Field(min_length=1)
     expires_at: datetime | None = None
@@ -227,6 +239,26 @@ class TaskUpdateRequest(ApiModel):
     evidence: list[WorkEvidenceSpec] | None = Field(default=None, max_length=200)
     claim_id: uuid.UUID | None = None
     fencing_token: int | None = None
+
+
+class TaskMigrateTypeRequest(ApiModel):
+    """ADR-0048, amendment 2026-09-30: move a task to another version of its type.
+
+    ``typeVersion`` omitted means the newest active version of the task's key;
+    ``statusMap`` maps a status of the current version to one of the target.
+    """
+
+    type_version: int | None = Field(default=None, ge=1)
+    status_map: dict[str, str] | None = Field(default=None, max_length=64)
+
+
+class TaskTypeMigrateTasksRequest(ApiModel):
+    """Move the open tasks of a type version, one page per call."""
+
+    to_version: int | None = Field(default=None, ge=1)
+    status_map: dict[str, str] | None = Field(default=None, max_length=64)
+    limit: int | None = Field(default=None, ge=1, le=500)
+    cursor: uuid.UUID | None = None
 
 
 class TaskCompleteRequest(ApiModel):
@@ -638,6 +670,16 @@ class PrincipalOut(ApiModel):
     updated_at: datetime
 
 
+class PrincipalEnabledOut(PrincipalOut):
+    """``principals/{id}:enable``: the principal plus what came back with its status."""
+
+    live_api_keys: int = Field(
+        ge=0,
+        description="API keys of the principal that are not revoked and not expired:"
+        " :disable does not revoke keys, so these authenticate again (CP-ADR-0077)",
+    )
+
+
 class RoleHolderOut(ApiModel):
     """A principal holding a role in a workspace (``GET /roles/{id}/principals``)."""
 
@@ -858,10 +900,13 @@ class PageOut(ApiModel):
 
 class EventPageOut(ApiModel):
     """Journal page: ``nextCursor`` is always present (echoes the input when
-    nothing new is stable) so followers can poll without decoding cursors."""
+    nothing new is stable) so followers can poll without decoding cursors.
+    ``prevCursor`` is the ``before`` of the preceding page; ``null`` on a
+    backward read (``before``/``tail``) means the start of the journal."""
 
     items: list[dict[str, Any]]
     next_cursor: str
+    prev_cursor: str | None
     has_more: bool
 
 
@@ -1242,6 +1287,32 @@ class WorkspaceMemberOut(ApiModel):
     created_at: datetime
 
 
+class PackageLinkOut(ApiModel):
+    """The package that installed a catalog object (CP-ADR-0074 §11, amendment TASK-000904)."""
+
+    key: str = Field(description="Key of the package (package.yaml -> metadata key)")
+    version: str | None = Field(
+        description="Version of the package whose installation last named the object;"
+        " null for objects applied before versions were kept"
+    )
+    install_hash: str | None = Field(
+        description="The installation: planHash of POST /packages:apply, or installHash"
+        " the installer named in POST /packages:record"
+    )
+    installed_at: datetime
+
+
+PACKAGE_FILTER_DESCRIPTION = (
+    "Only the objects the package with this key installed (package.key of the items)"
+)
+# Every list and card of a catalog kind the core holds carries it (TASK-000904).
+_PACKAGE_LINK_FIELD = Field(
+    default=None,
+    description="The package that installed the object (the key, all its versions);"
+    " null for an object created by hand. Filter a list with ?package=<key>",
+)
+
+
 class RoleOut(ApiModel):
     id: uuid.UUID
     tenant_id: uuid.UUID
@@ -1252,6 +1323,7 @@ class RoleOut(ApiModel):
     version: int
     created_at: datetime
     updated_at: datetime
+    package: PackageLinkOut | None = _PACKAGE_LINK_FIELD
 
 
 class CapabilityOut(ApiModel):
@@ -1260,6 +1332,7 @@ class CapabilityOut(ApiModel):
     name: str
     description: str
     created_at: datetime
+    package: PackageLinkOut | None = _PACKAGE_LINK_FIELD
 
 
 class SkillOut(ApiModel):
@@ -1279,6 +1352,7 @@ class SkillOut(ApiModel):
     row_version: int
     created_at: datetime
     updated_at: datetime
+    package: PackageLinkOut | None = _PACKAGE_LINK_FIELD
 
 
 class SkillExecutionOut(ApiModel):
@@ -1461,6 +1535,17 @@ class ArtifactContentOut(ApiModel):
     expires_at: datetime
 
 
+class TaskCommentAuthorOut(ApiModel):
+    """Who wrote a comment, in words (ADR-0050, amendment of 2026-09-30).
+
+    Part of the thread and read with it (``tasks.read``): a reader of the
+    discussion tells an owner from an agent without ``principals.read``.
+    """
+
+    kind: str
+    display_name: str
+
+
 class TaskCommentOut(ApiModel):
     """One reply in a work item's thread (ADR-0050)."""
 
@@ -1469,6 +1554,8 @@ class TaskCommentOut(ApiModel):
     task_id: uuid.UUID
     # Derived from the authenticated context at write time, never from a body.
     author_principal_id: uuid.UUID
+    # The author's current kind and display name, looked up at read time.
+    author: TaskCommentAuthorOut
     body: str
     run_id: uuid.UUID | None
     artifact_id: uuid.UUID | None
@@ -1578,6 +1665,7 @@ class WorkspaceTypeOut(ApiModel):
     version: int
     created_at: datetime
     updated_at: datetime
+    package: PackageLinkOut | None = _PACKAGE_LINK_FIELD
 
 
 class ProjectTemplateCreateRequest(ApiModel):
@@ -1611,6 +1699,7 @@ class ProjectTemplateOut(ApiModel):
     created_by: uuid.UUID
     created_at: datetime
     updated_at: datetime
+    package: PackageLinkOut | None = _PACKAGE_LINK_FIELD
 
 
 class TaskTypeCreateRequest(ApiModel):
@@ -1642,6 +1731,35 @@ class TaskTypeCreateRequest(ApiModel):
     acceptance: list[AcceptanceCheckSpec] = Field(default_factory=list, max_length=50)
 
 
+class TaskTypeMigratedTaskOut(ApiModel):
+    task_id: uuid.UUID
+    public_id: str
+    from_status: str
+    status: str
+    version: int
+
+
+class TaskTypeSkippedTaskOut(ApiModel):
+    """A task left where it was, with the refusal a single migration would give."""
+
+    task_id: uuid.UUID
+    code: str
+    message: str
+    details: dict[str, Any]
+
+
+class TaskTypeMigrateTasksOut(ApiModel):
+    """One page of ``POST /task-types/{id}:migrate-tasks`` (ADR-0048)."""
+
+    type_key: str
+    from_type_version: int
+    type_version: int
+    type_id: uuid.UUID
+    migrated: list[TaskTypeMigratedTaskOut]
+    skipped: list[TaskTypeSkippedTaskOut]
+    next_cursor: str | None
+
+
 class TaskTypeOut(ApiModel):
     id: uuid.UUID
     tenant_id: uuid.UUID
@@ -1662,6 +1780,7 @@ class TaskTypeOut(ApiModel):
     created_by: uuid.UUID
     created_at: datetime
     updated_at: datetime
+    package: PackageLinkOut | None = _PACKAGE_LINK_FIELD
 
 
 class ArtifactTypeCreateRequest(ApiModel):
@@ -1695,6 +1814,7 @@ class ArtifactTypeOut(ApiModel):
     created_by: uuid.UUID
     created_at: datetime
     updated_at: datetime
+    package: PackageLinkOut | None = _PACKAGE_LINK_FIELD
 
 
 class ProjectCreateRequest(ApiModel):
@@ -1943,6 +2063,7 @@ class RuleOut(ApiModel):
     created_by: uuid.UUID
     created_at: datetime
     updated_at: datetime
+    package: PackageLinkOut | None = _PACKAGE_LINK_FIELD
 
 
 class RuleEvaluationOut(ApiModel):
@@ -2177,11 +2298,23 @@ class AgentSpec(ApiModel):
         return self
 
 
+class AgentPackageRef(ApiModel):
+    """The package whose apply published a revision, as its installer names it."""
+
+    key: str = Field(min_length=1, max_length=200)
+    version: str = Field(min_length=1, max_length=100)
+
+
 class AgentPublishRequest(ApiModel):
     """``POST /agents`` and ``POST /agents:validate``: a catalog object without its envelope."""
 
     key: str = _AGENT_KEY_FIELD
     spec: AgentSpec
+    package: AgentPackageRef | None = Field(
+        default=None,
+        description="Set by a package installer: a new revision records the package as its "
+        "source; without it the revision is a manual edit. Not part of the spec hash",
+    )
 
 
 class AgentStateUpdateRequest(ApiModel):
@@ -2201,6 +2334,12 @@ class AgentRetireRequest(ApiModel):
 
 class AgentIdentityLinkRequest(IamIdentitySpec):
     """The IAM identity the placement service created for the agent (§6)."""
+
+
+class AgentIdentityReplaceRequest(IamIdentitySpec):
+    """A new IAM identity for a service agent (CP-ADR-0073, amendment 2026-09-30)."""
+
+    reason: str = Field(min_length=1, max_length=500)
 
 
 class AgentStatusReason(ApiModel):
@@ -2258,6 +2397,7 @@ class AgentOut(ApiModel):
     version: int
     created_at: datetime
     updated_at: datetime
+    package: PackageLinkOut | None = _PACKAGE_LINK_FIELD
 
 
 class AgentValidationOut(ApiModel):
@@ -2282,6 +2422,51 @@ class AgentStatusOut(ApiModel):
     observed_at: datetime | None
     reported_by: uuid.UUID | None
     updated_at: datetime | None
+
+
+class AgentListItemOut(AgentOut):
+    observed_status: AgentStatusOut | None = Field(
+        default=None,
+        description="Present only with include=status: the body of GET /agents/{key}/status",
+    )
+
+
+class AgentPageOut(ApiModel):
+    items: list[AgentListItemOut]
+    next_cursor: str | None
+
+
+class AgentRevisionSourceOut(ApiModel):
+    kind: Literal["package", "manual", "unknown"] = Field(
+        description="package: published by a package apply; manual: without a package; "
+        "unknown: published before the source was recorded"
+    )
+    package: AgentPackageRef | None
+
+
+class AgentRevisionSummaryOut(ApiModel):
+    """An item of ``GET /agents/{key}/revisions``: the revision without its spec."""
+
+    id: uuid.UUID
+    agent_key: str
+    revision: int
+    spec_hash: str = Field(description="sha256:<hex> of the canonical JSON of spec")
+    created_by: uuid.UUID = Field(description="The principal that published the revision")
+    created_at: datetime
+    source: AgentRevisionSourceOut
+    active: bool = Field(
+        description="The current revision of an agent that is not retired; "
+        "a retired agent has no active revision"
+    )
+    changed_fields: list[str] | None = Field(
+        description="Spec fields that differ from the previous revision (a nested object "
+        "one level down, as section.field), sorted; null for revision 1"
+    )
+
+
+class AgentRevisionPageOut(ApiModel):
+    items: list[AgentRevisionSummaryOut]
+    next_cursor: str | None
 
 
 # --- process-packages: processes, calendars, packages (CP-ADR-0074) ----------
@@ -2349,6 +2534,7 @@ class ProcessDefinitionOut(ApiModel):
     )
     created_by: uuid.UUID
     created_at: datetime
+    package: PackageLinkOut | None = _PACKAGE_LINK_FIELD
 
 
 class ProcessVersionOut(ApiModel):
@@ -2553,6 +2739,7 @@ class CalendarOut(ApiModel):
     provisional_years: list[int]
     created_by: uuid.UUID
     created_at: datetime
+    package: PackageLinkOut | None = _PACKAGE_LINK_FIELD
 
 
 def _package_path(path: str) -> str:
@@ -2566,7 +2753,7 @@ class PackageFile(ApiModel):
     path: Annotated[str, AfterValidator(_package_path)] = Field(
         min_length=1,
         max_length=500,
-        description="Path inside the package, e.g. processes/tender.yaml",
+        description="Path inside the package, e.g. processes/onboarding.yaml",
     )
     content: str = Field(max_length=PACKAGE_FILE_MAX_CHARS, description="YAML 1.2 text")
 
@@ -2664,11 +2851,25 @@ class PlanFieldOut(ApiModel):
 
 
 class PlanChangeOut(ApiModel):
-    kind: str
+    kind: Literal["TaskType", "Agent", "Calendar", "Process", "WorkRule"] = Field(
+        description="The kinds the core plans, in the order the apply publishes them"
+    )
     key: str
     action: Literal["create", "update", "rename", "retire", "unchanged"]
     renamed_from: str | None
     fields: list[PlanFieldOut]
+    deprecates: list[int] = Field(
+        default_factory=list,
+        description="TaskType: the active versions the apply deprecates (all but the kept one)",
+    )
+
+
+class PlanOutsideOut(ApiModel):
+    """An object of the package the core does not plan, and who applies it."""
+
+    kind: str
+    key: str
+    applied_by: Literal["installer", "notification-service"]
 
 
 class PlanReplayOut(ApiModel):
@@ -2706,6 +2907,10 @@ class PackagePlanOut(ApiModel):
     catalog_etag: str
     package: dict[str, Any] = Field(description="{key, version} of the package")
     changes: list[PlanChangeOut]
+    outside: list[PlanOutsideOut] = Field(
+        default_factory=list,
+        description="Objects of kinds the core does not plan (NotificationRule, Skill, Role…)",
+    )
     processes: list[PlanProcessOut]
     regulation_coverage: list[RegulationCoverageOut]
     problems: list[ProcessProblemOut]
@@ -2730,3 +2935,118 @@ class PackageApplyOut(ApiModel):
     plan_hash: str
     catalog_etag: str = Field(description="Etag of the catalog after the apply")
     applied: list[PackageAppliedOut]
+
+
+PACKAGE_RECORD_MAX_OBJECTS = 1000
+RecordedKind = Literal[
+    "ArtifactType",
+    "TaskType",
+    "ProjectTemplate",
+    "WorkspaceType",
+    "Role",
+    "Capability",
+    "Skill",
+    "WorkRule",
+    "Agent",
+]
+
+
+class PackageRef(ApiModel):
+    """A package as its installer names it: ``package.yaml`` key and version."""
+
+    key: str = Field(min_length=1, max_length=200)
+    version: str = Field(min_length=1, max_length=100)
+
+
+class PackageRecordedObject(ApiModel):
+    kind: RecordedKind
+    key: str = Field(
+        min_length=1,
+        max_length=200,
+        description="key; slug of a Role, name of a Capability or Skill",
+    )
+
+
+class PackageRecordRequest(ApiModel):
+    """``POST /packages:record``: the objects one package's installation applied.
+
+    Every object of the package the installer applied, the unchanged ones too:
+    the link moves to this version of the package. Processes and calendars are
+    linked by ``POST /packages:apply``.
+    """
+
+    package: PackageRef
+    install_hash: str | None = Field(
+        default=None,
+        max_length=200,
+        description="The installation as the installer identifies it (e.g. sha256 of the"
+        " package files); returned as package.installHash of the objects",
+    )
+    objects: list[PackageRecordedObject] = Field(
+        min_length=1, max_length=PACKAGE_RECORD_MAX_OBJECTS
+    )
+
+
+class PackageRecordOut(ApiModel):
+    package: PackageRef
+    install_hash: str | None
+    recorded: list[PackageRecordedObject]
+
+
+# --- may I do X on Y (CP-ADR-0055, amendment of 2026-09-29) --------------------
+
+AUTHZ_CHECK_MAX_ITEMS = 100
+
+AuthzResourceType = Literal["approval", "process_instance", "run", "rule", "agent", "principal"]
+AuthzAction = Literal[
+    "approve",
+    "reject",
+    "suspend",
+    "resume",
+    "cancel",
+    "request-cancel",
+    "enable",
+    "disable",
+    "update-state",
+]
+
+
+class AuthzCheckItem(ApiModel):
+    action: AuthzAction = Field(
+        description="The endpoint's verb: approval approve|reject; process_instance"
+        " suspend|resume|cancel; run request-cancel|cancel; rule enable|disable;"
+        " agent update-state (PATCH /agents/{key}/state, state and replicas);"
+        " principal enable|disable"
+    )
+    resource_type: AuthzResourceType
+    resource_id: str = Field(
+        min_length=1, max_length=200, description="The id; for an agent — its key"
+    )
+
+
+class AuthzCheckRequest(ApiModel):
+    checks: list[AuthzCheckItem] = Field(min_length=1, max_length=AUTHZ_CHECK_MAX_ITEMS)
+
+
+class AuthzDenialOut(ApiModel):
+    code: str = Field(
+        description="The code of the endpoint's own refusal: permission_denied, not_eligible,"
+        " separation_of_duties_violation, run_holder_mismatch, outside_purpose, not_found;"
+        " for a principal also permission_escalation, principal_kind_not_enableable,"
+        " principal_kind_not_disableable, cannot_disable_self, use_agent_publish,"
+        " use_agent_retire"
+    )
+    message: str
+    details: dict[str, Any]
+
+
+class AuthzCheckResultOut(ApiModel):
+    action: AuthzAction
+    resource_type: AuthzResourceType
+    resource_id: str
+    allowed: bool
+    reason: AuthzDenialOut | None = Field(description="Why not; null when allowed")
+
+
+class AuthzCheckOut(ApiModel):
+    results: list[AuthzCheckResultOut] = Field(description="One per check, in request order")

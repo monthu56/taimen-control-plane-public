@@ -41,8 +41,9 @@ declared actions in order:
 Core knows the action vocabulary, never what a tenant uses it for.
 """
 
+import logging
 import uuid
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import timedelta
@@ -52,7 +53,10 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from control_plane.application.authorization import AuthContext, ResourceRef, authorize
-from control_plane.application.commands.agent_assignees import is_agent_reference
+from control_plane.application.commands.agent_assignees import (
+    agent_principal,
+    is_agent_reference,
+)
 from control_plane.application.commands.principals import ensure_core_principal
 from control_plane.application.commands.relations import add_relation, resolve_task
 from control_plane.application.commands.skill_invocations import (
@@ -69,6 +73,10 @@ from control_plane.application.commands.task_types import task_type_of
 from control_plane.application.commands.tasks import complete_task, create_task, update_task
 from control_plane.application.common import new_uuid, utcnow
 from control_plane.application.events import record_event
+from control_plane.application.locking import (
+    lock_principal_key_share,
+    lock_principals_key_share,
+)
 from control_plane.domain.approval_outcomes import (
     COMMENT,
     COMPLETE_TASK,
@@ -117,6 +125,8 @@ from control_plane.infrastructure.db.models import (
     Task,
     TaskRelation,
 )
+
+logger = logging.getLogger(__name__)
 
 OUTCOME_PENDING = "pending"
 OUTCOME_DEFERRED = "deferred"
@@ -1028,6 +1038,57 @@ def failure_of(exc: DomainError) -> dict[str, Any]:
 # --- the executor --------------------------------------------------------------
 
 
+async def _referenced_principals(
+    session: AsyncSession,
+    tenant_id: uuid.UUID,
+    context: DecisionContext,
+    actions: Sequence[Action],
+    rows: dict[int, ApprovalOutcomeAction],
+) -> list[uuid.UUID]:
+    """The principals the outcome's remaining actions will reference.
+
+    ``ensureWork.assignee`` (an id or an agent of the registry) and
+    ``ensureWork.requestApproval.assignee``, rendered as the action will render
+    them. An action that reacts to a skill call is rendered without the call's
+    result; an input that does not render or does not name a principal is left
+    to the action itself, which refuses it the same way.
+    """
+    found: list[uuid.UUID] = []
+    for index, action in enumerate(actions):
+        done = rows.get(index)
+        if (done is not None and done.status == OUTCOME_EXECUTED) or action.name != ENSURE_WORK:
+            continue
+        try:
+            inputs = render(action.inputs, lambda path: context.resolve(path, None))
+        except DomainError as exc:
+            # The action itself refuses the same way when it runs.
+            logger.debug(
+                "outcome action inputs do not render for the pre-lock",
+                extra={"action_index": index, "code": exc.code},
+            )
+            continue
+        gate = inputs.get(REQUEST_APPROVAL)
+        gate_assignee = gate.get("assignee") if isinstance(gate, dict) else None
+        for value in (inputs.get("assignee"), gate_assignee):
+            if is_agent_reference(value):
+                try:
+                    found.append(
+                        await agent_principal(session, tenant_id, str(value), field="assignee")
+                    )
+                except DomainError as exc:
+                    logger.debug(
+                        "outcome assignee names no agent for the pre-lock",
+                        extra={"action_index": index, "code": exc.code},
+                    )
+                    continue
+            elif value:
+                try:
+                    found.append(uuid.UUID(str(value)))
+                except ValueError:
+                    continue
+    return found
+
+
 async def _lock_approval(
     session: AsyncSession,
     tenant_id: uuid.UUID,
@@ -1175,6 +1236,10 @@ async def execute_outcome(
     actions = await declared_actions(session, approval, outcome)
     causation_id = causation_id or await _decision_event_id(session, approval)
     ctx = _decider_context(approval, trace_run_id=trace_run_id, causation_id=causation_id)
+    # The outcome acts as the decider: its principal before any task row
+    # (rule 1 of ``application/locking.py``, CP-ADR-0077 §3). Only the approval
+    # row is held so far, and ``principals/{id}:disable`` never takes it.
+    await lock_principal_key_share(session, tenant_id, ctx.principal_id)
     rows = await _action_rows(session, approval.id)
     first_open = _first_open(actions, rows)
     context: DecisionContext | None = None
@@ -1197,6 +1262,12 @@ async def execute_outcome(
                 error=failure_of(exc),
             )
     context = context or await base_context(session, approval, outcome)
+    # All actions share this transaction, and the task an earlier one locks
+    # (``completeTask``) stays locked until the commit: the principals the
+    # later ones will reference go first (rule 3, CP-ADR-0077 §3).
+    await lock_principals_key_share(
+        session, tenant_id, await _referenced_principals(session, tenant_id, context, actions, rows)
+    )
     invocations: dict[int, tuple[SkillInvocation, Skill]] | None = None
     skill_wait = timedelta(seconds=skill_wait_seconds)
 
@@ -1388,6 +1459,9 @@ async def record_attempt_failure(
         trace_run_id=trace_run_id,
         causation_id=await _decision_event_id(session, approval),
     )
+    # The failure work is assigned to the decider (rule 3 of
+    # ``application/locking.py``): its principal before any task row.
+    await lock_principal_key_share(session, approval.tenant_id, ctx.principal_id)
     return await _fail(
         session,
         ctx,

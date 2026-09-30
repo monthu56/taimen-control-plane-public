@@ -67,6 +67,16 @@ async def get_tenant_rule(
     return rule
 
 
+async def rule_write_gate(
+    session: AsyncSession, ctx: AuthContext, rule_id: uuid.UUID, *, for_update: bool = False
+) -> WorkRule:
+    """Who may enable or disable the rule; ``POST /authz:check`` asks the same."""
+    await authorize(ctx, Permission.RULES_WRITE)
+    rule = await get_tenant_rule(session, ctx, rule_id, for_update=for_update)
+    await authorize(ctx, Permission.RULES_WRITE, resource=rule_scope(rule.workspace_id))
+    return rule
+
+
 async def ensure_rule_cursor(session: AsyncSession, tenant_id: uuid.UUID) -> None:
     """The tenant's journal cursor of the rule engine, created at the present.
 
@@ -270,12 +280,17 @@ async def _record(
     )
 
 
+async def lock_rule_key(session: AsyncSession, tenant_id: uuid.UUID, key: str) -> None:
+    """Serialize the creation of a rule with one (tenant, key)."""
+    await session.execute(
+        select(func.pg_advisory_xact_lock(func.hashtext(f"work-rule:{tenant_id}:{key}")))
+    )
+
+
 async def _require_free_key(session: AsyncSession, ctx: AuthContext, key: str) -> None:
     # Serialized per (tenant, key): the partial unique index would otherwise
     # turn a concurrent twin into a 500 instead of this 409.
-    await session.execute(
-        select(func.pg_advisory_xact_lock(func.hashtext(f"work-rule:{ctx.tenant_id}:{key}")))
-    )
+    await lock_rule_key(session, ctx.tenant_id, key)
     taken = await session.scalar(
         select(WorkRule.id).where(
             WorkRule.tenant_id == ctx.tenant_id,
@@ -475,9 +490,7 @@ async def set_rule_status(
     Enabling takes the caller's authority and starts the rule at the present:
     facts recorded while it was disabled are not evaluated after the fact.
     """
-    await authorize(ctx, Permission.RULES_WRITE)
-    rule = await get_tenant_rule(session, ctx, rule_id, for_update=True)
-    await authorize(ctx, Permission.RULES_WRITE, resource=rule_scope(rule.workspace_id))
+    rule = await rule_write_gate(session, ctx, rule_id, for_update=True)
     _require_live(rule)
     target = _validate_status(status)
     if rule.status == target:

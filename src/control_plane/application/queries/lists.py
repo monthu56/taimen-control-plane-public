@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from enum import StrEnum
 
-from sqlalchemy import Select, or_, select, tuple_
+from sqlalchemy import ColumnElement, Select, and_, or_, select, tuple_
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import InstrumentedAttribute
 
@@ -241,6 +241,54 @@ class TaskSort(StrEnum):
 
 TASK_SORTS = frozenset(s.value for s in TaskSort)
 
+# Text search over the task list (CP-ADR-0049, amendment TASK-000866). The
+# bounds keep a single request's predicate small: every term is an OR of three
+# trigram-indexed ILIKEs, and the terms are ANDed.
+TASK_SEARCH_MAX_LENGTH = 200
+TASK_SEARCH_MAX_TERMS = 10
+
+
+def _like_literal(term: str) -> str:
+    # Backslash is the default LIKE escape in PostgreSQL, so no ESCAPE clause
+    # is needed and the predicate keeps the plain shape the index matches.
+    return term.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
+def task_search_terms(q: str | None) -> list[str]:
+    """Whitespace-separated terms of ``q``; empty means "no filter"."""
+    if q is None:
+        return []
+    if len(q) > TASK_SEARCH_MAX_LENGTH:
+        raise ValidationError(
+            "invalid_search",
+            f"q is longer than {TASK_SEARCH_MAX_LENGTH} characters",
+            details={"maxLength": TASK_SEARCH_MAX_LENGTH},
+        )
+    terms = q.split()
+    if len(terms) > TASK_SEARCH_MAX_TERMS:
+        raise ValidationError(
+            "invalid_search",
+            f"q has more than {TASK_SEARCH_MAX_TERMS} terms",
+            details={"maxTerms": TASK_SEARCH_MAX_TERMS},
+        )
+    return terms
+
+
+def task_search_clause(terms: list[str]) -> ColumnElement[bool]:
+    """Every term occurs, case-insensitively, in the title, the description or
+    the public id. Each ILIKE is served by a pg_trgm GIN index of its column."""
+    clauses = []
+    for term in terms:
+        pattern = f"%{_like_literal(term)}%"
+        clauses.append(
+            or_(
+                Task.title.ilike(pattern),
+                Task.description.ilike(pattern),
+                Task.public_id.ilike(pattern),
+            )
+        )
+    return and_(*clauses)
+
 
 async def list_tasks(
     session: AsyncSession,
@@ -265,8 +313,10 @@ async def list_tasks(
     sort: str | None = None,
     goal_id: uuid.UUID | None = None,
     goal_ids: list[uuid.UUID] | None = None,
+    q: str | None = None,
 ) -> Page[Task]:
     await authorize(ctx, Permission.TASKS_READ)
+    search_terms = task_search_terms(q)
     # Status keys are a tenant's own vocabulary since v0.8, so there is no
     # global set to validate against: an unknown key is an empty page, not a
     # 422. Categories ARE global, so those still get checked.
@@ -320,6 +370,8 @@ async def list_tasks(
         stmt = stmt.where(Task.goal_id == goal_id)
     if goal_ids is not None:
         stmt = stmt.where(Task.goal_id.in_(goal_ids))
+    if search_terms:
+        stmt = stmt.where(task_search_clause(search_terms))
     # Date bounds are inclusive and independent of the ordering; a bound on a
     # date implicitly excludes the rows that do not carry it, because NULL
     # satisfies no comparison.

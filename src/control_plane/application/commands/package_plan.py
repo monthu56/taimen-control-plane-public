@@ -1,17 +1,24 @@
 """Package plan and apply by hash: ``POST /packages:plan``, ``POST /packages:apply``.
 
-CP-ADR-0074 §11, process-packages P015. The body is the package as its files,
-as for ``packages:test``; the core plans the kinds whose versions and
-instances it knows — ``Calendar`` and ``Process`` — and the installer applies
-the rest.
+CP-ADR-0074 §11, process-packages P015, amendment 2026-09-29. The body is
+the package as its files, as for ``packages:test``; the core plans every kind
+of the catalog it holds — ``TaskType``, ``Agent``, ``Calendar``, ``Process``,
+``WorkRule`` (:data:`package_plan.PLANNED_KINDS`, in that order); the objects
+of other kinds are listed in ``outside`` with who applies them (the installer,
+the notification service).
 
-**Plan** (:func:`plan_package`, a ``READ ONLY`` transaction; memory is asked
-after it closes):
+**Plan** (:func:`plan_package`, a transaction that is rolled back; memory is
+asked after it closes):
 
 - ``changes`` — per object ``create | update | rename | unchanged`` and the
   fields it changes, each with its owner: ``console`` when a person changed
   it since the last apply (``package_objects`` keeps what that apply wanted),
-  kept unless ``overwriteConsole`` (:func:`package_plan.diff_fields`);
+  kept unless ``overwriteConsole`` (:func:`package_plan.diff_fields`); a task
+  type also names the active versions the apply deprecates (``deprecates``).
+  Task types, agents and rules are compared as their form
+  (:mod:`control_plane.application.commands.package_catalog`), and the
+  command of their kind is run on what the apply would publish, in a
+  savepoint of the rolled-back transaction: what it refuses is a finding;
 - ``processes`` — per changed process the replay of the new version on the
   latest ``replayLimit`` instances of the current one, and the fate of open
   instances by version: ``pin`` or ``migrate`` by the version's
@@ -24,29 +31,35 @@ after it closes):
 - ``catalogEtag`` and ``planHash`` (:mod:`control_plane.domain.package_plan`).
 
 **Apply** (:func:`apply_package`) builds the plan again from the same files in
-its own transaction, under a lock of the tenant's applies and with the open
-instances locked, and refuses ``409 plan_stale`` when its hash differs from
-the one shown: the catalog or the instances changed since. A plan with
+its own transaction, under a lock of the tenant's applies, with the keys of
+its task types, agents and rules locked as their commands lock them
+(:func:`package_catalog.lock_keys`) and the open instances locked, and
+refuses ``409 plan_stale`` when its hash differs from the one shown: the
+catalog or the instances changed since. A plan with
 ``migration_required`` is ``422 migration_required``, any other error ``422
-invalid_package``. Then, in one transaction: calendars, then processes, are
-published by the ordinary commands under the right of their kind; open
+invalid_package``. Then, in one transaction, every object is published by the
+ordinary command of its kind, under the right of that kind, in the order of
+``PLANNED_KINDS`` (a refusal of a command rolls the whole apply back); open
 instances with ``migrate`` move to the new version by the map
 (:func:`control_plane.domain.process_migration.migrate_state`) — a journal
 entry ``migrate`` with the migrated state and ``process.migrated`` each; a key
-renamed away is retired; ``package_objects`` records what the apply wanted.
+renamed away is retired; ``package_objects`` records what the apply wanted and
+the package (key, version, plan hash) of every object of the plan.
 """
 
 import uuid
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import datetime
 from typing import Any
 
-from sqlalchemy import func, select, text, tuple_
+from sqlalchemy import select, tuple_
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from control_plane.application.authorization import AuthContext, authorize
+from control_plane.application.commands import package_catalog, package_links
 from control_plane.application.commands.calendars import check_calendar_spec, publish_calendar
+from control_plane.application.commands.package_catalog import CATALOG_KINDS, Latest, SpecShape
 from control_plane.application.commands.package_test import (
     overlay_catalog,
     with_workspace,
@@ -66,6 +79,7 @@ from control_plane.application.commands.process_replays import chosen_instances,
 from control_plane.application.common import new_uuid, utcnow
 from control_plane.application.context.graph import GraphScope
 from control_plane.application.events import record_event
+from control_plane.application.locking import lock_caller
 from control_plane.application.queries.process_regulations import (
     UNKNOWN_SECTION,
     document_sections,
@@ -74,13 +88,21 @@ from control_plane.application.queries.process_regulations import (
 from control_plane.config import Settings
 from control_plane.domain import process_engine as engine
 from control_plane.domain.enums import Permission
-from control_plane.domain.errors import ConflictError, DomainError, NotFoundError, ValidationError
+from control_plane.domain.errors import (
+    AuthorizationError,
+    ConflictError,
+    DomainError,
+    NotFoundError,
+    ValidationError,
+)
 from control_plane.domain.package_plan import (
     PLANNED_KINDS,
     FieldChange,
     Rename,
+    canonical_hash,
     catalog_etag,
     diff_fields,
+    outside,
     package_hash,
     plan_hash,
     renames,
@@ -107,7 +129,6 @@ from control_plane.domain.process_migration import (
     uncovered,
 )
 from control_plane.infrastructure.context_provider import ContextProviderError, GraphProvider
-from control_plane.infrastructure.db.engine import transaction
 from control_plane.infrastructure.db.models import (
     CalendarVersion,
     ProcessDefinition,
@@ -118,25 +139,15 @@ from control_plane.infrastructure.db.models import (
 )
 from control_plane.infrastructure.db.models import PackageObject as PackageRecord
 
-# The spec of a package object of kind Calendar as ``POST /calendars`` takes
-# it (its shape checked), or the findings of its shape.
-CalendarSpec = Callable[[PackageObject], tuple[dict[str, Any] | None, list[Problem]]]
+# The shape of a package object per kind (``Calendar``, ``TaskType``,
+# ``Agent``, ``WorkRule``): the spec as the route of its kind takes it.
+Shapes = Mapping[str, SpecShape]
 # Diverged instances named per process in the plan.
 MAX_DIVERGED_IDS = 20
 _OPEN = (engine.RUNNING, engine.SUSPENDED)
 
 
 # --- the plan --------------------------------------------------------------------------------
-
-
-@dataclass
-class _Latest:
-    """The latest version of a key in the catalog."""
-
-    version: int
-    hash: str
-    spec: dict[str, Any]
-    row: ProcessDefinition | CalendarVersion
 
 
 @dataclass
@@ -149,7 +160,7 @@ class _Planned:
     wanted: dict[str, Any]
     wanted_hash: str
     renamed_from: str | None = None
-    latest: _Latest | None = None
+    latest: Latest | None = None
     # What the last apply wanted of this key, and of the key it is renamed from.
     record: PackageRecord | None = None
     source_record: PackageRecord | None = None
@@ -158,6 +169,8 @@ class _Planned:
     published: dict[str, Any] = field(default_factory=dict)
     version: int | None = None
     definition: engine.Definition | None = None
+    # TaskType: the active versions the apply deprecates.
+    deprecates: list[int] = field(default_factory=list)
 
     @property
     def source(self) -> str:
@@ -171,6 +184,7 @@ class _Planned:
             "action": self.action,
             "renamedFrom": self.renamed_from,
             "fields": [item.out() for item in self.fields],
+            "deprecates": self.deprecates,
         }
 
 
@@ -205,16 +219,26 @@ class PackagePlan:
     overwrite: bool
     problems: list[Problem] = field(default_factory=list)
     planned: list[_Planned] = field(default_factory=list)
+    outside: list[dict[str, str]] = field(default_factory=list)
     groups: list[_Group] = field(default_factory=list)
     effective_renames: list[_Planned] = field(default_factory=list)
     behaviour: dict[str, dict[str, Any]] = field(default_factory=dict)
     coverage: list[dict[str, Any]] = field(default_factory=list)
     etag_entries: list[dict[str, Any]] = field(default_factory=list)
+    # The (kind, key) of the catalog objects the plan reads: what the apply and the trial lock.
+    lock_pairs: set[tuple[str, str]] = field(default_factory=set)
     created_at: datetime = field(default_factory=utcnow)
 
     @property
     def catalog_etag(self) -> str:
         return catalog_etag(self.etag_entries)
+
+    @property
+    def package(self) -> tuple[str, str] | None:
+        """The source an agent's revision records: the package and its version."""
+        if self.package_key is None or self.package_version is None:
+            return None
+        return (self.package_key, self.package_version)
 
     def changes(self) -> list[dict[str, Any]]:
         return [item.change() for item in self.planned]
@@ -251,6 +275,7 @@ class PackagePlan:
             "catalogEtag": self.catalog_etag,
             "package": {"key": self.package_key, "version": self.package_version},
             "changes": self.changes(),
+            "outside": self.outside,
             "processes": self.processes(),
             "regulationCoverage": self.coverage,
             "problems": [p.out() for p in _sorted(self.problems)],
@@ -265,7 +290,9 @@ def _sorted(problems: Sequence[Problem]) -> list[Problem]:
 # --- reading the catalog ---------------------------------------------------------------------
 
 
-async def _latest(db: AsyncSession, tenant_id: uuid.UUID, kind: str, key: str) -> _Latest | None:
+async def _latest(db: AsyncSession, tenant_id: uuid.UUID, kind: str, key: str) -> Latest | None:
+    if kind in CATALOG_KINDS:
+        return await package_catalog.latest_of(db, tenant_id, kind, key)
     if kind == "Process":
         row = await db.scalar(
             select(ProcessDefinition)
@@ -273,7 +300,7 @@ async def _latest(db: AsyncSession, tenant_id: uuid.UUID, kind: str, key: str) -
             .order_by(ProcessDefinition.version.desc())
             .limit(1)
         )
-        return _Latest(row.version, row.definition_hash, row.spec, row) if row else None
+        return Latest(row.version, row.definition_hash, row.spec, row) if row else None
     calendar = await db.scalar(
         select(CalendarVersion)
         .where(CalendarVersion.tenant_id == tenant_id, CalendarVersion.key == key)
@@ -282,7 +309,7 @@ async def _latest(db: AsyncSession, tenant_id: uuid.UUID, kind: str, key: str) -
     )
     if calendar is None:
         return None
-    return _Latest(calendar.version, calendar.calendar_hash, calendar.spec, calendar)
+    return Latest(calendar.version, calendar.calendar_hash, calendar.spec, calendar)
 
 
 async def _records(
@@ -290,9 +317,13 @@ async def _records(
 ) -> dict[tuple[str, str], PackageRecord]:
     if not pairs:
         return {}
-    stmt = select(PackageRecord).where(
-        PackageRecord.tenant_id == tenant_id,
-        tuple_(PackageRecord.kind, PackageRecord.key).in_(sorted(pairs)),
+    stmt = (
+        select(PackageRecord)
+        .where(
+            PackageRecord.tenant_id == tenant_id,
+            tuple_(PackageRecord.kind, PackageRecord.key).in_(sorted(pairs)),
+        )
+        .order_by(PackageRecord.kind, PackageRecord.key)
     )
     if lock:
         stmt = stmt.with_for_update()
@@ -315,7 +346,9 @@ async def catalog_entries(
                 "version": latest.version if latest else None,
                 "hash": latest.hash if latest else None,
                 "applied": record.spec_hash if record else None,
-                "retired": record is not None and record.retired_at is not None,
+                "package": (record.package_key or None) if record else None,
+                "retired": (record is not None and record.retired_at is not None)
+                or (latest is not None and latest.retired),
             }
         )
     return entries
@@ -331,7 +364,7 @@ async def build_plan(
     files: Sequence[tuple[str, str]],
     workspace_id: uuid.UUID | None,
     overwrite: bool,
-    calendar_spec: CalendarSpec,
+    shapes: Shapes,
     lock: bool = False,
 ) -> PackagePlan:
     """The plan without its reports (behaviour, coverage): what the hash covers."""
@@ -344,6 +377,7 @@ async def build_plan(
         overwrite=overwrite,
     )
     plan.problems.extend(package.problems)
+    plan.outside = outside(package)
     if manifest is None:
         plan.problems.append(
             Problem(
@@ -359,36 +393,96 @@ async def build_plan(
     by_target = {(r.kind, r.target): r for r in listed}
     pairs = {(o.kind, o.key) for o in package.objects if o.kind in PLANNED_KINDS}
     pairs |= {(r.kind, r.source) for r in listed}
+    plan.lock_pairs = pairs
+    if lock:
+        await package_catalog.lock_keys(db, ctx.tenant_id, pairs)
     records = await _records(db, ctx.tenant_id, pairs, lock=lock)
     plan.etag_entries = await catalog_entries(db, ctx.tenant_id, pairs)
 
     calendars = frozenset(o.key for o in package.of_kind("Calendar"))
-    for obj in sorted(package.of_kind("Calendar"), key=lambda o: o.key):
-        sent, problems = calendar_spec(obj)
-        plan.problems.extend(obj.place(p) for p in problems)
-        if sent is None:
-            continue
-        body, body_hash, _ = check_calendar_spec(sent)
-        item = _Planned("Calendar", obj.key, obj, body, body_hash)
-        await _place(db, ctx, plan, item, by_target, records, manifest)
-        plan.planned.append(item)
-    for obj in sorted(package.of_kind("Process"), key=lambda o: o.key):
-        try:
-            body = normalized_spec(obj.spec)
-        except SpecError as exc:
-            plan.problems.append(
-                obj.place(Problem("invalid_document", "error", exc.path, exc.message))
-            )
-            continue
-        if workspace_id is not None:
-            body = with_workspace(body, workspace_id)
-        item = _Planned("Process", obj.key, obj, body, definition_hash(body))
-        await _place(db, ctx, plan, item, by_target, records, manifest)
-        await _check(db, ctx, plan, item, package, calendars)
-        plan.planned.append(item)
-        if item.action in ("update", "rename"):
-            await _instances(db, ctx, plan, item, lock=lock)
+    for kind in PLANNED_KINDS:
+        for obj in sorted(package.of_kind(kind), key=lambda o: o.key):
+            if kind == "Calendar":
+                sent, problems = shapes[kind](obj)
+                plan.problems.extend(obj.place(p) for p in problems)
+                if sent is None:
+                    continue
+                body, body_hash, _ = check_calendar_spec(sent)
+                item = _Planned(kind, obj.key, obj, body, body_hash)
+            elif kind == "Process":
+                try:
+                    body = normalized_spec(obj.spec)
+                except SpecError as exc:
+                    plan.problems.append(
+                        obj.place(Problem("invalid_document", "error", exc.path, exc.message))
+                    )
+                    continue
+                if workspace_id is not None:
+                    body = with_workspace(body, workspace_id)
+                item = _Planned(kind, obj.key, obj, body, definition_hash(body))
+            else:
+                shaped = await _catalog_item(db, ctx, plan, obj, workspace_id, shapes)
+                if shaped is None:
+                    continue
+                item = shaped
+            await _place(db, ctx, plan, item, by_target, records, manifest)
+            if kind == "Process":
+                await _check(db, ctx, plan, item, package, calendars)
+            plan.planned.append(item)
+            if kind == "Process" and item.action in ("update", "rename"):
+                await _instances(db, ctx, plan, item, lock=lock)
     return plan
+
+
+async def _catalog_item(
+    db: AsyncSession,
+    ctx: AuthContext,
+    plan: PackagePlan,
+    obj: PackageObject,
+    workspace_id: uuid.UUID | None,
+    shapes: Shapes,
+) -> _Planned | None:
+    """A task type, an agent or a rule as its form, or ``None`` with its findings."""
+    raw = obj.spec.get("workspaceId") if obj.kind == "WorkRule" else None
+    if isinstance(raw, str) and raw.startswith("${") and raw.endswith("}"):
+        if workspace_id is None:
+            plan.problems.append(
+                obj.place(
+                    Problem(
+                        "unresolved_install_variable",
+                        "error",
+                        "/spec/workspaceId",
+                        f"{raw} is an install variable: the plan was given no workspaceId",
+                        hint="pass workspaceId with the plan and the apply",
+                    )
+                )
+            )
+            return None
+        obj = replace(obj, spec=with_workspace(obj.spec, workspace_id))
+    sent, problems = shapes[obj.kind](obj)
+    plan.problems.extend(obj.place(p) for p in problems)
+    if sent is None:
+        return None
+    latest = await _latest(db, ctx.tenant_id, obj.kind, obj.key)
+    try:
+        form = package_catalog.wanted_form(obj.kind, sent, latest)
+    except DomainError as exc:
+        plan.problems.append(obj.place(_finding(exc)))
+        return None
+    return _Planned(obj.kind, obj.key, obj, form, canonical_hash(form))
+
+
+def _finding(exc: DomainError, severity: str = "error") -> Problem:
+    """A refusal of a command as a finding of the object it was about."""
+    details = exc.details or {}
+    where = details.get("path") or details.get("field")
+    path = ""
+    if isinstance(where, str) and where:
+        where = where.removeprefix("$.").removeprefix("spec.").removeprefix("spec")
+        path = "/spec" + "".join(
+            "/" + part for part in where.replace("[", ".").replace("]", "").split(".") if part
+        )
+    return Problem(exc.code, severity, path, exc.message)
 
 
 async def _place(
@@ -403,6 +497,22 @@ async def _place(
     """Where the object comes from (its key or a key it is renamed from) and what changes."""
     latest = await _latest(db, ctx.tenant_id, item.kind, item.key)
     item.record = records.get((item.kind, item.key))
+    owner = item.record.package_key if item.record is not None else None
+    if owner and plan.package_key is not None and owner != plan.package_key:
+        # The apply links the object to this package: say so, not silently.
+        plan.problems.append(
+            item.obj.place(
+                Problem(
+                    "package_owner_changed",
+                    "warning",
+                    "",
+                    f"{item.kind}/{item.key} belongs to package {owner}: the apply moves it"
+                    f" to package {plan.package_key}",
+                    hint=f"drop {item.kind}/{item.key} from one of the packages"
+                    " unless the package was renamed",
+                )
+            )
+        )
     base = item.record if item.record is not None and item.record.retired_at is None else None
     rename = by_target.get((item.kind, item.key))
     if rename is not None:
@@ -445,6 +555,15 @@ async def _place(
         item.action = "unchanged"
     else:
         item.action = "update"
+    if item.kind in CATALOG_KINDS:
+        item.version = await package_catalog.planned_version(
+            db, ctx.tenant_id, item.kind, item.key, latest, item.published, item.action
+        )
+        if item.kind == "TaskType":
+            item.deprecates = package_catalog.deprecated_versions(latest, item.action)
+        found = package_catalog.static_problems(item.kind, item.key, latest, item.published)
+        plan.problems.extend(item.obj.place(p) for p in found)
+        return
     if item.kind == "Calendar":
         if item.action == "unchanged" and latest is not None:
             item.version = latest.version
@@ -493,7 +612,7 @@ async def _check(
             ctx.tenant_id,
             item.key,
             item.published,
-            previous,  # type: ignore[arg-type]
+            previous,
             history_key=item.renamed_from,
         ),
         package,
@@ -741,44 +860,100 @@ async def plan_package(
     workspace_id: uuid.UUID | None,
     replay_limit: int,
     overwrite: bool,
-    calendar_spec: CalendarSpec,
+    shapes: Shapes,
 ) -> PackagePlan:
-    """``POST /packages:plan``: nothing is written."""
+    """``POST /packages:plan``: whatever is written to try the commands is rolled back."""
     await authorize(ctx, Permission.PACKAGES_PLAN)
     if workspace_id is not None:
         await authorize(ctx, Permission.PROCESSES_READ, resource=process_scope(workspace_id))
     scoped: list[tuple[_Planned, GraphScope]] = []
-    async with transaction(session_factory) as db:
-        await db.execute(text("SET TRANSACTION READ ONLY"))
-        if workspace_id is not None and not await workspace_exists(db, ctx, workspace_id):
-            raise NotFoundError("Workspace not found", details={"workspaceId": str(workspace_id)})
-        plan = await build_plan(
-            db,
-            ctx,
-            files=files,
-            workspace_id=workspace_id,
-            overwrite=overwrite,
-            calendar_spec=calendar_spec,
-        )
-        if replay_limit > 0:
-            await _behaviour(db, ctx, plan, replay_limit)
-        for item in plan.planned:
-            spec = item.published if item.action != "unchanged" else item.wanted
-            if item.kind == "Process" and governed_references(spec):
-                try:
-                    scoped.append((item, await regulation_scope(db, ctx, settings, spec)))
-                except ValueError:
-                    continue  # a workspace id that is no UUID: the check has said so
+    async with session_factory() as db:
+        tx = await db.begin()
+        try:
+            # Rule 1 of CP-ADR-0077: the trial runs the writing commands.
+            await lock_caller(db, ctx)
+            if workspace_id is not None and not await workspace_exists(db, ctx, workspace_id):
+                raise NotFoundError(
+                    "Workspace not found", details={"workspaceId": str(workspace_id)}
+                )
+            plan = await build_plan(
+                db,
+                ctx,
+                files=files,
+                workspace_id=workspace_id,
+                overwrite=overwrite,
+                shapes=shapes,
+            )
+            if replay_limit > 0:
+                await _behaviour(db, ctx, plan, replay_limit)
+            for item in plan.planned:
+                spec = item.published if item.action != "unchanged" else item.wanted
+                if item.kind == "Process" and governed_references(spec):
+                    try:
+                        scoped.append((item, await regulation_scope(db, ctx, settings, spec)))
+                    except ValueError:
+                        continue  # a workspace id that is no UUID: the check has said so
+            await _trial(db, ctx, plan)
+        finally:
+            await tx.rollback()
     plan.coverage, found = await _coverage(provider, scoped, settings, ctx.trace_run_id)
     plan.problems.extend(found)
     return plan
 
 
-async def _lock_applies(db: AsyncSession, tenant_id: uuid.UUID) -> None:
-    """One apply of a tenant at a time: each plans on the catalog the previous one left."""
-    await db.execute(
-        select(func.pg_advisory_xact_lock(func.hashtextextended(f"cp:packages:{tenant_id}", 0)))
-    )
+async def _trial(db: AsyncSession, ctx: AuthContext, plan: PackagePlan) -> None:
+    """Run the command of each task type, agent and rule the apply would publish.
+
+    Each in its own savepoint, in the order of the apply, so a rule sees the
+    task type and the agent the package brings; the transaction around is
+    rolled back by the caller. What a command refuses is a finding of the
+    object. A right the caller lacks ends the trial with a warning: the apply
+    needs the right anyway, and what follows would stumble on the gap.
+
+    The keys are locked first, as the apply locks them
+    (:func:`package_catalog.lock_keys`): a savepoint released keeps its locks,
+    and taken one command at a time they would come in another order than
+    the apply's.
+    """
+    if any(
+        item.kind in CATALOG_KINDS and (item.action != "unchanged" or item.deprecates)
+        for item in plan.planned
+    ):
+        await package_catalog.lock_keys(db, ctx.tenant_id, plan.lock_pairs)
+    for item in plan.planned:
+        if item.kind not in CATALOG_KINDS or (item.action == "unchanged" and not item.deprecates):
+            continue
+        if any(p.error and p.file == item.obj.file for p in plan.problems):
+            continue
+        try:
+            async with db.begin_nested():
+                await package_catalog.publish(
+                    db,
+                    ctx,
+                    kind=item.kind,
+                    key=item.key,
+                    spec=item.published,
+                    latest=item.latest,
+                    action=item.action,
+                    deprecates=item.deprecates,
+                    package=plan.package,
+                )
+        except AuthorizationError as exc:
+            plan.problems.append(
+                item.obj.place(
+                    Problem(
+                        "permission_required",
+                        "warning",
+                        "",
+                        f"{item.kind}/{item.key} was not checked: {exc.message}; the apply"
+                        " needs the right of every kind it changes",
+                        hint=", ".join((exc.details or {}).get("missing") or ()) or None,
+                    )
+                )
+            )
+            return
+        except DomainError as exc:
+            plan.problems.append(item.obj.place(_finding(exc)))
 
 
 async def apply_package(
@@ -789,20 +964,25 @@ async def apply_package(
     expected_hash: str,
     workspace_id: uuid.UUID | None,
     overwrite: bool,
-    calendar_spec: CalendarSpec,
+    shapes: Shapes,
+    touched: list[tuple[str, uuid.UUID]] | None = None,
 ) -> dict[str, Any]:
-    """``POST /packages:apply``: exactly the plan with ``expected_hash``, or a refusal."""
+    """``POST /packages:apply``: exactly the plan with ``expected_hash``, or a refusal.
+
+    ``touched`` collects the IAM identities whose binding an agent's revision
+    changed: the route drops their cache entries after the commit.
+    """
     await authorize(ctx, Permission.PACKAGES_PLAN)
     if workspace_id is not None:
         await authorize(ctx, Permission.PROCESSES_READ, resource=process_scope(workspace_id))
-    await _lock_applies(db, ctx.tenant_id)
+    await package_links.lock_applies(db, ctx.tenant_id)
     plan = await build_plan(
         db,
         ctx,
         files=files,
         workspace_id=workspace_id,
         overwrite=overwrite,
-        calendar_spec=calendar_spec,
+        shapes=shapes,
         lock=True,
     )
     current = plan.hash
@@ -837,6 +1017,24 @@ async def apply_package(
         )
     published: dict[str, ProcessDefinition] = {}
     for item in plan.planned:
+        if item.kind in CATALOG_KINDS:
+            if item.action == "unchanged" and not item.deprecates:
+                continue
+            done = await package_catalog.publish(
+                db,
+                ctx,
+                kind=item.kind,
+                key=item.key,
+                spec=item.published,
+                latest=item.latest,
+                action=item.action,
+                deprecates=item.deprecates,
+                package=plan.package,
+            )
+            item.version = done.version
+            if touched is not None:
+                touched.extend(done.touched)
+            continue
         if item.action == "unchanged":
             continue
         if item.kind == "Calendar":
@@ -862,12 +1060,14 @@ async def apply_package(
         )
         db.add(record)
         record.version, record.spec_hash = item.latest.version, item.latest.hash
+        record.package_version = plan.package_version
         record.retired_at = now
         _stamp(record, ctx, current, now)
     for item in plan.planned:
         record = item.record or _new_record(ctx, plan, item.kind, item.key, item.wanted, current)
         db.add(record)
         record.package_key = plan.package_key or record.package_key
+        record.package_version = plan.package_version
         record.version = int(item.version or 0)
         record.spec, record.spec_hash = item.wanted, item.wanted_hash
         record.retired_at = None
@@ -893,6 +1093,7 @@ def _new_record(
         kind=kind,
         key=key,
         package_key=plan.package_key or "",
+        package_version=plan.package_version,
         version=0,
         spec_hash="",
         spec=spec,

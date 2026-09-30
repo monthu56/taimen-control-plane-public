@@ -40,6 +40,7 @@ from control_plane.api.v1.schemas import (
 )
 from control_plane.domain.enums import Permission
 from control_plane.domain.event_catalog import event_types, get_event_type
+from control_plane.domain.package_plan import PLANNED_KINDS
 
 ROOT = Path(__file__).resolve().parents[2]
 FIXTURES = ROOT / "tests" / "fixtures"
@@ -207,6 +208,7 @@ ROUTES: list[tuple[str, str, str | None, str]] = [
     ("/api/v1/packages:test", "post", "PackageTestRequest", "PackageTestOut"),
     ("/api/v1/packages:plan", "post", "PackagePlanRequest", "PackagePlanOut"),
     ("/api/v1/packages:apply", "post", "PackageApplyRequest", "PackageApplyOut"),
+    ("/api/v1/packages:record", "post", "PackageRecordRequest", "PackageRecordOut"),
 ]
 # Routes whose step has landed: they no longer document a 501.
 IMPLEMENTED = {
@@ -223,6 +225,7 @@ IMPLEMENTED = {
     "/api/v1/process-instances/{instance_id}:cancel",
     "/api/v1/packages:plan",  # P015
     "/api/v1/packages:apply",
+    "/api/v1/packages:record",  # TASK-000904
 }
 
 
@@ -261,6 +264,14 @@ def test_the_plan_names_its_hash_the_catalog_etag_and_every_part_of_fr_027() -> 
         "migrate",
         "unaffected",
     ]
+    # Every kind of the catalog the core holds is planned (amendment 2026-09-29);
+    # the rest of a package is named with who applies it.
+    change = SCHEMAS["PlanChangeOut"]["properties"]
+    assert change["kind"]["enum"] == list(PLANNED_KINDS)
+    assert change["deprecates"]["items"] == {"type": "integer"}
+    assert _ref(plan["outside"]["items"]) == "PlanOutsideOut"
+    outside = SCHEMAS["PlanOutsideOut"]["properties"]["appliedBy"]
+    assert outside["enum"] == ["installer", "notification-service"]
     apply = SCHEMAS["PackageApplyRequest"]
     assert apply["properties"]["planHash"]["pattern"] == "^sha256:[0-9a-f]{64}$"
     assert "planHash" in apply["required"]

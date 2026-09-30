@@ -265,7 +265,7 @@ def test_no_failed_verification_no_feedback(attempt: dict[str, Any] | None) -> N
 def test_the_platform_contract_names_the_blocked_signal() -> None:
     assert "`blocked`" in PLATFORM_CONTRACT
     assert "`executor_blocked`" in PLATFORM_CONTRACT
-    assert PLATFORM_CONTRACT_VERSION == 3
+    assert PLATFORM_CONTRACT_VERSION == 4
 
 
 def test_each_adapter_tells_its_executor_how_to_stop() -> None:

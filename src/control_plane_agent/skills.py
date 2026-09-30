@@ -36,7 +36,9 @@ Protocols:
 - ``mcp`` — ``tools/call`` of the tool ``implementation.entrypoint`` on the
   server ``implementation.endpoint``: an ``http(s)://`` URL (streamable HTTP)
   or ``stdio:<name>``, a server this executor starts from its own
-  configuration (``CONTROL_PLANE_SKILLS_MCP_SERVERS``). Structured content —
+  configuration (``CONTROL_PLANE_SKILLS_MCP_SERVERS``). The request's
+  ``_meta`` carries ``skill/invocationId`` and ``skill/idempotencyKey`` — the
+  values ``http`` puts in the body. Structured content —
   or a text block holding one JSON object — is the outputs, ``_meta`` key
   ``skill/cost`` its cost; an ``isError`` result whose one text block is
   ``{"error": {code, retryable}}`` names the failure.
@@ -72,13 +74,16 @@ import socket
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
-from typing import Any, Protocol
+from typing import TYPE_CHECKING, Any, Protocol, cast
 
 import httpx
 import jsonschema
 
 from control_plane_agent.workspace import redact_local_paths
-from control_plane_client import ControlPlaneClient, ControlPlaneError, TransportError
+from control_plane_client import ControlPlaneClient, ControlPlaneError, is_transient
+
+if TYPE_CHECKING:
+    from mcp.types import RequestParamsMeta
 
 logger = logging.getLogger("control_plane_agent.skills")
 
@@ -107,6 +112,9 @@ _CODE_RE = re.compile(r"^[a-z0-9][a-z0-9_.-]{0,99}$")
 #: Where skill-sdk hosts put the cost of a call (TAI-ADR-0045 п.5).
 COST_HEADER = "X-Skill-Cost"
 MCP_COST_META = "skill/cost"
+#: Where the executor puts the invocation of an ``mcp`` call (request ``_meta``).
+MCP_INVOCATION_META = "skill/invocationId"
+MCP_IDEMPOTENCY_META = "skill/idempotencyKey"
 #: The local wire contract of skill-sdk: ``(inputs, meta) -> {outputs, cost}``.
 SDK_INVOKE = "__skill_invoke__"
 SDK_CONTRACT = "__skill_contract__"
@@ -836,7 +844,16 @@ class McpProtocol:
         try:
             async with Client(target) as client:
                 result = await client.call_tool(
-                    tool, call.inputs, read_timeout_seconds=call.timeout_seconds
+                    tool,
+                    call.inputs,
+                    read_timeout_seconds=call.timeout_seconds,
+                    meta=cast(
+                        "RequestParamsMeta",
+                        {
+                            MCP_INVOCATION_META: call.invocation_id,
+                            MCP_IDEMPOTENCY_META: call.idempotency_key,
+                        },
+                    ),
                 )
         except MCPError as exc:
             # A protocol error (unknown tool, invalid params) repeats on retry.
@@ -1093,7 +1110,7 @@ class SkillExecutor:
             logger.info("skill %s succeeded", ref)
             return "succeeded"
         except ControlPlaneError as exc:
-            if isinstance(exc, TransportError) or exc.code not in LEASE_LOST_CODES:
+            if is_transient(exc) or exc.code not in LEASE_LOST_CODES:
                 raise
             logger.warning("lease on %s lost before the report (%s)", ref, exc.code)
             return "lease_lost"
@@ -1106,9 +1123,12 @@ class SkillExecutor:
     async def _keep_lease(self, lease: _Lease, session_id: str | None) -> None:
         """Heartbeat until cancelled; set ``lost`` once the lease is not ours.
 
-        A transport failure is not a verdict — the lease may still be valid —
-        but the deadline is: past ``leaseExpiresAt`` without a successful
-        heartbeat the lease is treated as gone.
+        A transport failure or a 502/503/504 of a restarting core is not a
+        verdict — the lease may still be valid — but the deadline is: past
+        ``leaseExpiresAt`` without a successful heartbeat the lease is treated
+        as gone. The call itself is bounded by that deadline: the client keeps
+        retrying an unreachable core for its whole retry window, which may be
+        longer than what is left of the lease.
         """
         while True:
             interval = self.heartbeat_interval
@@ -1120,16 +1140,25 @@ class SkillExecutor:
                     return
                 interval = max(0.05, min(interval, remaining / 3))
             await asyncio.sleep(interval)
+            deadline: float | None = None
+            if lease.expires_at is not None:
+                deadline = max(0.0, (lease.expires_at - datetime.now(UTC)).total_seconds())
             try:
-                beat = await self.client.heartbeat_skill_invocation(
-                    lease.invocation_id,
-                    fencing_token=lease.fencing_token,
-                    session_id=session_id,
+                beat = await asyncio.wait_for(
+                    self.client.heartbeat_skill_invocation(
+                        lease.invocation_id,
+                        fencing_token=lease.fencing_token,
+                        session_id=session_id,
+                    ),
+                    deadline,
                 )
-            except TransportError as exc:
-                logger.info("heartbeat of %s failed: %s", lease.invocation_id, exc)
+            except TimeoutError:
+                logger.info("heartbeat of %s outlived the lease", lease.invocation_id)
                 continue
             except ControlPlaneError as exc:
+                if is_transient(exc):
+                    logger.info("heartbeat of %s failed: %s", lease.invocation_id, exc)
+                    continue
                 if exc.code in LEASE_LOST_CODES:
                     lease.reason = exc.code
                     lease.lost.set()

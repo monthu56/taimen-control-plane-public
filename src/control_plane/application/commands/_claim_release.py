@@ -1,7 +1,9 @@
 """Shared claim-release helper.
 
 Lock ordering discipline (deadlock avoidance), everywhere in the codebase:
-task row first, then claim row. Sessions are never locked after tasks.
+task row first, then claim row. Sessions are never locked after tasks, and
+principals go before both — the full order and the rules every writer keeps
+are in ``application/locking.py`` (CP-ADR-0077 §3).
 """
 
 import uuid

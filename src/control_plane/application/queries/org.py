@@ -11,6 +11,7 @@ from control_plane.application.commands.workspaces import (
     workspace_ancestor_ids,
 )
 from control_plane.application.queries.lists import Page, _paginate, clamp_limit
+from control_plane.application.queries.package_links import in_package
 from control_plane.domain.enums import Permission, WorkspaceStatus
 from control_plane.domain.errors import AuthorizationError, NotFoundError, ValidationError
 from control_plane.infrastructure.db.models import (
@@ -99,11 +100,17 @@ async def list_roles(
     limit: int | None = None,
     cursor: str | None = None,
     workspace_id: uuid.UUID | None = None,
+    package: str | None = None,
 ) -> Page[Role]:
     await authorize(ctx, Permission.ORG_READ)
     stmt = select(Role).where(Role.tenant_id == ctx.tenant_id)
     if workspace_id is not None:
         stmt = stmt.where(Role.workspace_id == workspace_id)
+    if package is not None:
+        # A package brings roles of the tenant, never of a workspace.
+        stmt = stmt.where(
+            Role.workspace_id.is_(None), in_package("Role", Role.tenant_id, Role.slug, package)
+        )
     return await _paginate(
         session,
         stmt,
@@ -185,9 +192,12 @@ async def list_capabilities(
     *,
     limit: int | None = None,
     cursor: str | None = None,
+    package: str | None = None,
 ) -> Page[Capability]:
     await authorize(ctx, Permission.ORG_READ)
     stmt = select(Capability).where(Capability.tenant_id == ctx.tenant_id)
+    if package is not None:
+        stmt = stmt.where(in_package("Capability", Capability.tenant_id, Capability.name, package))
     return await _paginate(
         session,
         stmt,
@@ -220,6 +230,7 @@ async def list_skills(
     cursor: str | None = None,
     name: str | None = None,
     status: str | None = None,
+    package: str | None = None,
 ) -> Page[Skill]:
     await authorize(ctx, Permission.ORG_READ)
     stmt = select(Skill).where(Skill.tenant_id == ctx.tenant_id)
@@ -227,6 +238,8 @@ async def list_skills(
         stmt = stmt.where(Skill.name == name)
     if status is not None:
         stmt = stmt.where(Skill.status == status)
+    if package is not None:
+        stmt = stmt.where(in_package("Skill", Skill.tenant_id, Skill.name, package))
     return await _paginate(
         session,
         stmt,

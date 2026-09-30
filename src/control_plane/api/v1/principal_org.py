@@ -21,6 +21,7 @@ from control_plane.api.v1.schemas import (
 from control_plane.api.write_flow import as_no_content, execute_write
 from control_plane.application.commands import org as commands
 from control_plane.application.queries import org as queries
+from control_plane.application.queries.package_links import attach_package, attach_packages
 from control_plane.infrastructure.db.models import (
     PrincipalCapability,
     PrincipalRole,
@@ -69,7 +70,10 @@ async def assign_role(
             workspace_id=payload.workspace_id,
         )
         role = await commands.get_tenant_role(db, ctx, payload.role_id)
-        return 201, _assignment_body(assignment, "role", dump(RoleOut, role))
+        body = await attach_package(
+            db, ctx.tenant_id, "Role", dump(RoleOut, role), key_field="slug"
+        )
+        return 201, _assignment_body(assignment, "role", body)
 
     return await execute_write(
         request,
@@ -84,11 +88,13 @@ async def assign_role(
 @router.get("/principals/{principal_id}/roles", responses=ERROR_RESPONSES)
 async def list_roles(principal_id: uuid.UUID, ctx: AuthDep, db: DbDep) -> JSONResponse:
     rows = await queries.list_principal_roles(db, ctx, principal_id)
+    bodies = [dump(RoleOut, role) for _, role in rows]
+    await attach_packages(db, ctx.tenant_id, "Role", bodies, key_field="slug")
     return JSONResponse(
         {
             "items": [
-                _assignment_body(assignment, "role", dump(RoleOut, role))
-                for assignment, role in rows
+                _assignment_body(assignment, "role", body)
+                for (assignment, _), body in zip(rows, bodies, strict=True)
             ]
         }
     )
@@ -149,7 +155,10 @@ async def assign_capability(
             metadata=payload.metadata,
         )
         capability = await commands.get_tenant_capability(db, ctx, payload.capability_id)
-        return 201, _assignment_body(assignment, "capability", dump(CapabilityOut, capability))
+        body = await attach_package(
+            db, ctx.tenant_id, "Capability", dump(CapabilityOut, capability), key_field="name"
+        )
+        return 201, _assignment_body(assignment, "capability", body)
 
     return await execute_write(
         request,
@@ -164,11 +173,13 @@ async def assign_capability(
 @router.get("/principals/{principal_id}/capabilities", responses=ERROR_RESPONSES)
 async def list_capabilities(principal_id: uuid.UUID, ctx: AuthDep, db: DbDep) -> JSONResponse:
     rows = await queries.list_principal_capabilities(db, ctx, principal_id)
+    bodies = [dump(CapabilityOut, capability) for _, capability in rows]
+    await attach_packages(db, ctx.tenant_id, "Capability", bodies, key_field="name")
     return JSONResponse(
         {
             "items": [
-                _assignment_body(assignment, "capability", dump(CapabilityOut, capability))
-                for assignment, capability in rows
+                _assignment_body(assignment, "capability", body)
+                for (assignment, _), body in zip(rows, bodies, strict=True)
             ]
         }
     )
@@ -221,7 +232,10 @@ async def assign_skill(
             metadata=payload.metadata,
         )
         skill = await commands.get_tenant_skill(db, ctx, payload.skill_id)
-        return 201, _assignment_body(assignment, "skill", dump(SkillOut, skill))
+        body = await attach_package(
+            db, ctx.tenant_id, "Skill", dump(SkillOut, skill), key_field="name"
+        )
+        return 201, _assignment_body(assignment, "skill", body)
 
     return await execute_write(
         request,
@@ -236,11 +250,13 @@ async def assign_skill(
 @router.get("/principals/{principal_id}/skills", responses=ERROR_RESPONSES)
 async def list_skills(principal_id: uuid.UUID, ctx: AuthDep, db: DbDep) -> JSONResponse:
     rows = await queries.list_principal_skills(db, ctx, principal_id)
+    bodies = [dump(SkillOut, skill) for _, skill in rows]
+    await attach_packages(db, ctx.tenant_id, "Skill", bodies, key_field="name")
     return JSONResponse(
         {
             "items": [
-                _assignment_body(assignment, "skill", dump(SkillOut, skill))
-                for assignment, skill in rows
+                _assignment_body(assignment, "skill", body)
+                for (assignment, _), body in zip(rows, bodies, strict=True)
             ]
         }
     )

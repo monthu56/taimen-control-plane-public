@@ -10,6 +10,7 @@ from control_plane.api.dependencies import AuthDep, DbDep, SessionFactoryDep, Se
 from control_plane.api.etag import format_etag, parse_if_match
 from control_plane.api.v1.schemas import (
     ERROR_RESPONSES,
+    PACKAGE_FILTER_DESCRIPTION,
     CapabilityCreateRequest,
     CapabilityOut,
     PageOut,
@@ -26,6 +27,7 @@ from control_plane.api.v1.schemas import (
 from control_plane.api.write_flow import execute_write
 from control_plane.application.commands import org as commands
 from control_plane.application.queries import org as queries
+from control_plane.application.queries.package_links import attach_package, attach_packages
 
 router = APIRouter(tags=["organization"])
 
@@ -50,7 +52,9 @@ async def create_role(
             description=payload.description,
             workspace_id=payload.workspace_id,
         )
-        return 201, dump(RoleOut, role)
+        return 201, await attach_package(
+            db, ctx.tenant_id, "Role", dump(RoleOut, role), key_field="slug"
+        )
 
     return await execute_write(
         request,
@@ -69,15 +73,21 @@ async def list_roles(
     limit: int | None = Query(default=None),
     cursor: str | None = Query(default=None),
     workspace_id: uuid.UUID | None = Query(default=None, alias="workspaceId"),
+    package: str | None = Query(default=None, description=PACKAGE_FILTER_DESCRIPTION),
 ) -> JSONResponse:
-    page = await queries.list_roles(db, ctx, limit=limit, cursor=cursor, workspace_id=workspace_id)
-    return JSONResponse(page_body([dump(RoleOut, r) for r in page.items], page.next_cursor))
+    page = await queries.list_roles(
+        db, ctx, limit=limit, cursor=cursor, workspace_id=workspace_id, package=package
+    )
+    items = [dump(RoleOut, r) for r in page.items]
+    await attach_packages(db, ctx.tenant_id, "Role", items, key_field="slug")
+    return JSONResponse(page_body(items, page.next_cursor))
 
 
 @router.get("/roles/{role_id}", response_model=RoleOut, responses=ERROR_RESPONSES)
 async def get_role(role_id: uuid.UUID, ctx: AuthDep, db: DbDep) -> JSONResponse:
     role = await queries.get_role(db, ctx, role_id)
-    return JSONResponse(dump(RoleOut, role), headers={"ETag": format_etag("role", role.version)})
+    body = await attach_package(db, ctx.tenant_id, "Role", dump(RoleOut, role), key_field="slug")
+    return JSONResponse(body, headers={"ETag": format_etag("role", role.version)})
 
 
 @router.get("/roles/{role_id}/principals", response_model=PageOut, responses=ERROR_RESPONSES)
@@ -116,7 +126,9 @@ async def update_role(
             name=payload.name,
             description=payload.description,
         )
-        return 200, dump(RoleOut, role)
+        return 200, await attach_package(
+            db, ctx.tenant_id, "Role", dump(RoleOut, role), key_field="slug"
+        )
 
     return await execute_write(
         request,
@@ -146,7 +158,9 @@ async def create_capability(
         capability = await commands.create_capability(
             db, ctx, name=payload.name, description=payload.description
         )
-        return 201, dump(CapabilityOut, capability)
+        return 201, await attach_package(
+            db, ctx.tenant_id, "Capability", dump(CapabilityOut, capability), key_field="name"
+        )
 
     return await execute_write(
         request,
@@ -164,9 +178,12 @@ async def list_capabilities(
     db: DbDep,
     limit: int | None = Query(default=None),
     cursor: str | None = Query(default=None),
+    package: str | None = Query(default=None, description=PACKAGE_FILTER_DESCRIPTION),
 ) -> JSONResponse:
-    page = await queries.list_capabilities(db, ctx, limit=limit, cursor=cursor)
-    return JSONResponse(page_body([dump(CapabilityOut, c) for c in page.items], page.next_cursor))
+    page = await queries.list_capabilities(db, ctx, limit=limit, cursor=cursor, package=package)
+    items = [dump(CapabilityOut, c) for c in page.items]
+    await attach_packages(db, ctx.tenant_id, "Capability", items, key_field="name")
+    return JSONResponse(page_body(items, page.next_cursor))
 
 
 @router.get(
@@ -174,7 +191,10 @@ async def list_capabilities(
 )
 async def get_capability(capability_id: uuid.UUID, ctx: AuthDep, db: DbDep) -> JSONResponse:
     capability = await queries.get_capability(db, ctx, capability_id)
-    return JSONResponse(dump(CapabilityOut, capability))
+    body = dump(CapabilityOut, capability)
+    return JSONResponse(
+        await attach_package(db, ctx.tenant_id, "Capability", body, key_field="name")
+    )
 
 
 # --- skills -------------------------------------------------------------------
@@ -203,7 +223,9 @@ async def register_skill(
             risk_level=payload.risk_level,
             contract=payload.contract,
         )
-        return 201, dump(SkillOut, skill)
+        return 201, await attach_package(
+            db, ctx.tenant_id, "Skill", dump(SkillOut, skill), key_field="name"
+        )
 
     return await execute_write(
         request,
@@ -223,9 +245,14 @@ async def list_skills(
     cursor: str | None = Query(default=None),
     name: str | None = Query(default=None),
     status: str | None = Query(default=None),
+    package: str | None = Query(default=None, description=PACKAGE_FILTER_DESCRIPTION),
 ) -> JSONResponse:
-    page = await queries.list_skills(db, ctx, limit=limit, cursor=cursor, name=name, status=status)
-    return JSONResponse(page_body([dump(SkillOut, s) for s in page.items], page.next_cursor))
+    page = await queries.list_skills(
+        db, ctx, limit=limit, cursor=cursor, name=name, status=status, package=package
+    )
+    items = [dump(SkillOut, s) for s in page.items]
+    await attach_packages(db, ctx.tenant_id, "Skill", items, key_field="name")
+    return JSONResponse(page_body(items, page.next_cursor))
 
 
 @router.get("/skills/{skill_ref}", response_model=SkillOut, responses=ERROR_RESPONSES)
@@ -234,7 +261,7 @@ async def get_skill(skill_ref: str, ctx: AuthDep, db: DbDep) -> JSONResponse:
     carries the full contract v1 when the version has one (ADR-0056). The
     legacy ``config`` is returned empty to callers without ``org.read``."""
     skill, config_visible = await queries.get_skill_by_ref(db, ctx, skill_ref)
-    body = dump(SkillOut, skill)
+    body = await attach_package(db, ctx.tenant_id, "Skill", dump(SkillOut, skill), key_field="name")
     if not config_visible:
         body["config"] = {}
     return JSONResponse(body, headers={"ETag": format_etag("skill", skill.row_version)})
@@ -265,7 +292,9 @@ async def update_skill(
             status=payload.status,
             endpoint=payload.endpoint,
         )
-        return 200, dump(SkillOut, skill)
+        return 200, await attach_package(
+            db, ctx.tenant_id, "Skill", dump(SkillOut, skill), key_field="name"
+        )
 
     return await execute_write(
         request,

@@ -30,6 +30,7 @@ from control_plane.application.authorization import (
 from control_plane.application.commands.work_rules import check_identity, ensure_consumer_cursor
 from control_plane.application.common import new_uuid, utcnow
 from control_plane.application.events import record_event
+from control_plane.application.queries.package_links import in_package
 from control_plane.domain.enums import Permission
 from control_plane.domain.errors import ConflictError, NotFoundError, ValidationError
 from control_plane.domain.process_definition import (
@@ -413,6 +414,7 @@ async def list_process_definitions(
     key: str | None = None,
     workspace_id: uuid.UUID | None = None,
     governed_by: str | None = None,
+    package: str | None = None,
 ) -> tuple[list[ProcessDefinitionView], str | None]:
     """The latest version of every key the caller may read, by key.
 
@@ -448,6 +450,10 @@ async def list_process_definitions(
         stmt = stmt.where(ProcessDefinition.workspace_id == workspace_id)
     if governed_by is not None:
         stmt = stmt.where(ProcessDefinition.governed_by.contains([governed_by]))
+    if package is not None:
+        stmt = stmt.where(
+            in_package("Process", ProcessDefinition.tenant_id, ProcessDefinition.key, package)
+        )
     if after_key is not None:
         stmt = stmt.where(ProcessDefinition.key > after_key)
     rows = list(

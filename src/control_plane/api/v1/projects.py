@@ -17,6 +17,7 @@ from control_plane.api.dependencies import AuthDep, DbDep, SessionFactoryDep, Se
 from control_plane.api.etag import format_etag, parse_if_match
 from control_plane.api.v1.schemas import (
     ERROR_RESPONSES,
+    PACKAGE_FILTER_DESCRIPTION,
     ConfigRevisionCreateRequest,
     ConfigRevisionOut,
     ExternalReferenceCreateRequest,
@@ -39,6 +40,11 @@ from control_plane.application.common import make_created_cursor, parse_created_
 from control_plane.application.queries import external_references as external_reference_queries
 from control_plane.application.queries import projects as queries
 from control_plane.application.queries.lists import clamp_limit
+from control_plane.application.queries.package_links import (
+    attach_package,
+    attach_packages,
+    in_package,
+)
 from control_plane.domain.enums import Permission
 from control_plane.infrastructure.db.models import (
     ProjectConfigRevision,
@@ -142,7 +148,9 @@ async def create_project_template(
             governance_schema=payload.governance_schema,
             memory_defaults=payload.memory_defaults,
         )
-        return 201, dump(ProjectTemplateOut, template)
+        return 201, await attach_package(
+            db, ctx.tenant_id, "ProjectTemplate", dump(ProjectTemplateOut, template)
+        )
 
     return await execute_write(
         request,
@@ -162,6 +170,7 @@ async def list_project_templates(
     cursor: str | None = Query(default=None),
     key: str | None = Query(default=None),
     status: str | None = Query(default=None),
+    package: str | None = Query(default=None, description=PACKAGE_FILTER_DESCRIPTION),
 ) -> JSONResponse:
     await authorize(ctx, Permission.PROJECT_TEMPLATES_READ)
     effective_limit = clamp_limit(limit)
@@ -170,6 +179,10 @@ async def list_project_templates(
         stmt = stmt.where(ProjectTemplate.key == key)
     if status is not None:
         stmt = stmt.where(ProjectTemplate.status == status)
+    if package is not None:
+        stmt = stmt.where(
+            in_package("ProjectTemplate", ProjectTemplate.tenant_id, ProjectTemplate.key, package)
+        )
     if cursor is not None:
         created_at, entity_id = parse_created_cursor(cursor)
         stmt = stmt.where(
@@ -184,7 +197,9 @@ async def list_project_templates(
     if len(rows) > effective_limit:
         rows = rows[:effective_limit]
         next_cursor = make_created_cursor(rows[-1].created_at, rows[-1].id)
-    return JSONResponse(page_body([dump(ProjectTemplateOut, t) for t in rows], next_cursor))
+    items = [dump(ProjectTemplateOut, t) for t in rows]
+    await attach_packages(db, ctx.tenant_id, "ProjectTemplate", items)
+    return JSONResponse(page_body(items, next_cursor))
 
 
 @router.get(
@@ -195,7 +210,8 @@ async def list_project_templates(
 async def get_project_template(template_id: uuid.UUID, ctx: AuthDep, db: DbDep) -> JSONResponse:
     await authorize(ctx, Permission.PROJECT_TEMPLATES_READ)
     template = await template_commands.get_tenant_template(db, ctx, template_id)
-    return JSONResponse(dump(ProjectTemplateOut, template))
+    body = dump(ProjectTemplateOut, template)
+    return JSONResponse(await attach_package(db, ctx.tenant_id, "ProjectTemplate", body))
 
 
 @router.post(
@@ -212,7 +228,9 @@ async def deprecate_project_template(
 ) -> JSONResponse:
     async def executor(db: AsyncSession) -> tuple[int, dict[str, object]]:
         template = await template_commands.deprecate_template(db, ctx, template_id=template_id)
-        return 200, dump(ProjectTemplateOut, template)
+        return 200, await attach_package(
+            db, ctx.tenant_id, "ProjectTemplate", dump(ProjectTemplateOut, template)
+        )
 
     return await execute_write(
         request, ctx, settings, session_factory, canonical_body="", executor=executor

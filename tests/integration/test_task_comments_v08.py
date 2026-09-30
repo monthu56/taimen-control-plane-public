@@ -114,6 +114,93 @@ async def test_author_comes_from_the_credential_not_from_the_body(
     assert forged.json()["error"]["code"] == "invalid_request"
 
 
+async def test_every_comment_names_its_author_in_words(client: httpx.AsyncClient) -> None:
+    """``author {kind, displayName}`` on every read and write (amendment of 2026-09-30).
+
+    A reader holding only ``tasks.read`` tells the owner from an agent without
+    ``principals.read``; an idempotent replay answers the same author.
+    """
+    admin_key = (await do_bootstrap(client))["apiKey"]["key"]
+    agent, agent_key = await create_agent_with_key(client, admin_key, name="runner")
+    _, reader_key = await create_agent_with_key(
+        client, admin_key, name="reader", permissions=["tasks.read"]
+    )
+    task = await create_task(client, admin_key, title="Who said it")
+    ref = task["publicId"]
+    owner = {"kind": "human", "displayName": "Admin"}
+    runner = {"kind": "agent", "displayName": "runner"}
+
+    headers = {**auth(admin_key), "Idempotency-Key": "comment-author-1"}
+    first = await client.post(
+        f"/api/v1/tasks/{ref}/comments", json={"body": "Owner speaking."}, headers=headers
+    )
+    assert first.status_code == 201, first.text
+    assert first.json()["author"] == owner
+    replay = await client.post(
+        f"/api/v1/tasks/{ref}/comments", json={"body": "Owner speaking."}, headers=headers
+    )
+    assert replay.status_code == 201, replay.text
+    assert replay.json() == first.json()
+
+    from_agent = await add_comment(client, agent_key, ref, "Agent speaking.")
+    assert from_agent.json()["author"] == runner
+    assert from_agent.json()["authorPrincipalId"] == agent["id"]
+
+    edited = await edit_comment(
+        client, agent_key, ref, from_agent.json()["id"], "Agent, corrected.", version=1
+    )
+    assert edited.status_code == 200, edited.text
+    assert edited.json()["author"] == runner
+
+    listed = await client.get(f"/api/v1/tasks/{ref}/comments", headers=auth(reader_key))
+    assert listed.status_code == 200, listed.text
+    assert [(c["body"], c["author"]) for c in listed.json()["items"]] == [
+        ("Owner speaking.", owner),
+        ("Agent, corrected.", runner),
+    ]
+    one = await client.get(
+        f"/api/v1/tasks/{ref}/comments/{first.json()['id']}", headers=auth(reader_key)
+    )
+    assert one.status_code == 200, one.text
+    assert one.json()["author"] == owner
+    # The reader still cannot read the principal itself: only the words travel.
+    principal = await client.get(f"/api/v1/principals/{agent['id']}", headers=auth(reader_key))
+    assert principal.status_code == 403, principal.text
+
+
+async def test_cores_comment_names_a_service(
+    client: httpx.AsyncClient, sync_engine: Engine
+) -> None:
+    """Core's own principal is a ``service``: runners tell its text from a person's."""
+    admin_key = (await do_bootstrap(client))["apiKey"]["key"]
+    task = await create_task(client, admin_key, title="Verified")
+    with sync_engine.begin() as conn:
+        core_id = conn.execute(
+            text(
+                "INSERT INTO principals"
+                " (id, tenant_id, kind, display_name, status, metadata, created_at, updated_at)"
+                " VALUES (gen_random_uuid(), :tenant, 'service', 'Control Plane', 'active',"
+                ' \'{"system": "control-plane-core"}\', now(), now()) RETURNING id'
+            ),
+            {"tenant": task["tenantId"]},
+        ).scalar_one()
+        conn.execute(
+            text(
+                "INSERT INTO task_comments (id, tenant_id, task_id, author_principal_id, body,"
+                " version, created_at, updated_at)"
+                " VALUES (gen_random_uuid(), :tenant, :task, :author,"
+                " 'Verification attempt #1 failed', 1, now(), now())"
+            ),
+            {"tenant": task["tenantId"], "task": task["id"], "author": core_id},
+        )
+
+    listed = await client.get(f"/api/v1/tasks/{task['publicId']}/comments", headers=auth(admin_key))
+    assert listed.status_code == 200, listed.text
+    [item] = listed.json()["items"]
+    assert item["author"] == {"kind": "service", "displayName": "Control Plane"}
+    assert item["authorPrincipalId"] == str(core_id)
+
+
 async def test_reading_a_thread_requires_read_and_writing_requires_write(
     client: httpx.AsyncClient,
 ) -> None:

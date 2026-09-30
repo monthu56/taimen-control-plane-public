@@ -13,6 +13,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from control_plane.api.dependencies import AuthDep, DbDep, SessionFactoryDep, SettingsDep
 from control_plane.api.v1.schemas import (
     ERROR_RESPONSES,
+    PACKAGE_FILTER_DESCRIPTION,
     ArtifactTypeCreateRequest,
     ArtifactTypeOut,
     PageOut,
@@ -24,6 +25,11 @@ from control_plane.application.authorization import authorize
 from control_plane.application.commands import artifact_types as commands
 from control_plane.application.common import make_created_cursor, parse_created_cursor
 from control_plane.application.queries.lists import clamp_limit
+from control_plane.application.queries.package_links import (
+    attach_package,
+    attach_packages,
+    in_package,
+)
 from control_plane.domain.enums import Permission
 from control_plane.infrastructure.db.models import ArtifactType
 
@@ -56,7 +62,9 @@ async def create_artifact_type(
             max_bytes=payload.max_bytes,
             global_max_bytes=settings.artifact_max_bytes,
         )
-        return 201, dump(ArtifactTypeOut, artifact_type)
+        return 201, await attach_package(
+            db, ctx.tenant_id, "ArtifactType", dump(ArtifactTypeOut, artifact_type)
+        )
 
     return await execute_write(
         request,
@@ -76,6 +84,7 @@ async def list_artifact_types(
     cursor: str | None = Query(default=None),
     key: str | None = Query(default=None),
     status: str | None = Query(default=None),
+    package: str | None = Query(default=None, description=PACKAGE_FILTER_DESCRIPTION),
 ) -> JSONResponse:
     await authorize(ctx, Permission.ARTIFACT_TYPES_READ)
     effective_limit = clamp_limit(limit)
@@ -84,6 +93,10 @@ async def list_artifact_types(
         stmt = stmt.where(ArtifactType.key == key)
     if status is not None:
         stmt = stmt.where(ArtifactType.status == status)
+    if package is not None:
+        stmt = stmt.where(
+            in_package("ArtifactType", ArtifactType.tenant_id, ArtifactType.key, package)
+        )
     if cursor is not None:
         created_at, entity_id = parse_created_cursor(cursor)
         stmt = stmt.where(
@@ -98,11 +111,14 @@ async def list_artifact_types(
     if len(rows) > effective_limit:
         rows = rows[:effective_limit]
         next_cursor = make_created_cursor(rows[-1].created_at, rows[-1].id)
-    return JSONResponse(page_body([dump(ArtifactTypeOut, t) for t in rows], next_cursor))
+    items = [dump(ArtifactTypeOut, t) for t in rows]
+    await attach_packages(db, ctx.tenant_id, "ArtifactType", items)
+    return JSONResponse(page_body(items, next_cursor))
 
 
 @router.get("/artifact-types/{ref}", response_model=ArtifactTypeOut, responses=ERROR_RESPONSES)
 async def get_artifact_type(ref: str, ctx: AuthDep, db: DbDep) -> JSONResponse:
     """``key`` — the latest version; ``key@version`` — that version."""
     await authorize(ctx, Permission.ARTIFACT_TYPES_READ)
-    return JSONResponse(dump(ArtifactTypeOut, await commands.resolve_artifact_type(db, ctx, ref)))
+    body = dump(ArtifactTypeOut, await commands.resolve_artifact_type(db, ctx, ref))
+    return JSONResponse(await attach_package(db, ctx.tenant_id, "ArtifactType", body))

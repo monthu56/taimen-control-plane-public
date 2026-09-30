@@ -321,8 +321,8 @@
     {
       "type": "library",
       "name": "httpcore2",
-      "version": "2.10.0",
-      "purl": "pkg:pypi/httpcore2@2.10.0",
+      "version": "2.13.1",
+      "purl": "pkg:pypi/httpcore2@2.13.1",
       "licenses": [
         {
           "license": {
@@ -378,8 +378,8 @@
     {
       "type": "library",
       "name": "httpx2",
-      "version": "2.10.0",
-      "purl": "pkg:pypi/httpx2@2.10.0",
+      "version": "2.13.1",
+      "purl": "pkg:pypi/httpx2@2.13.1",
       "licenses": [
         {
           "license": {

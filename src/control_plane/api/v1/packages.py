@@ -2,33 +2,49 @@
 
 The body is the package as its files: the core parses YAML 1.2 itself so a
 finding names the file and line. Test and plan write nothing; apply performs
-exactly the plan whose hash it is given, or refuses ``409 plan_stale``.
+exactly the plan whose hash it is given, or refuses ``409 plan_stale``. The
+shape of an object the plan takes from the request model of its kind's route
+(:data:`SHAPES`): a package says what ``POST /task-types``, ``POST /agents``,
+``POST /rules`` and ``POST /calendars`` would be sent. ``packages:record``
+links the objects the installer applied through their own routes to their
+package (:mod:`control_plane.application.commands.package_links`).
 ``packages:test`` — :mod:`control_plane.application.commands.package_test`
 (P013); plan and apply — :mod:`control_plane.application.commands.package_plan`
 (P015).
 """
 
+import uuid
 from typing import Any, cast
 
+import pydantic
 from fastapi import APIRouter, Query, Request
 from fastapi.responses import JSONResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from control_plane.api.dependencies import AuthDep, SessionFactoryDep, SettingsDep
 from control_plane.api.v1.calendars import calendar_request, spec_as_sent
+from control_plane.api.v1.principals import forget_binding_cache
 from control_plane.api.v1.processes import RESPONSES
 from control_plane.api.v1.schemas import (
     ERROR_RESPONSES,
+    AgentPublishRequest,
+    ApiModel,
     PackageApplyOut,
     PackageApplyRequest,
     PackagePlanOut,
     PackagePlanRequest,
+    PackageRecordOut,
+    PackageRecordRequest,
     PackageTestOut,
     PackageTestRequest,
+    RuleCreateRequest,
+    TaskTypeCreateRequest,
+    work_document,
 )
 from control_plane.api.write_flow import execute_write
 from control_plane.application.authorization import authorize
-from control_plane.application.commands import package_plan
+from control_plane.application.commands import package_links, package_plan
+from control_plane.application.commands.package_catalog import SpecShape
 from control_plane.application.commands.package_test import run_package_tests
 from control_plane.domain.calendar import Calendar, CalendarError
 from control_plane.domain.enums import Permission
@@ -57,10 +73,72 @@ def calendar_spec(obj: PackageObject) -> tuple[dict[str, Any] | None, list[Probl
     return spec, []
 
 
+def _shaped(
+    model: type[ApiModel], body: dict[str, Any], code: str, prefix: str
+) -> tuple[ApiModel | None, list[Problem]]:
+    """``body`` validated by the request model of a route, or the findings of its shape."""
+    try:
+        return model.model_validate(body), []
+    except pydantic.ValidationError as exc:
+        problems = []
+        for error in exc.errors():
+            loc = [str(part) for part in error["loc"]]
+            path = "/key" if loc[:1] == ["key"] else prefix + "".join("/" + p for p in loc)
+            problems.append(Problem(code, "error", path, error["msg"]))
+        return None, problems
+
+
+def task_type_spec(obj: PackageObject) -> tuple[dict[str, Any] | None, list[Problem]]:
+    """A TaskType as ``POST /task-types`` takes it: the fields the file sets."""
+    payload, problems = _shaped(
+        TaskTypeCreateRequest, {"key": obj.key, **obj.spec}, "invalid_task_type", "/spec"
+    )
+    if payload is None:
+        return None, problems
+    sent = payload.model_dump(mode="json", by_alias=True, exclude_unset=True)
+    sent.pop("key", None)
+    if "acceptance" in sent:
+        sent["acceptance"] = work_document(cast(TaskTypeCreateRequest, payload).acceptance)
+    return sent, []
+
+
+def agent_spec(obj: PackageObject) -> tuple[dict[str, Any] | None, list[Problem]]:
+    """An Agent as ``POST /agents`` takes it: the spec as sent, without defaults."""
+    payload, problems = _shaped(
+        AgentPublishRequest, {"key": obj.key, "spec": obj.spec}, "invalid_agent", ""
+    )
+    if payload is None:
+        return None, problems
+    spec = cast(AgentPublishRequest, payload).spec
+    return spec.model_dump(mode="json", by_alias=True, exclude_unset=True), []
+
+
+def rule_spec(obj: PackageObject) -> tuple[dict[str, Any] | None, list[Problem]]:
+    """A WorkRule as ``POST /rules`` takes it (without ``goalId``: a package names no goal)."""
+    if "goalId" in obj.spec:
+        return None, [Problem("invalid_rule", "error", "/spec/goalId", "a package names no goal")]
+    payload, problems = _shaped(
+        RuleCreateRequest, {"key": obj.key, **obj.spec}, "invalid_rule", "/spec"
+    )
+    if payload is None:
+        return None, problems
+    sent = payload.model_dump(mode="json", by_alias=True, exclude_unset=True)
+    sent.pop("key", None)
+    return sent, []
+
+
 def check_calendar(obj: PackageObject) -> tuple[Calendar | None, list[Problem]]:
     """A package object of kind Calendar: its shape (``CalendarSpec``), then the calendar itself."""
     spec, problems = calendar_spec(obj)
     return (Calendar.from_spec(spec) if spec is not None else None), problems
+
+
+SHAPES: dict[str, SpecShape] = {
+    "Calendar": calendar_spec,
+    "TaskType": task_type_spec,
+    "Agent": agent_spec,
+    "WorkRule": rule_spec,
+}
 
 
 @router.post(
@@ -118,7 +196,7 @@ async def plan_package(
         workspace_id=payload.workspace_id,
         replay_limit=payload.replay_limit,
         overwrite=payload.overwrite_console,
-        calendar_spec=calendar_spec,
+        shapes=SHAPES,
     )
     body = PackagePlanOut.model_validate(plan.out()).model_dump(mode="json", by_alias=True)
     return JSONResponse(body)
@@ -138,8 +216,10 @@ async def apply_package(
     session_factory: SessionFactoryDep,
 ) -> JSONResponse:
     # packages.plan here; each change is checked again against the right of
-    # its kind (processes.write, calendars.write) when it is applied.
+    # its kind (task_types.manage, agents.manage, calendars.write,
+    # processes.write, rules.write) when it is applied.
     await authorize(ctx, Permission.PACKAGES_PLAN)
+    touched: list[tuple[str, uuid.UUID]] = []
 
     async def executor(db: AsyncSession) -> tuple[int, dict[str, object]]:
         applied = await package_plan.apply_package(
@@ -149,9 +229,47 @@ async def apply_package(
             expected_hash=payload.plan_hash,
             workspace_id=payload.workspace_id,
             overwrite=payload.overwrite_console,
-            calendar_spec=calendar_spec,
+            shapes=SHAPES,
+            touched=touched,
         )
         return 200, PackageApplyOut.model_validate(applied).model_dump(mode="json", by_alias=True)
+
+    response = await execute_write(
+        request,
+        ctx,
+        settings,
+        session_factory,
+        canonical_body=payload.model_dump_json(),
+        executor=executor,
+    )
+    for issuer, iam_principal_id in touched:
+        forget_binding_cache(request, issuer, iam_principal_id)
+    return response
+
+
+@router.post(
+    "/packages:record",
+    response_model=PackageRecordOut,
+    responses=ERROR_RESPONSES,
+    summary="Link the objects an installer applied through their routes to their package",
+)
+async def record_package(
+    payload: PackageRecordRequest,
+    request: Request,
+    ctx: AuthDep,
+    settings: SettingsDep,
+    session_factory: SessionFactoryDep,
+) -> JSONResponse:
+    async def executor(db: AsyncSession) -> tuple[int, dict[str, object]]:
+        recorded = await package_links.record_package(
+            db,
+            ctx,
+            package_key=payload.package.key,
+            package_version=payload.package.version,
+            install_hash=payload.install_hash,
+            objects=[(item.kind, item.key) for item in payload.objects],
+        )
+        return 200, PackageRecordOut.model_validate(recorded).model_dump(mode="json", by_alias=True)
 
     return await execute_write(
         request,

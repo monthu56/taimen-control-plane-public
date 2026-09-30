@@ -17,6 +17,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from control_plane.application.authorization import AuthContext, authorize
 from control_plane.application.common import new_uuid, utcnow
 from control_plane.application.events import record_event
+from control_plane.application.queries.package_links import in_package
 from control_plane.domain.calendar import Calendar, CalendarError, normalized_spec
 from control_plane.domain.canonical import canonicalize, content_hash
 from control_plane.domain.enums import Permission
@@ -160,7 +161,12 @@ async def resolve_calendar(session: AsyncSession, ctx: AuthContext, ref: str) ->
 
 
 async def list_calendars(
-    session: AsyncSession, ctx: AuthContext, *, limit: int, after_key: str | None
+    session: AsyncSession,
+    ctx: AuthContext,
+    *,
+    limit: int,
+    after_key: str | None,
+    package: str | None = None,
 ) -> tuple[list[CalendarView], str | None]:
     """The latest version of every key, by key; the last key of a full page continues it."""
     latest = (
@@ -177,6 +183,10 @@ async def list_calendars(
         )
         .where(CalendarVersion.tenant_id == ctx.tenant_id)
     )
+    if package is not None:
+        stmt = stmt.where(
+            in_package("Calendar", CalendarVersion.tenant_id, CalendarVersion.key, package)
+        )
     if after_key is not None:
         stmt = stmt.where(CalendarVersion.key > after_key)
     rows = list((await session.scalars(stmt.order_by(CalendarVersion.key).limit(limit + 1))).all())

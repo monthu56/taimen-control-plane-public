@@ -57,6 +57,7 @@ from control_plane.application.context.graph import (
     within_budget,
 )
 from control_plane.application.events import record_event
+from control_plane.application.locking import lock_principal_key_share
 from control_plane.config import Settings
 from control_plane.domain.context_schema import (
     AS_OF_NOW,
@@ -505,6 +506,11 @@ async def _record(
     assert call.claim_id is not None
     used = used_of(pack)
     async with transaction(session_factory) as db:
+        # The record references the caller: its principal before the task
+        # (rule 1 of ``application/locking.py``, CP-ADR-0077 §3) — this
+        # transaction does not go through the write flow. A caller disabled in
+        # the meantime has lost its claim, and the check below records nothing.
+        await lock_principal_key_share(db, ctx.tenant_id, ctx.principal_id)
         # Claim, release and takeover lock the task row; expiry is lazy (the
         # deadline passed). Under the lock the claim this pack was compiled
         # for is still the live one, or nothing is recorded.

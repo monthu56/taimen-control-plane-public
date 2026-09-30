@@ -24,6 +24,7 @@ from control_plane.api.v1.schemas import (
     RunStartRequest,
     TaskCompleteRequest,
     TaskCreateRequest,
+    TaskMigrateTypeRequest,
     TaskOut,
     TaskRelationOut,
     TaskRequirementsSpec,
@@ -38,6 +39,7 @@ from control_plane.api.write_flow import as_no_content, execute_write
 from control_plane.application.commands import claims as claim_commands
 from control_plane.application.commands import relations as relation_commands
 from control_plane.application.commands import runs as run_commands
+from control_plane.application.commands import task_type_migration as migration_commands
 from control_plane.application.commands import tasks as commands
 from control_plane.application.commands.eligibility import RequirementSpec
 from control_plane.application.commands.tasks import _UNSET
@@ -138,6 +140,15 @@ async def list_tasks(
     due_to: datetime | None = Query(default=None, alias="dueTo"),
     sort: str | None = Query(default=None),
     goal_id: uuid.UUID | None = Query(default=None, alias="goalId"),
+    q: str | None = Query(
+        default=None,
+        description=(
+            "Text search: every whitespace-separated term must occur, case-insensitively, "
+            "in the title, the description or the publicId (substring match). At most "
+            "200 characters and 10 terms, else 422 invalid_search; empty means no filter. "
+            "Combines with every other filter, sort and cursor (CP-ADR-0049)."
+        ),
+    ),
 ) -> JSONResponse:
     page = await queries.list_tasks(
         db,
@@ -160,6 +171,7 @@ async def list_tasks(
         due_to=due_to,
         sort=sort,
         goal_id=goal_id,
+        q=q,
     )
     return JSONResponse(page_body(await task_bodies(db, ctx, page.items), page.next_cursor))
 
@@ -354,6 +366,45 @@ async def complete_task(
             expected_version=expected_version,
             claim_id=body.claim_id,
             fencing_token=body.fencing_token,
+        )
+        return 200, await task_body(db, ctx, task)
+
+    return await execute_write(
+        request,
+        ctx,
+        settings,
+        session_factory,
+        canonical_body=f"if-match:{expected_version}\n" + body.model_dump_json(exclude_unset=True),
+        executor=executor,
+    )
+
+
+@router.post(
+    "/tasks/{task_ref}:migrate-type",
+    response_model=TaskOut,
+    responses=ERROR_RESPONSES,
+    summary="Move an open task to another version of its type (ADR-0048)",
+)
+async def migrate_task_type(
+    task_ref: str,
+    request: Request,
+    ctx: AuthDep,
+    settings: SettingsDep,
+    session_factory: SessionFactoryDep,
+    payload: TaskMigrateTypeRequest | None = None,
+    if_match: str | None = Header(default=None),
+) -> JSONResponse:
+    expected_version = parse_if_match(if_match)
+    body = payload or TaskMigrateTypeRequest()
+
+    async def executor(db: AsyncSession) -> tuple[int, dict[str, object]]:
+        task = await migration_commands.migrate_task_type(
+            db,
+            ctx,
+            task_ref=task_ref,
+            expected_version=expected_version,
+            type_version=body.type_version,
+            status_map=body.status_map,
         )
         return 200, await task_body(db, ctx, task)
 

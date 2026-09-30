@@ -961,6 +961,37 @@ role}`), это ошибка команды, а не отказ элемента
   переводится в `unknown_role`.
 - Тесты: `tests/integration/test_rules_target_workspace.py`.
 
+## Амендмент 2026-09-29 (runtime-console, R001): чтение оценки по id
+
+Основание: фича `runtime-console` (R001; FR-002, SC-002). Задача, заведённая
+правилом, ссылается на свою оценку: `origin.ref = rule_evaluation:<id>` (п.5).
+Раньше найти эту оценку можно было только перебором страниц
+`GET /rules/{ruleId}/evaluations`. Консоли, которая объясняет, откуда взялась
+задача, нужно прочитать оценку одним вызовом.
+
+### Е1. `GET /rule-evaluations/{id}`
+
+- **Ответ:** `RuleEvaluationOut` — та же форма, что у элемента
+  `/rules/{id}/evaluations` (`status`, `result`, `evidence`, `createdTaskIds`,
+  `error`, `nextCheckAt`, `ruleId`, `ruleVersion`, `triggerRef`…). ETag нет:
+  оценка не правится через API.
+- **Право:** `rules.read`. Оно проверяется так же, как у чтения правила (п.8):
+  сначала без ресурса, затем на workspace правила оценки (у правила tenant'а —
+  только на tenant). Нового действия в `authz/catalog.yaml` нет.
+- **Видимость:** оценка ищется в tenant'е вызывающего. Оценка чужого tenant'а
+  и несуществующий id дают `404 not_found` (`details.evaluationId`). Оценка
+  архивного правила читается: история правила остаётся (п.9).
+- Оценка правила в недоступном workspace своего tenant'а даёт `403`, а не
+  `404` — как у `get_rule`.
+- MCP и SDK в этот амендмент не входят: `cp_get_rule` по-прежнему отдаёт первую
+  страницу истории.
+
+### Реализация амендмента (R001, TASK-000813)
+
+- `application/queries/work_rules.py`: `get_rule_evaluation`.
+- `api/v1/rules.py`: маршрут `GET /rule-evaluations/{evaluation_id}`.
+- Тесты: `tests/integration/test_rule_evaluation_read.py`.
+
 ## Conformance
 
 Пробы для `adr.conformance_check` (пилот «саморазработка»):
@@ -994,4 +1025,6 @@ role}`), это ошибка команды, а не отказ элемента
 - grep: {path: tests/integration/test_rules_identity_relations.py, pattern: 'test_for_each_files_typed_related_work_once'}
 - grep: {path: src/control_plane/domain/work_rules.py, pattern: 'WORKSPACE_FIELD = "workspaceId"'}
 - grep: {path: tests/integration/test_rules_target_workspace.py, pattern: 'test_work_goes_to_the_workspace_and_the_role_the_item_names'}
+- grep: {path: src/control_plane/api/v1/rules.py, pattern: '"/rule-evaluations/\{evaluation_id\}"'}
+- grep: {path: tests/integration/test_rule_evaluation_read.py, pattern: 'test_the_evaluation_that_filed_a_task_reads_in_one_call'}
 ```

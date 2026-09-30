@@ -1,4 +1,4 @@
-"""Work rule read side: one rule, a page of rules, a rule's evaluations (CP-ADR-0063).
+"""Work rule read side: one rule, a page of rules, evaluations of a rule or by id (CP-ADR-0063).
 
 ``rules.read`` is decided on the rule's workspace (the tenant for a
 tenant-level rule), like ``goals.read``: in policy mode a listing narrows to
@@ -13,8 +13,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from control_plane.application.authorization import AuthContext, authorize, visible_objects
 from control_plane.application.commands.work_rules import get_tenant_rule, rule_scope
 from control_plane.application.queries.lists import Page, _paginate, clamp_limit
+from control_plane.application.queries.package_links import in_package
 from control_plane.domain.enums import Permission
-from control_plane.domain.errors import ValidationError
+from control_plane.domain.errors import NotFoundError, ValidationError
 from control_plane.domain.work_rules import RULE_STATUSES, EvaluationStatus, RuleStatus
 from control_plane.infrastructure.db.models import RuleEvaluation, WorkRule
 
@@ -39,6 +40,7 @@ async def list_rules(
     workspace_id: uuid.UUID | None = None,
     key: str | None = None,
     trigger_kind: str | None = None,
+    package: str | None = None,
 ) -> Page[WorkRule]:
     """Newest first; archived rules only when asked for by status."""
     await authorize(ctx, Permission.RULES_READ)
@@ -65,6 +67,8 @@ async def list_rules(
         stmt = stmt.where(WorkRule.key == key)
     if trigger_kind is not None:
         stmt = stmt.where(WorkRule.trigger["kind"].astext == trigger_kind)
+    if package is not None:
+        stmt = stmt.where(in_package("WorkRule", WorkRule.tenant_id, WorkRule.key, package))
     return await _paginate(
         session,
         stmt,
@@ -101,3 +105,30 @@ async def list_rule_evaluations(
         limit=clamp_limit(limit),
         cursor=cursor,
     )
+
+
+async def get_rule_evaluation(
+    session: AsyncSession, ctx: AuthContext, evaluation_id: uuid.UUID
+) -> RuleEvaluation:
+    """One evaluation by id — the target of ``origin.ref = rule_evaluation:<id>``.
+
+    Decided like the rule itself: ``rules.read`` on the rule's workspace. An
+    evaluation of another tenant is not found.
+    """
+    await authorize(ctx, Permission.RULES_READ)
+    row = (
+        await session.execute(
+            select(RuleEvaluation, WorkRule.workspace_id)
+            .join(WorkRule, WorkRule.id == RuleEvaluation.rule_id)
+            .where(RuleEvaluation.id == evaluation_id, RuleEvaluation.tenant_id == ctx.tenant_id)
+        )
+    ).first()
+    if row is None:
+        raise NotFoundError(
+            "Rule evaluation not found", details={"evaluationId": str(evaluation_id)}
+        )
+    evaluation: RuleEvaluation = row[0]
+    workspace_id = row[1]
+    if workspace_id is not None:
+        await authorize(ctx, Permission.RULES_READ, resource=rule_scope(workspace_id))
+    return evaluation

@@ -16,6 +16,7 @@ from control_plane.api.dependencies import AuthDep, DbDep, SessionFactoryDep, Se
 from control_plane.api.etag import format_etag, parse_if_match
 from control_plane.api.v1.schemas import (
     ERROR_RESPONSES,
+    PACKAGE_FILTER_DESCRIPTION,
     PageOut,
     RuleCreateRequest,
     RuleEvaluationOut,
@@ -28,6 +29,7 @@ from control_plane.api.write_flow import as_no_content, execute_write
 from control_plane.application.commands import work_rules as commands
 from control_plane.application.commands.work_rules import _UNSET
 from control_plane.application.queries import work_rules as queries
+from control_plane.application.queries.package_links import attach_package, attach_packages
 from control_plane.domain.errors import ValidationError
 from control_plane.domain.work_rules import RuleStatus
 
@@ -69,7 +71,7 @@ async def create_rule(
             status=payload.status,
             identity=payload.identity.model_dump() if payload.identity else None,
         )
-        return 201, dump(RuleOut, rule)
+        return 201, await attach_package(db, ctx.tenant_id, "WorkRule", dump(RuleOut, rule))
 
     return await execute_write(
         request,
@@ -91,6 +93,7 @@ async def list_rules(
     workspace_id: uuid.UUID | None = Query(default=None, alias="workspaceId"),
     key: str | None = Query(default=None),
     trigger_kind: str | None = Query(default=None, alias="triggerKind"),
+    package: str | None = Query(default=None, description=PACKAGE_FILTER_DESCRIPTION),
 ) -> JSONResponse:
     page = await queries.list_rules(
         db,
@@ -101,15 +104,19 @@ async def list_rules(
         workspace_id=workspace_id,
         key=key,
         trigger_kind=trigger_kind,
+        package=package,
     )
-    return JSONResponse(page_body([dump(RuleOut, r) for r in page.items], page.next_cursor))
+    items = [dump(RuleOut, r) for r in page.items]
+    await attach_packages(db, ctx.tenant_id, "WorkRule", items)
+    return JSONResponse(page_body(items, page.next_cursor))
 
 
 @router.get("/rules/{rule_id}", response_model=RuleOut, responses=ERROR_RESPONSES)
 async def get_rule(rule_id: uuid.UUID, ctx: AuthDep, db: DbDep) -> JSONResponse:
     rule = await queries.get_rule(db, ctx, rule_id)
     return JSONResponse(
-        dump(RuleOut, rule), headers={"ETag": format_etag(_RULE_ENTITY, rule.version)}
+        await attach_package(db, ctx.tenant_id, "WorkRule", dump(RuleOut, rule)),
+        headers={"ETag": format_etag(_RULE_ENTITY, rule.version)},
     )
 
 
@@ -146,7 +153,7 @@ async def update_rule(
             goal_id=pick("goal_id"),
             identity=pick("identity"),
         )
-        return 200, dump(RuleOut, rule)
+        return 200, await attach_package(db, ctx.tenant_id, "WorkRule", dump(RuleOut, rule))
 
     return await execute_write(
         request,
@@ -169,7 +176,7 @@ async def _set_status(
 ) -> JSONResponse:
     async def executor(db: AsyncSession) -> tuple[int, dict[str, object]]:
         rule = await commands.set_rule_status(db, ctx, rule_id=rule_id, status=status)
-        return 200, dump(RuleOut, rule)
+        return 200, await attach_package(db, ctx.tenant_id, "WorkRule", dump(RuleOut, rule))
 
     return await execute_write(
         request, ctx, settings, session_factory, canonical_body=status, executor=executor
@@ -252,3 +259,14 @@ async def list_rule_evaluations(
     return JSONResponse(
         page_body([dump(RuleEvaluationOut, e) for e in page.items], page.next_cursor)
     )
+
+
+@router.get(
+    "/rule-evaluations/{evaluation_id}",
+    response_model=RuleEvaluationOut,
+    responses=ERROR_RESPONSES,
+    summary="One evaluation by id: what origin.ref = rule_evaluation:<id> points to",
+)
+async def get_rule_evaluation(evaluation_id: uuid.UUID, ctx: AuthDep, db: DbDep) -> JSONResponse:
+    evaluation = await queries.get_rule_evaluation(db, ctx, evaluation_id)
+    return JSONResponse(dump(RuleEvaluationOut, evaluation))

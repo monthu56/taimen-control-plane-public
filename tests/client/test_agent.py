@@ -520,6 +520,9 @@ async def test_a_finished_action_followed_by_silence_is_stopped_as_before(
     assert adapter.stopped
     [run] = await _runs(client, admin_key, task["id"])
     assert (run["status"], run["failureReason"]) == ("failed", "no_progress")
-    [stall] = await _stalls(client, admin_key, run["id"])
+    # On a slow machine the watchdog may already warn while the action is still
+    # running; its finish is progress, so a second warning follows. The last one is
+    # the silence after the finished action.
+    stall = (await _stalls(client, admin_key, run["id"]))[-1]
     assert stall["data"]["lastAction"]["status"] == "completed"
     assert "actionRunning" not in stall["data"]

@@ -39,6 +39,7 @@ from control_plane_client.errors import (
     TransportError,
     ValidationError,
     VersionConflictError,
+    is_transient,
 )
 from control_plane_client.iam import IamCredential, IamCredentialError
 
@@ -71,6 +72,7 @@ __all__ = [
     "VersionConflictError",
     "delete_api_key",
     "find_project_config",
+    "is_transient",
     "resolve_api_key",
     "resolve_credential",
     "store_api_key",

@@ -30,6 +30,7 @@ from control_plane.application.commands.runs import (
 from control_plane.application.commands.tasks import create_task, enforce_claim_gate
 from control_plane.application.common import new_uuid, utcnow
 from control_plane.application.events import record_event
+from control_plane.application.locking import lock_principals_key_share
 from control_plane.domain.child_handle import (
     MAX_ARTIFACT_REFS,
     Grant,
@@ -203,6 +204,11 @@ async def launch_child_run(
     # committed row and replays it. Without that order both would find nothing
     # and race into the unique constraint.
     run_probe = await _get_tenant_run(session, ctx, parent_run_id)
+    # The child task and the handle reference the caller (locked by the write
+    # flow) and the owner and assignee named here: those go before the parent
+    # task (rule 3 of ``application/locking.py``, CP-ADR-0077 §3), and the
+    # parent run's session goes first inside ``_lock_task_then_run`` (rule 2).
+    await lock_principals_key_share(session, ctx.tenant_id, [owner_id, assignee_id])
     parent_task, parent_run = await _lock_task_then_run(session, ctx, run_probe)
 
     existing = await session.scalar(

@@ -84,6 +84,7 @@ from control_plane.application.common import new_uuid, utcnow
 from control_plane.application.context.graph import entity_key
 from control_plane.application.event_cursor import EventPosition
 from control_plane.application.events import record_event
+from control_plane.application.locking import lock_process_identities
 from control_plane.application.queries.events import JournalEvent, fetch_events_after
 from control_plane.application.queries.recall import (
     ProcessRecallFailed,
@@ -265,6 +266,11 @@ async def _acting(
         trace_run_id=trace_run_id,
         iam_principal_id=uuid.UUID(iam) if iam else None,
     )
+    # The process acts as its agent, and a step may start or cancel a child
+    # acting as another: every process agent's principal before any task row
+    # (``lock_process_identities``, CP-ADR-0077 §3). Only the instance row is
+    # held here, which ``principals/{id}:disable`` never takes.
+    await lock_process_identities(session, ctx.tenant_id)
     try:
         await require_active_credential(
             session,
@@ -1879,6 +1885,11 @@ async def process_tenant_events(
     )
     if not events:
         return 0
+    # One transaction feeds many instances, and a task an earlier input locks
+    # stays locked until the commit: every principal the processes may act as
+    # or name, and the actors of the batch's events (an instance an event
+    # starts records its actor as ``started_by``), first.
+    await lock_process_identities(session, tenant_id, [event.actor_id for event in events])
     processes = await _published(session, tenant_id)
     taken = 0
     for event in events:

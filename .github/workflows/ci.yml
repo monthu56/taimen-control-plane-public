@@ -86,11 +86,15 @@ jobs:
         run: uv run mypy src
       # S3-compatible store for the ContentStore contract test (CP-ADR-0072).
       # A step, not a service: the MinIO image needs a command line.
+      # The upstream Docker Hub image is gone; the Chainguard image is pinned by digest
+      # (MinIO RELEASE.2026-09-22T19-25-18Z). Its entrypoint is /usr/bin/minio, so the
+      # command starts with "server"; /data in the image is writable by its non-root user.
       - name: Start MinIO
         run: |
           docker run -d --name minio -p 9000:9000 \
             -e MINIO_ROOT_USER=minioadmin -e MINIO_ROOT_PASSWORD=minioadmin \
-            minio/minio:RELEASE.2025-04-22T22-12-26Z server /data
+            cgr.dev/chainguard/minio:latest@sha256:4692462f35d97d7e82c30371d82f057703c5d9489bcae726010594c812f2d285 \
+            server /data
           for i in $(seq 1 30); do
             curl -sf http://localhost:9000/minio/health/live && exit 0
             sleep 1

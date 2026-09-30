@@ -556,6 +556,12 @@ permission_escalation` (`details.missing`); a non-active principal — `422
 principal_not_active`. On top of that, a principal of kind `agent`/`service` does not
 get `admin` and `approvals.decide` — `422 permissions_not_allowed_for_kind`.
 An identity bound in another tenant — `409 iam_identity_bound_elsewhere`.
+An issuer other than `CP_IAM_ISSUER` (when set) — `422 iam_issuer_untrusted`.
+Moving an identity from another principal takes an `admin` (`403
+permission_escalation`, `details.previousOwnerKind`). The principal of an active
+registry agent takes no identity through this route — `409 agent_identity_conflict`
+with `details.route` `/agents/{key}/identity`; only an `admin` may re-bind the
+identity the registry already records (CP-ADR-0073, amendment 2026-09-30, E4).
 
 Journal events: `iam_binding.created` / `updated` / `revoked` with
 `principalId`, `issuer`, `iamPrincipalId` and the permissions. After commit the router

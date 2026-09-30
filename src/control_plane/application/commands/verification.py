@@ -84,6 +84,7 @@ from control_plane.application.commands.task_types import lifecycle_of
 from control_plane.application.commands.tasks import mark_task_completed
 from control_plane.application.common import new_uuid, utcnow
 from control_plane.application.events import record_event
+from control_plane.application.locking import lock_principal_key_share
 from control_plane.domain.approval_outcomes import Path, expressions_in, render
 from control_plane.domain.artifact_schema import CONTENT_REQUIRED
 from control_plane.domain.artifact_type import media_type_allowed
@@ -447,6 +448,11 @@ async def execute_verification(
     probe = await session.get(TaskVerification, verification_id, populate_existing=True)
     if probe is None or probe.status not in OPEN_STATUSES:
         return probe
+    # The attempt acts as its authority (the completer): the calls, artifacts
+    # and approvals it writes reference that principal, so it is locked before
+    # the task (rule 1 of ``application/locking.py``, CP-ADR-0077 §3). The
+    # authority of an attempt never changes; the probe's value is the one.
+    await lock_principal_key_share(session, probe.tenant_id, probe.authority_principal_id)
     task: Task | None = await session.scalar(
         select(Task)
         .where(Task.id == probe.task_id)

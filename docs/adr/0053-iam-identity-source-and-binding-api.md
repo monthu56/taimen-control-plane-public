@@ -136,6 +136,51 @@ permissions)` и `revoke_iam_binding(binding_id)`; записи идут с
 - Конформанс — `tests/integration/test_iam_bindings.py`; форма контракта —
   `tests/unit/test_iam_binding_schemas.py`.
 
+## Амендмент 2026-09-30: владелец переносимой identity
+
+Задача TASK-001063 (вместе с амендментом CP-ADR-0073 «смена IAM-идентичности
+служебного агента»). **Проблема.** Upsert (п.3) перенаправлял строку на
+новый principal, не глядя, кому она принадлежала. Так identity агента
+реестра уходила из-под реестра: ревизия продолжала задавать права строке,
+которая ей больше не принадлежит. Так же любой держатель `principals.write`
+мог забрать вход человека на свой principal.
+
+Если строка `(issuer, iamPrincipalId)` уже есть у **другого** principal того же
+tenant'а, до переноса проверяется прежний владелец:
+
+- identity — действующая идентичность агента реестра (`agents.iam_*`, агент
+  не выведен из оборота) — `409 agent_identity_conflict` с `details.agent`.
+  Identity агента меняется через реестр (`POST /agents/{key}/identity:replace`
+  или вывод из оборота); после этого прежняя identity переносится как обычная;
+- вызывающий не `admin` — `403 permission_escalation` с
+  `details.previousOwnerKind`: перенос забирает вход у прежнего владельца,
+  поэтому его делает только администратор. Сначала правило касалось только
+  человека; с TASK-001120 — любого вида: иначе держатель `principals.write`
+  забирал идентичность стороннего сервиса, не входящего в реестр (проба
+  ревью — `200`).
+
+Upsert той же identity на тот же principal не меняется: у строки нет другого
+владельца. `iam_binding.updated` при переносе получает `previousPrincipalId`
+(необязательное поле схемы, версия события прежняя).
+
+Ещё два правила TASK-001120 (CP-ADR-0073, амендмент 2026-09-30, Е2 п.5а и Е4):
+
+- `issuer` должен совпадать с `CP_IAM_ISSUER` — иначе `422
+  iam_issuer_untrusted` с `details {issuer, expected}`: связка issuer'а, чьи
+  токены ядро не проверяет, никого не пускает. При незаданном `CP_IAM_ISSUER`
+  проверки нет;
+- на principal действующего агента реестра upsert не заводит и не
+  открывает связку — `409 agent_identity_conflict` с `details {agent, route}`:
+  идентичность агента меняется через `/agents/{key}/identity`. Исключение —
+  повторная привязка идентичности, записанной в реестре, вызывающим с
+  `admin` (переходный путь bootstrap).
+
+Проверки: `tests/integration/test_agent_identity_replace.py` — identity агента
+не переносится, после смены и после вывода переносится, `previousPrincipalId`
+в событии; identity человека переносит только администратор;
+`tests/integration/test_agent_identity_bindings.py` — issuer, principal агента
+реестра, перенос identity сервиса вне реестра только администратором.
+
 ## Conformance
 
 Пробы для `adr.conformance_check` (пилот «саморазработка»):
@@ -152,5 +197,7 @@ permissions)` и `revoke_iam_binding(binding_id)`; записи идут с
 - grep: {path: src/control_plane/api/v1/principals.py, pattern: 'bindings\.invalidate\(issuer, iam_principal_id\)'}
   repo: control-plane
 - grep: {path: src/control_plane/api/v1/schemas.py, pattern: 'iam_binding: IamIdentitySpec \| None'}
+  repo: control-plane
+- grep: {path: src/control_plane/application/commands/iam_bindings.py, pattern: 'await _check_previous_owner\('}
   repo: control-plane
 ```
