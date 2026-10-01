@@ -7,6 +7,7 @@ past the published years knows only the weekend and reads "provisional".
 """
 
 import json
+import uuid
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -16,6 +17,7 @@ import pytest
 import yaml
 
 from control_plane.api.v1.calendars import calendar_request, spec_as_sent
+from control_plane.application.commands.process_instances import calendars_named
 from control_plane.domain.calendar import Calendar, CalendarError, normalized_spec
 from control_plane.domain.errors import ValidationError
 
@@ -207,3 +209,20 @@ def test_a_package_object_of_kind_calendar_becomes_a_publish_request() -> None:
     with pytest.raises(ValidationError) as caught:
         calendar_request({**DOCUMENT, "spec": {**DOCUMENT["spec"], "years": []}})
     assert caught.value.details["errors"][0]["path"] == "/spec/years"
+
+
+async def test_the_package_calendars_a_plan_names_stand_for_the_published_ones() -> None:
+    """``calendars_named`` with ``own``: no query for them, no version number (TASK-001161)."""
+
+    class NoDatabase:
+        async def scalars(self, *_: Any) -> Any:
+            raise AssertionError("every calendar named is the package's own")
+
+    session: Any = NoDatabase()
+    other = Calendar.from_spec(_spec())
+    found = await calendars_named(
+        session, uuid.uuid4(), {"calendar": "ru"}, own={"ru": RU, "x": other}
+    )
+    assert found == ({"ru": RU}, {})
+    assert await calendars_named(session, uuid.uuid4(), {}, own={"ru": RU}) == ({}, {})
+    assert await calendars_named(session, uuid.uuid4(), {}) == ({}, {})

@@ -58,6 +58,7 @@ from control_plane.application.commands.approval_outcomes import (
     record_attempt_failure,
 )
 from control_plane.application.commands.artifacts import sweep_expired_uploads
+from control_plane.application.commands.catalog_retirements import is_key_busy
 from control_plane.application.commands.rule_evaluations import (
     due_evaluations,
     due_rule_tenants,
@@ -425,7 +426,9 @@ class Worker:
         """One journal batch per due tenant into its process instances.
 
         An unexpected error rolls the tenant's batch back (its cursor does not
-        move) and holds the tenant back with backoff; the others go on.
+        move) and holds the tenant back with backoff; the others go on. A key
+        an apply holds (``catalog_key_busy``) rolls the batch back too, but the
+        tenant is only deferred: that is expected, not a failure.
         """
         async with transaction(self.session_factory) as session:
             tenants = await process_instances.due_process_tenants(
@@ -442,6 +445,20 @@ class Worker:
                         trace_run_id=self.trace_run_id,
                     )
             except Exception as exc:
+                if is_key_busy(exc):
+                    # An apply holds the key of a child a step starts: the
+                    # batch is rolled back and read again soon, not failed.
+                    logger.info(
+                        "process event batch deferred: catalog key busy",
+                        extra={"tenant": str(tenant_id), "worker": self.name},
+                    )
+                    async with transaction(self.session_factory) as session:
+                        await process_instances.defer_tenant(
+                            session,
+                            tenant_id=tenant_id,
+                            seconds=self.settings.outbox_backoff_base_seconds,
+                        )
+                    continue
                 logger.exception(
                     "process event batch failed",
                     extra={"tenant": str(tenant_id), "worker": self.name},
@@ -471,7 +488,13 @@ class Worker:
                     fired += await process_instances.fire_timer(
                         session, timer_id, trace_run_id=self.trace_run_id
                     )
-            except Exception:
+            except Exception as exc:
+                if is_key_busy(exc):
+                    logger.info(
+                        "process timer deferred: catalog key busy",
+                        extra={"timer_id": str(timer_id), "worker": self.name},
+                    )
+                    continue
                 logger.exception(
                     "process timer failed",
                     extra={"timer_id": str(timer_id), "worker": self.name},
@@ -498,7 +521,14 @@ class Worker:
                     recall_id,
                     trace_run_id=self.trace_run_id,
                 )
-            except Exception:
+            except Exception as exc:
+                if is_key_busy(exc):
+                    # The recall keeps its lease and is answered after it.
+                    logger.info(
+                        "process recall deferred: catalog key busy",
+                        extra={"recall_id": str(recall_id), "worker": self.name},
+                    )
+                    continue
                 logger.exception(
                     "process recall failed",
                     extra={"recall_id": str(recall_id), "worker": self.name},

@@ -9,6 +9,7 @@ check must give those and no other error, so that a fixture pins one class.
 import copy
 import json
 import re
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -356,3 +357,133 @@ def test_recall_where_values_are_expressions_checked_by_operator() -> None:
         ("expression_type_error", f"{here}/2/value"),
         ("expression_type_error", f"{here}/3/value"),
     }
+
+
+# --- the calendar of a due in working units (CP-ADR-0078 §1; P009) ---------------------
+
+HOURS = replace(
+    CATALOG, calendars=frozenset({"ru", "ru-2024"}), calendars_with_hours=frozenset({"ru"})
+)
+
+
+def _with_due(due: Any, *, calendar: str | None = "ru") -> dict[str, Any]:
+    spec = _sample()
+    if calendar is None:
+        del spec["calendar"]
+        # The sample's own deadline reads the process calendar.
+        spec["stages"][0]["steps"][2]["human"]["due"] = {
+            "at": 'cal.addWorkdays(data.deadline, -2, "ru")'
+        }
+    spec["stages"][1]["steps"][0]["call"]["due"] = due
+    return spec
+
+
+CALL_DUE = "/spec/stages/1/steps/0/call/due"
+
+
+@pytest.mark.parametrize(
+    "due",
+    [
+        "P2D",
+        {"at": "data.deadline"},
+        {"duration": "PT4H", "warnBefore": "PT1H"},
+        {"workdays": 2},
+        {"workhours": 8},
+        {"workhours": 8, "calendar": "ru", "warnBefore": {"workhours": 2}},
+        {"workdays": 2, "calendar": "ru-2024", "warnBefore": {"workdays": 1}},
+        {"duration": "PT4H", "warnBefore": {"workhours": 1}},
+    ],
+)
+def test_a_due_in_any_form_passes_with_a_calendar_that_counts_it(due: Any) -> None:
+    assert _check(_with_due(due), HOURS).problems == ()
+
+
+def test_working_units_without_a_calendar_are_refused() -> None:
+    checked = _check(_with_due({"workhours": 8}, calendar=None), HOURS)
+    (problem,) = checked.errors
+    assert (problem.code, problem.path) == ("sla_calendar_missing", CALL_DUE + "/workhours")
+    assert "calendar" in problem.message and problem.hint is not None
+    warn = _with_due({"duration": "PT4H", "warnBefore": {"workdays": 1}}, calendar=None)
+    assert _codes(_check(warn, HOURS)) == {
+        ("sla_calendar_missing", CALL_DUE + "/warnBefore/workdays")
+    }
+    # A calendar of the due itself is enough.
+    keyed = _with_due({"workdays": 2, "calendar": "ru"}, calendar=None)
+    assert _check(keyed, HOURS).problems == ()
+
+
+def test_workhours_by_a_calendar_without_working_hours_are_refused() -> None:
+    checked = _check(_with_due({"workhours": 8, "calendar": "ru-2024"}), HOURS)
+    (problem,) = checked.errors
+    assert (problem.code, problem.path) == (
+        "sla_calendar_without_hours",
+        CALL_DUE + "/workhours",
+    )
+    assert "ru-2024" in problem.message and "workingHours" in (problem.hint or "")
+    warn = {"workdays": 2, "calendar": "ru-2024", "warnBefore": {"workhours": 2}}
+    assert _codes(_check(_with_due(warn), HOURS)) == {
+        ("sla_calendar_without_hours", CALL_DUE + "/warnBefore/workhours")
+    }
+    by_process = _sample(calendar="ru-2024", due={"workhours": 40})
+    assert _codes(_check(by_process, HOURS)) == {
+        ("sla_calendar_without_hours", "/spec/due/workhours")
+    }
+
+
+@pytest.mark.parametrize(
+    ("kind", "body"),
+    [
+        ("human", {"taskType": "review", "assign": [{"role": "lead"}]}),
+        ("approve", {"approvers": [{"role": "lead"}], "quorum": "any"}),
+        ("recall", {"anchors": [{"case": True}]}),
+        ("listen", {"any": [{"on": {"observation": "sample.answered"}}], "timeout": "P1D"}),
+    ],
+)
+def test_every_step_with_a_due_is_checked(kind: str, body: dict[str, Any]) -> None:
+    spec = _sample(calendar="ru-2024")
+    spec["stages"][1]["steps"].insert(0, {"id": "waiting", kind: {**body, "due": {"workhours": 4}}})
+    path = f"/spec/stages/1/steps/0/{kind}/due/workhours"
+    assert _codes(_check(spec, HOURS)) == {("sla_calendar_without_hours", path)}
+
+
+def test_a_due_names_a_calendar_that_exists() -> None:
+    assert _codes(_check(_with_due({"workdays": 2, "calendar": "kz"}), HOURS)) == {
+        ("unknown_calendar", CALL_DUE + "/calendar")
+    }
+    refs = pd.references(_with_due({"workdays": 2, "calendar": "kz"}))
+    assert refs.calendars == {"ru", "kz"}
+
+
+def test_hours_not_loaded_are_not_checked() -> None:
+    # The engine compiles a published version without them: a calendar that
+    # lost its hours later fails the due, not the version (CP-ADR-0078 §3).
+    spec = _with_due({"workhours": 8, "calendar": "ru-2024"})
+    unchecked = replace(HOURS, calendars_with_hours=None)
+    assert _check(spec, unchecked).problems == ()
+
+
+# --- retired keys (CP-ADR-0074, amendment Zh2, Zh3) -------------------------------------
+
+
+def test_a_retired_calendar_is_an_error() -> None:
+    catalog = Catalog(**{**CATALOG.__dict__, "retired_calendars": frozenset({"ru"})})
+    checked = _check(SAMPLE["spec"], catalog)
+    assert [(p.code, p.path, p.error) for p in checked.problems] == [
+        ("calendar_retired", "/spec/calendar", True)
+    ]
+
+
+def test_a_call_of_a_retired_process_is_a_warning() -> None:
+    spec = copy.deepcopy(SAMPLE["spec"])
+    spec["stages"][1]["steps"][0] = {"id": "summarize", "call": {"process": "child"}}
+    catalog = Catalog(
+        **{
+            **CATALOG.__dict__,
+            "processes": frozenset({"child"}),
+            "retired_processes": frozenset({"child"}),
+        }
+    )
+    checked = _check(spec, catalog)
+    assert [(p.code, p.path, p.error) for p in checked.problems] == [
+        ("process_retired", "/spec/stages/1/steps/0/call/process", False)
+    ]

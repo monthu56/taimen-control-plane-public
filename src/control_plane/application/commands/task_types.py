@@ -11,6 +11,7 @@ a separate, explicit action (``task_type_migration``, ADR-0048 amendment
 """
 
 import uuid
+from dataclasses import dataclass
 from typing import Any
 
 from sqlalchemy import func, select
@@ -247,6 +248,85 @@ async def _type_checks(
     return checks
 
 
+@dataclass(frozen=True)
+class TypeDocuments:
+    """The documents of a type version, checked by their grammar alone."""
+
+    field_schema: dict[str, Any]
+    lifecycle_schema: dict[str, Any]
+    lifecycle: WorkItemLifecycle
+    approval_schema: dict[str, Any]
+    outcomes: ApprovalSchema
+    context_schema: dict[str, Any]
+    instructions: str
+    completion_schema: dict[str, Any]
+    artifact_schema: dict[str, Any]
+    artifact_io: ArtifactSchema
+
+
+def check_type_documents(
+    *,
+    field_schema: dict[str, Any] | None = None,
+    lifecycle_schema: dict[str, Any] | None = None,
+    approval_schema: dict[str, Any] | None = None,
+    context_schema: dict[str, Any] | None = None,
+    instructions: str | None = None,
+    completion_schema: dict[str, Any] | None = None,
+    artifact_schema: dict[str, Any] | None = None,
+) -> TypeDocuments:
+    """What a type version fixes, checked by the pure functions of the domain.
+
+    Everything :func:`create_task_type_version` refuses without asking the
+    registries; ``packages:test`` checks a package's types by it too
+    (CP-ADR-0074 Z4).
+    """
+    schema = field_schema or {}
+    validate_json_schema_document(schema, field_name="fieldSchema")
+    document = lifecycle_schema or SYSTEM_TASK_LIFECYCLE
+    # Everything that could make the type unusable is rejected here rather
+    # than when a task carrying it tries to move.
+    lifecycle = parse_work_item_lifecycle(document)
+    # Outcomes are checked against the closed action vocabulary and expression
+    # grammar now, so a decided approval never meets a schema it cannot run
+    # (CP-ADR-0061).
+    outcomes = approval_schema or {}
+    categories = lifecycle.lifecycle.categories
+    parsed = parse_approval_schema(
+        outcomes,
+        statuses=frozenset(categories),
+        terminal=frozenset(k for k, c in categories.items() if c in TERMINAL_CATEGORIES),
+    )
+    # The context profile is checked against its grammar and Memory's limits
+    # now (CP-ADR-0064); kinds and relations are the domain packs' names and
+    # are not known to core.
+    profile = context_schema or {}
+    parse_context_schema(profile)
+    # Executor instructions are checked for size and pasted credentials now
+    # (CP-ADR-0066): the version is immutable, a secret in it would stay.
+    text = validate_instructions(instructions, field="instructions")
+    # Work after completion (CP-ADR-0061, amendment 2026-09-25): the same
+    # closed vocabulary, checked now for the same reason as the outcomes.
+    after_completion = completion_schema or {}
+    parse_completion_schema(after_completion)
+    # Inputs and outputs (CP-ADR-0072 §7): the artifact types they name must
+    # be registered — which the caller asks the registry; their version is
+    # not pinned, an artifact is checked against the latest one.
+    handoff = artifact_schema or {}
+    io = parse_artifact_schema(handoff)
+    return TypeDocuments(
+        field_schema=schema,
+        lifecycle_schema=document,
+        lifecycle=lifecycle,
+        approval_schema=outcomes,
+        outcomes=parsed,
+        context_schema=profile,
+        instructions=text,
+        completion_schema=after_completion,
+        artifact_schema=handoff,
+        artifact_io=io,
+    )
+
+
 async def create_task_type_version(
     session: AsyncSession,
     ctx: AuthContext,
@@ -271,40 +351,23 @@ async def create_task_type_version(
     if normalized_execution is not None:
         await _require_executable_skill(session, ctx, normalized_execution)
 
-    schema = field_schema or {}
-    validate_json_schema_document(schema, field_name="fieldSchema")
-    document = lifecycle_schema or SYSTEM_TASK_LIFECYCLE
-    # Everything that could make the type unusable is rejected here rather
-    # than when a task carrying it tries to move.
-    lifecycle = parse_work_item_lifecycle(document)
-    # Outcomes are checked against the closed action vocabulary and expression
-    # grammar now, so a decided approval never meets a schema it cannot run
-    # (CP-ADR-0061).
-    outcomes = approval_schema or {}
-    categories = lifecycle.lifecycle.categories
-    parsed = parse_approval_schema(
-        outcomes,
-        statuses=frozenset(categories),
-        terminal=frozenset(k for k, c in categories.items() if c in TERMINAL_CATEGORIES),
+    checked = check_type_documents(
+        field_schema=field_schema,
+        lifecycle_schema=lifecycle_schema,
+        approval_schema=approval_schema,
+        context_schema=context_schema,
+        instructions=instructions,
+        completion_schema=completion_schema,
+        artifact_schema=artifact_schema,
     )
-    await _check_outcome_skills(session, ctx, parsed)
-    # The context profile is checked against its grammar and Memory's limits
-    # now (CP-ADR-0064); kinds and relations are the domain packs' names and
-    # are not known to core.
-    profile = context_schema or {}
-    parse_context_schema(profile)
-    # Executor instructions are checked for size and pasted credentials now
-    # (CP-ADR-0066): the version is immutable, a secret in it would stay.
-    text = validate_instructions(instructions, field="instructions")
-    # Work after completion (CP-ADR-0061, amendment 2026-09-25): the same
-    # closed vocabulary, checked now for the same reason as the outcomes.
-    after_completion = completion_schema or {}
-    parse_completion_schema(after_completion)
-    # Inputs and outputs (CP-ADR-0072 §7): the artifact types they name must
-    # be registered now; their version is not pinned — an artifact is checked
-    # against the latest one.
-    handoff = artifact_schema or {}
-    io = parse_artifact_schema(handoff)
+    schema, document, lifecycle = checked.field_schema, checked.lifecycle_schema, checked.lifecycle
+    outcomes, profile, text = checked.approval_schema, checked.context_schema, checked.instructions
+    after_completion, handoff, io = (
+        checked.completion_schema,
+        checked.artifact_schema,
+        checked.artifact_io,
+    )
+    await _check_outcome_skills(session, ctx, checked.outcomes)
     await _check_artifact_types(session, ctx, io)
     # Default checks of every task of the version (CP-ADR-0067, amendment
     # 2026-09-27): the grammar and registries of a task's acceptance, now —

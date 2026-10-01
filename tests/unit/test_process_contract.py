@@ -10,9 +10,10 @@ the contract of ``process.retrospective@1`` of the package process-knowledge), t
 examples of the kinds Process and Calendar and of a package test pass the
 schema and the core's request models unchanged.
 
-The schemas and examples are read from the superproject when this repository
-is checked out inside it, from the pinned copies otherwise (as in
-``test_agent_contract.py``).
+The schemas belong to package-sdk and are read from it when it is checked out
+next to control-plane, from the pinned copies otherwise (``tests/package_sdk.py``);
+the examples are read from the superproject when this repository is checked
+out inside it, from the pinned copies otherwise.
 """
 
 import copy
@@ -34,13 +35,16 @@ from control_plane.api.v1.schemas import (
     CalendarPublishRequest,
     PackageSource,
     PackageTestRequest,
+    PlanProcessOut,
     ProcessDefinitionPublishRequest,
     ProcessJournalEntryOut,
+    ProcessOpenElementOut,
     ProcessReplayRequest,
 )
 from control_plane.domain.enums import Permission
 from control_plane.domain.event_catalog import event_types, get_event_type
 from control_plane.domain.package_plan import PLANNED_KINDS
+from tests.package_sdk import PINNED_NAMES, live_schema_path, schema_path
 
 ROOT = Path(__file__).resolve().parents[2]
 FIXTURES = ROOT / "tests" / "fixtures"
@@ -48,21 +52,16 @@ PINNED = FIXTURES / "superproject"
 EXAMPLES = FIXTURES / "processes"
 # In the superproject control-plane is a submodule at its root (flat layout).
 SUPERPROJECT = ROOT.parent
-SUPERPROJECT_SCHEMAS = SUPERPROJECT / "packages" / "schema" / "v1"
 SUPERPROJECT_EXAMPLES = SUPERPROJECT / "tools" / "tests" / "fixtures" / "process"
 # The skill of a process's retrospective (package process-knowledge, CP-ADR-0076 §6).
 SUPERPROJECT_RETROSPECTIVE = (
     SUPERPROJECT / "packages" / "process-knowledge" / "skills" / "process.retrospective.yaml"
 )
-# The development superproject has all three sources; an open umbrella ships the schemas
-# alone, and then the pinned copies are the truth.
+# The development superproject has both sources; an open umbrella does not ship them,
+# and then the pinned copies are the truth. The schemas are package-sdk's (S007).
 INSIDE_SUPERPROJECT = all(
     path.is_file()
-    for path in (
-        SUPERPROJECT_SCHEMAS / "object.schema.json",
-        SUPERPROJECT_EXAMPLES / "purchase.process.yaml",
-        SUPERPROJECT_RETROSPECTIVE,
-    )
+    for path in (SUPERPROJECT_EXAMPLES / "purchase.process.yaml", SUPERPROJECT_RETROSPECTIVE)
 )
 
 
@@ -94,8 +93,7 @@ def _read_yaml(name: str) -> Any:
 
 
 def _schema(name: str) -> dict[str, Any]:
-    directory = SUPERPROJECT_SCHEMAS if INSIDE_SUPERPROJECT else PINNED
-    return json.loads((directory / name).read_text("utf-8"))
+    return json.loads(schema_path(name).read_text("utf-8"))
 
 
 CATALOG_SCHEMA = _schema("object.schema.json")
@@ -116,6 +114,42 @@ def retrospective_contract() -> dict[str, Any]:
 PROCESS = _read_yaml("purchase.process.yaml")
 CALENDAR = _read_yaml("ru.calendar.yaml")
 PACKAGE_TEST = _read_yaml("purchase.test.yaml")
+# The examples of CP-ADR-0074 Z1 (plan R6 of the superproject).
+RULE_TEST: dict[str, Any] = {
+    "subject": "rule",
+    "rule": "claim-reopened",
+    "name": "a reopened claim files its review",
+    "given": {
+        "observation": {
+            "kind": "helpdesk.ticket_reopened",
+            "data": {"ticketId": "T-1", "claimKey": "T-1", "text": "..."},
+        }
+    },
+    "mocks": {"skills": {"claims.classify@1": [{"output": {"category": "complaint"}}]}},
+    "steps": [
+        {
+            "expect": {
+                "result": "matched",
+                "ensureWork": [{"type": "claim-review", "customFields": {"ticketId": "T-1"}}],
+            }
+        }
+    ],
+}
+TASK_TYPE_TEST: dict[str, Any] = {
+    "subject": "taskType",
+    "taskType": "refund-approval",
+    "name": "an approved refund replies and closes the task",
+    "given": {"task": {"customFields": {"amount": 72000, "ticketId": "T-1"}}},
+    "steps": [
+        {"approve": {"gate": "default", "decision": "approved"}},
+        {
+            "expect": {
+                "invokeSkill": [{"skill": "helpdesk.reply@1", "inputs": {"ticketId": "T-1"}}],
+                "status": {"category": "terminal_success"},
+            }
+        },
+    ],
+}
 
 
 def _openapi() -> dict[str, Any]:
@@ -205,6 +239,13 @@ ROUTES: list[tuple[str, str, str | None, str]] = [
     ("/api/v1/calendars", "post", "CalendarPublishRequest", "CalendarOut"),
     ("/api/v1/calendars", "get", None, "PageOut"),
     ("/api/v1/calendars/{ref}", "get", None, "CalendarOut"),
+    ("/api/v1/calendars/{key}:retire", "post", "CatalogRetireRequest", "CalendarRetireOut"),
+    (
+        "/api/v1/process-definitions/{key}:retire",
+        "post",
+        "CatalogRetireRequest",
+        "ProcessRetireOut",
+    ),
     ("/api/v1/packages:test", "post", "PackageTestRequest", "PackageTestOut"),
     ("/api/v1/packages:plan", "post", "PackagePlanRequest", "PackagePlanOut"),
     ("/api/v1/packages:apply", "post", "PackageApplyRequest", "PackageApplyOut"),
@@ -226,6 +267,8 @@ IMPLEMENTED = {
     "/api/v1/packages:plan",  # P015
     "/api/v1/packages:apply",
     "/api/v1/packages:record",  # TASK-000904
+    "/api/v1/calendars/{key}:retire",  # S012
+    "/api/v1/process-definitions/{key}:retire",
 }
 
 
@@ -237,6 +280,21 @@ def test_openapi_carries_the_route_with_its_bodies(
     assert _response(path, method) == response_body
     pending = path not in IMPLEMENTED
     assert ("501" in PATHS[path][method]["responses"]) is pending, "only a pending route has 501"
+
+
+@pytest.mark.parametrize(
+    "path", ["/api/v1/process-definitions/{key}:retire", "/api/v1/calendars/{key}:retire"]
+)
+def test_retire_takes_dry_run_as_a_query_parameter(path: str) -> None:
+    parameters = PATHS[path]["post"]["parameters"]
+    assert [(p["name"], p["in"]) for p in parameters] == [("key", "path"), ("dryRun", "query")]
+
+
+@pytest.mark.parametrize("schema", ["ProcessDefinitionOut", "CalendarOut"])
+def test_a_version_shows_the_retirement_of_its_key(schema: str) -> None:
+    properties = SCHEMAS[schema]["properties"]
+    assert properties["status"]["enum"] == ["active", "retired"]
+    assert "retired" in properties
 
 
 def test_package_test_takes_check_only_as_a_query_parameter() -> None:
@@ -284,9 +342,65 @@ def test_an_instance_shows_its_pinned_version_and_journal_entries_their_author()
     entry = ProcessJournalEntryOut.model_json_schema(by_alias=True)["properties"]
     assert {"seq", "at", "kind", "element", "reason", "actorId", "eventId"} <= set(entry)
     definition = SCHEMAS["ProcessDefinitionOut"]["properties"]
-    assert {"version", "definitionHash", "identityAgent", "expressionProfile", "owner"} <= set(
-        definition
+    assert {
+        "version",
+        "definitionHash",
+        "identityAgent",
+        "expressionProfile",
+        "engineRevision",
+        "owner",
+    } <= set(definition)
+
+
+SLA_STATES = ["ok", "warning", "breached", "paused", "unknown", "none"]
+
+
+def test_the_projection_carries_the_sla_of_steps_and_of_the_process() -> None:
+    """CP-ADR-0078 §6: attempt, due, slaState and overdueSeconds; optional, null by default."""
+    element = SCHEMAS["ProcessOpenElementOut"]
+    assert {"attempt", "due", "slaState", "overdueSeconds"} <= set(element["properties"])
+    instance = SCHEMAS["ProcessInstanceOut"]
+    assert {"sla", "slaState"} <= set(instance["properties"])
+    for schema in (element, instance):
+        options = schema["properties"]["slaState"]["anyOf"]
+        assert {"type": "string", "enum": SLA_STATES} in options
+    sla = SCHEMAS["ProcessSlaOut"]["properties"]
+    assert set(sla) == {"dueAt", "warnAt", "provisional", "remainingSeconds", "remainingUnit"}
+    # The unit of a frozen remainder (CP-ADR-0078 §4): workdays are encoded, not seconds.
+    unit = {"type": "string", "enum": ["wall", "working_seconds", "workdays"]}
+    assert unit in sla["remainingUnit"]["anyOf"]
+    assert {"type": "null"} in sla["remainingUnit"]["anyOf"]
+    assert _ref(element["properties"]["due"]["anyOf"][0]) == "ProcessSlaOut"
+    assert _ref(instance["properties"]["sla"]["anyOf"][0]) == "ProcessSlaOut"
+    # The projection built before the SLA fields validates, and reads them as null.
+    before = {"id": "a", "kind": "human", "since": "2026-09-29T10:00:00Z", "taskId": None}
+    body = ProcessOpenElementOut.model_validate(before | {"approvalIds": []}).model_dump(
+        mode="json", by_alias=True
     )
+    new = ("attempt", "due", "slaState", "overdueSeconds")
+    assert {name: body[name] for name in new} == dict.fromkeys(new)
+
+
+def test_the_instance_list_filters_by_sla_state_under_processes_read() -> None:
+    parameters = PATHS["/api/v1/process-instances"]["get"]["parameters"]
+    [sla] = [p for p in parameters if p["name"] == "slaState"]
+    assert sla["in"] == "query"
+    assert not sla.get("required", False)
+    options = sla["schema"]["anyOf"]
+    assert {"type": "string", "enum": ["breached", "warning"]} in options
+
+
+def test_the_plan_lists_the_deadlines_a_migration_moves() -> None:
+    """CP-ADR-0074 amendment 2026-09-29, §11 (FR-023)."""
+    process = SCHEMAS["PlanProcessOut"]["properties"]
+    assert _ref(process["deadlines"]["items"]) == "PlanDeadlineOut"
+    deadline = SCHEMAS["PlanDeadlineOut"]["properties"]
+    assert set(deadline) == {"instanceId", "element", "previousDueAt", "dueAt", "breached"}
+    # Empty until the plan computes them.
+    out = PlanProcessOut.model_validate(
+        {"key": "p", "fromVersion": 1, "toVersion": 2, "behaviour": None, "instances": []}
+    )
+    assert out.deadlines == []
 
 
 def test_an_approval_carries_excluded_principals() -> None:
@@ -350,7 +464,9 @@ def test_process_events_are_in_the_catalog() -> None:
     registered = {entry.type for entry in event_types()}
     assert registered >= PROCESS_EVENTS | {
         "process.definition_published",
+        "process.definition_retired",
         "calendar.published",
+        "calendar.retired",
         "knowledge.changed",
     }
     for name in PROCESS_EVENTS:
@@ -390,22 +506,68 @@ def test_knowledge_changed_names_the_changed_keys() -> None:
 # --- the catalog schema of the superproject (P001) ------------------------------
 
 
-def test_the_pinned_schemas_and_examples_are_the_superproject_ones() -> None:
+@pytest.mark.parametrize("name", PINNED_NAMES)
+def test_the_pinned_schemas_are_the_package_sdk_ones(name: str) -> None:
+    """The catalog and test schemas belong to package-sdk (S003, S007); the core holds copies."""
+    assert (PINNED / name).read_bytes() == live_schema_path(name).read_bytes(), name
+
+
+def test_the_pinned_examples_are_the_superproject_ones() -> None:
     if not INSIDE_SUPERPROJECT:
         pytest.skip("not checked out inside the superproject")
-    for name in ("object.schema.json", "test.schema.json"):
-        assert (PINNED / name).read_bytes() == (SUPERPROJECT_SCHEMAS / name).read_bytes(), name
     pinned = (PINNED / "process.retrospective.yaml").read_bytes()
     assert pinned == SUPERPROJECT_RETROSPECTIVE.read_bytes(), "process.retrospective.yaml"
     for name in ("purchase.process.yaml", "purchase.test.yaml", "ru.calendar.yaml"):
         assert (EXAMPLES / name).read_bytes() == (SUPERPROJECT_EXAMPLES / name).read_bytes(), name
 
 
+def test_a_test_names_its_subject_and_each_subject_its_given_and_steps() -> None:
+    schema = _schema("test.schema.json")
+    assert schema["properties"]["subject"]["enum"] == ["process", "rule", "taskType"]
+    assert schema["required"] == ["name", "steps"]
+    wanted = {
+        "rule": ("#/$defs/ruleGiven", "#/$defs/ruleStep"),
+        "taskType": ("#/$defs/taskTypeGiven", "#/$defs/taskTypeStep"),
+    }
+    for branch in schema["allOf"][1:]:
+        subject = branch["if"]["properties"]["subject"]["const"]
+        then = branch["then"]["properties"]
+        assert (then["given"]["$ref"], then["steps"]["items"]["$ref"]) == wanted[subject]
+    for example in (RULE_TEST, TASK_TYPE_TEST):
+        assert TESTS.is_valid(example)
+    refused = {**RULE_TEST, "steps": [{"advance": "P1D"}]}
+    assert not TESTS.is_valid(refused)
+
+
+def test_the_test_result_names_its_subject_and_the_package_its_coverage() -> None:
+    result = SCHEMAS["PackageTestResultOut"]
+    assert {"subject", "object", "process"} <= set(result["required"])
+    assert result["properties"]["subject"]["enum"] == ["process", "rule", "taskType"]
+    assert {"type": "null"} in result["properties"]["process"]["anyOf"]
+    out = SCHEMAS["PackageTestOut"]
+    assert {"coverage", "ruleCoverage", "taskTypeCoverage"} <= set(out["required"])
+    rule = SCHEMAS["RuleCoverageOut"]["properties"]
+    assert set(rule) == {"rule", "tests", "branches", "outcomes"}
+    task_type = SCHEMAS["TaskTypeCoverageOut"]["properties"]
+    assert set(task_type) == {
+        "taskType",
+        "version",
+        "tests",
+        "outcomes",
+        "preconditions",
+        "completion",
+        "acceptance",
+    }
+    for name in ("branches", "outcomes"):
+        assert _ref(rule[name]) == "CoverageCounterOut"
+
+
 def test_the_catalog_has_the_kinds_and_the_language_the_adrs_describe() -> None:
     kinds = CATALOG_SCHEMA["properties"]["kind"]["enum"]
     assert {"Process", "Calendar"} <= set(kinds)
     defs = CATALOG_SCHEMA["$defs"]
-    assert "CP-ADR-0075" in defs["cel"]["description"]
+    # ADR references live in ``$comment`` since package-sdk TASK-001236.
+    assert "CP-ADR-0075" in defs["cel"]["$comment"]
     process = defs["processSpec"]["properties"]
     assert {
         "identity",
@@ -419,6 +581,7 @@ def test_the_catalog_has_the_kinds_and_the_language_the_adrs_describe() -> None:
     assert process["owner"] == {
         "$ref": "#/$defs/assignChain",
         "description": process["owner"]["description"],
+        "$comment": process["owner"]["$comment"],
     }
     step = defs["processStep"]["properties"]
     assert {"human", "approve", "call", "decide", "recall", "remember", "listen", "wait"} <= set(
@@ -459,6 +622,10 @@ def _year(**changes: Any) -> dict[str, Any]:
     return {"year": 2026, **changes}
 
 
+def _hours(start: str, end: str) -> dict[str, str]:
+    return {"from": start, "to": end}
+
+
 CALENDARS_BOTH_ACCEPT: list[dict[str, Any]] = [
     _calendar(),
     _calendar(weekend=[7]),
@@ -467,6 +634,16 @@ CALENDARS_BOTH_ACCEPT: list[dict[str, Any]] = [
     _calendar(years=[_year(holidays=["2026-01-01"], workdays=["2026-11-01"])]),
     _calendar(years=[_year(shortDays=["2026-12-31"], source="decree")]),
     _calendar(years=[_year(year=2000), _year(year=2100)]),
+    # Working hours (CP-ADR-0078 §2).
+    _calendar(workingHours={"intervals": [_hours("09:00", "18:00")]}),
+    _calendar(
+        workingHours={
+            "intervals": [_hours("09:00", "13:00"), _hours("14:00", "18:00")],
+            "weekdays": {"5": [_hours("09:00", "16:45")], "6": []},
+            "shortDayReduction": "PT1H",
+        }
+    ),
+    _calendar(workingHours={"intervals": [_hours("00:00", "24:00")]}),
 ]
 
 CALENDARS_BOTH_REJECT: list[dict[str, Any]] = [
@@ -484,6 +661,19 @@ CALENDARS_BOTH_REJECT: list[dict[str, Any]] = [
     _calendar(timezone="t" * 65),
     _calendar(displayName=""),
     _calendar(unknown=True),
+    _calendar(workingHours={}),
+    _calendar(workingHours={"intervals": []}),
+    _calendar(workingHours={"intervals": [_hours("9:00", "18:00")]}),
+    _calendar(workingHours={"intervals": [_hours("09:00", "24:01")]}),
+    _calendar(workingHours={"intervals": [_hours("24:00", "24:00")]}),
+    _calendar(workingHours={"intervals": [{"from": "09:00"}]}),
+    _calendar(workingHours={"intervals": [{**_hours("09:00", "18:00"), "break": "PT1H"}]}),
+    _calendar(workingHours={"intervals": [_hours("09:00", "18:00")] * 11}),
+    _calendar(workingHours={"intervals": [_hours("09:00", "18:00")], "weekdays": {"0": []}}),
+    _calendar(workingHours={"intervals": [_hours("09:00", "18:00")], "weekdays": {"8": []}}),
+    _calendar(workingHours={"intervals": [_hours("09:00", "18:00")], "shortDayReduction": "1H"}),
+    _calendar(workingHours={"intervals": [_hours("09:00", "18:00")], "shortDayReduction": "PT"}),
+    _calendar(workingHours={"intervals": [_hours("09:00", "18:00")], "unknown": True}),
     {key: value for key, value in CALENDAR["spec"].items() if key != "timezone"},
 ]
 
@@ -517,3 +707,13 @@ def test_a_package_travels_as_its_files() -> None:
         assert not _core_accepts(PackageSource, {"files": [{"path": bad, "content": ""}]}), bad
     twice = {"files": [files[0], files[0]]}
     assert not _core_accepts(PackageSource, twice)
+
+
+def test_the_plan_counts_all_deadlines_it_lists_at_most_a_limit_of() -> None:
+    """Review of P017 (TASK-001161): the section is capped, ``deadlinesTotal`` counts all."""
+    process = SCHEMAS["PlanProcessOut"]["properties"]
+    assert process["deadlinesTotal"]["type"] == "integer"
+    out = PlanProcessOut.model_validate(
+        {"key": "p", "fromVersion": 1, "toVersion": 2, "behaviour": None, "instances": []}
+    )
+    assert out.deadlines_total == 0

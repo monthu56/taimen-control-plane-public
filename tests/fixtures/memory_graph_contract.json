@@ -1,5 +1,5 @@
 {
-  "$comment": "Pinned contract of the Memory Service graph reads the core makes (CP-ADR-0064). paths/schemas are copied from memory-service app.openapi(); typedRequest is hand-extracted from context/typed.py; packages/namespaceKinds are answers produced by memory-service code (parse_pack(...).to_payload(), KindCatalog.build(...).to_payload()) for the superproject's integrations/selfdev software-delivery pack. Regenerate when memory-service changes these endpoints or the pack changes. paths /api/memory/entities:query, schemas.EntitiesQueryIn (WhereClause in $defs, refs rewritten to #/$defs/) and entitiesQuery.EntitiesQueryResult (EntityItem in $defs) are copied from memory-service feature/company-knowledge 7492f04 app.openapi() (K030, MEM-ADR-020 amendment: the entity list); the value rules of its where conditions are those of typedRequest.properties.where (the same context/where.parse_where).",
+  "$comment": "Pinned contract of the Memory Service graph reads the core makes (CP-ADR-0064). paths/schemas are copied from memory-service app.openapi(); typedRequest is hand-extracted from context/typed.py; packages/namespaceKinds are answers produced by memory-service code (parse_pack(...).to_payload(), KindCatalog.build(...).to_payload()) for the superproject's integrations/selfdev software-delivery pack. Regenerate when memory-service changes these endpoints or the pack changes. paths /api/memory/entities:query, schemas.EntitiesQueryIn (WhereClause in $defs, refs rewritten to #/$defs/) and entitiesQuery.EntitiesQueryResult (EntityItem in $defs) are copied from memory-service feature/company-knowledge 7492f04 app.openapi() (K030, MEM-ADR-020 amendment: the entity list); the value rules of its where conditions are those of typedRequest.properties.where (the same context/where.parse_where). The namespace parameter of GET /api/memory/packages/{name} (a tenant pack, tenant:<name>, is found only with ?namespace= of a namespace that sees it) is copied from memory-service master e33aafc server/memory_api.py memory_package_get (K007, amendment 2026-09-28; 7f43a8c has no such parameter), recorded in that path's memoryService.",
   "memoryService": {
     "repository": "monthu56/taimen-memory-service",
     "branch": "master",
@@ -26,8 +26,13 @@
       "get": {
         "parameters": [
           "name",
-          "version"
-        ]
+          "version",
+          "namespace"
+        ],
+        "memoryService": {
+          "branch": "master",
+          "commit": "e33aafc"
+        }
       }
     },
     "/api/memory/entities:query": {

@@ -1,0 +1,58 @@
+# yaml-language-server: $schema=../../../../packages/schema/v1/object.schema.json
+# Пример описания универсального кодового агента (TAI-ADR-0063 п.3, U001): каталог
+# репозиториев вместо одного repository. Репозиторий задачи — ключ или псевдоним в поле
+# customFields.repositoryKey; адреса — только из каталога, переменными установки.
+# Выдаваемый секрет forge-token (часовой токен установки приложения forge, его
+# выпускает узел) объявляется в placement.secrets так же, как статический.
+# Фикстура тестов схемы, не описание из пакета: живые описания меняет U019.
+apiVersion: taimen.ai/v1
+kind: Agent
+key: coder
+spec:
+  displayName: Autonomous coder
+  identity:
+    kind: agent
+    permissions:
+    - artifacts.write
+    - sessions.open
+    - tasks.claim
+    - tasks.read
+    - tasks.write
+  work:
+    workspace: ${SELFDEV_WORKSPACE_ID}
+    onlyAssigned: true
+    taskTypes: [coding-task]
+  executor:
+    kind: claude-code
+    params:
+      model: claude-opus-5-5
+      permissionMode: bypassPermissions
+      timeoutSeconds: 10800
+    instructions: |
+      Общие инструкции исполнителю. Соглашения репозитория — в его AGENTS.md.
+  workingCopy:
+    repositoryField: repositoryKey
+    superproject: superproject
+    publish: true
+    repositories:
+      control-plane: {url: "${SELFDEV_CONTROL_PLANE_URL}", baseRef: main}
+      iam-service: {url: "${SELFDEV_IAM_SERVICE_URL}", baseRef: main}
+      memory-service: {url: "${SELFDEV_MEMORY_SERVICE_URL}", baseRef: master}
+      notification-service: {url: "${SELFDEV_NOTIFICATION_SERVICE_URL}", baseRef: main}
+      skill-sdk: {url: "${SELFDEV_SKILL_SDK_URL}", baseRef: main}
+      fleet: {url: "${SELFDEV_FLEET_URL}", baseRef: main}
+      package-sdk: {url: "${SELFDEV_PACKAGE_SDK_URL}", baseRef: main}
+      human-harness: {url: "${SELFDEV_HUMAN_HARNESS_URL}", baseRef: main}
+      superproject:
+        url: "${SELFDEV_SUPERPROJECT_URL}"
+        baseRef: main
+        directory: superproject
+        aliases: [суперпроект, project-taimen-ai]
+      platform-auth-sdk: {url: "${SELFDEV_PLATFORM_AUTH_SDK_URL}", baseRef: main, publish: false}
+  placement:
+    requires: [claude-subscription, repos]
+    secrets: [claude-oauth-token, forge-token]
+    resources: {cpus: 2, memoryMb: 4096}
+    replicas: 2
+    drainSeconds: 14400
+  state: running

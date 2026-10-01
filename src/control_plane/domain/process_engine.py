@@ -46,6 +46,7 @@ recorded and the projection field left out.
 Pure functions over plain values; no I/O.
 """
 
+import contextlib
 import copy
 import hashlib
 import json
@@ -61,6 +62,7 @@ from google.protobuf.message import Message
 from jsonschema import Draft202012Validator
 
 from control_plane.domain import decision_table
+from control_plane.domain import process_sla as sla
 from control_plane.domain.calendar import Calendar
 from control_plane.domain.cel_profile import (
     DEFAULT_COST_LIMIT,
@@ -76,6 +78,19 @@ from control_plane.domain.process_definition import (
     pointer,
     step_kind,
 )
+
+# Revisions of the engine's semantics (CP-ADR-0074, amendment 2026-09-29): a
+# version runs under the revision it was published with, and an instance moves
+# to another one only by a migration. ``1`` — versions published before SLA
+# deadlines; ``2`` — every version published since: SLA deadlines of steps
+# and of the process (timers ``sla``/``sla_warning``, ``process.sla_*``).
+ENGINE_REVISIONS = (1, 2)
+ENGINE_REVISION = ENGINE_REVISIONS[-1]
+# The first revision with SLA deadlines (CP-ADR-0078 §3).
+SLA_REVISION = 2
+# An escalation level fired; its ``to`` targets are text, resolved into
+# addressees by the application when it records the event.
+ESCALATED = "process.escalated"
 
 # Ids of the engine: UUIDv5 in this namespace of "<instance>:<seq>:<index>".
 ID_NAMESPACE = uuid.UUID("5d0c7a8e-3f5b-5a4e-9c61-0e7c1f4b2a90")
@@ -108,6 +123,7 @@ INPUT_KINDS = (
     "intent_failed",
     "calendar",
     "command",
+    "migrated",
 )
 COMMANDS = ("suspend", "resume", "cancel", "start_discretionary")
 # The trigger type of an instance started without an event (``POST
@@ -118,6 +134,14 @@ COMMAND_TRIGGER = "command"
 _ACTIVITY_INPUTS = ("task", "approval", "skill", "child", "recall", "intent_failed")
 _WAITING_STEPS = ("human", "approve", "call", "recall", "listen", "wait")
 _RESULT_STEPS = ("human", "approve", "call", "decide", "recall", "listen")
+# Step kind -> the kinds of its activities that wait with the step's due.
+_DUE_ACTIVITIES: Mapping[str, tuple[str, ...]] = {
+    "human": ("task",),
+    "approve": ("approval",),
+    "call": ("skill", "agent", "child"),
+    "recall": ("recall",),
+    "listen": ("listen",),
+}
 
 
 # --- values in and out ----------------------------------------------------------------
@@ -175,7 +199,9 @@ class Input:
       data, error}``: a nested process ended;
     - ``recall`` — ``{activityId, status: completed|timed_out, result,
       reason}``: the answer of memory, recorded whole in the journal;
-    - ``timer`` — ``{timerId}``;
+    - ``timer`` — ``{timerId, detectedAt?}``: ``detectedAt`` — when the core
+      noticed the timer (the input's time is its due), the ``detectedAt`` of
+      a breached SLA deadline;
     - ``intent_failed`` — ``{activityId?, intent, code, detail}``: a command
       refused an intent (CP-ADR-0074 §6);
     - ``calendar`` — ``{key}``: a new version of a calendar was published;
@@ -253,6 +279,9 @@ class Definition:
     (``programs`` by JSON pointer); blocks are addressed by keys made of
     element ids (``stage:<id>/steps``, ``step:<id>/try``, ``branch:<id>``…),
     so a thread's position names elements, not places in a file.
+    ``engine_revision`` is the revision of the semantics the version runs
+    under: the one of its record (``process_definitions.engine_revision``),
+    the latest for a spec a publication would create as a new version.
     """
 
     key: str
@@ -264,6 +293,11 @@ class Definition:
     timers: Mapping[str, _Timer]
     stage_ids: tuple[str, ...]
     cost_limit: int = DEFAULT_COST_LIMIT
+    engine_revision: int = ENGINE_REVISION
+
+    def __post_init__(self) -> None:
+        if self.engine_revision not in ENGINE_REVISIONS:
+            raise EngineError(f"unknown engine revision {self.engine_revision!r}")
 
     @property
     def version(self) -> int:
@@ -277,6 +311,7 @@ class Definition:
         catalog: Catalog,
         *,
         cost_limit: int = DEFAULT_COST_LIMIT,
+        engine_revision: int = ENGINE_REVISION,
     ) -> "Definition":
         """Check ``spec`` (a normalized, published spec) and compile it for the engine."""
         checked = check_process(key, spec, catalog)
@@ -356,6 +391,7 @@ class Definition:
             timers=timers,
             stage_ids=tuple(s["id"] for s in spec["stages"]),
             cost_limit=cost_limit,
+            engine_revision=engine_revision,
         )
 
     def stage(self, stage_id: str) -> tuple[str, Mapping[str, Any]]:
@@ -467,6 +503,17 @@ def step(
     return engine.state, engine.decisions, engine.intents
 
 
+def owner_chain(
+    definition: Definition, state: Mapping[str, Any], at: datetime
+) -> list[dict[str, Any]]:
+    """``spec.owner`` of an instance in ``state``, its expressions computed at ``at``.
+
+    The candidates an SLA event addresses, for the application to resolve
+    elsewhere: the owner of an approval nobody may decide (CP-ADR-0074 §7).
+    """
+    return _Engine(definition, state, Input("event", at)).owner_chain()
+
+
 class _Raised(Exception):
     def __init__(self, error: ProcessError) -> None:
         super().__init__(error.type)
@@ -495,20 +542,38 @@ class _Engine:
     def instance_id(self) -> str:
         return str(self.state["instanceId"])
 
+    @property
+    def sla_on(self) -> bool:
+        """Whether the version runs with SLA deadlines (CP-ADR-0078 §3)."""
+        return self.d.engine_revision >= SLA_REVISION
+
     def decide(self, kind: str, element: str | None = None, **detail: Any) -> None:
         self.decisions.append(Decision(kind, element, detail))
 
     def intent(self, kind: str, **body: Any) -> None:
         self.intents.append(Intent(kind, body))
 
-    def emit(self, event_type: str, **payload: Any) -> None:
+    def emit(
+        self,
+        event_type: str,
+        *,
+        addressees: Mapping[str, Any] | None = None,
+        **payload: Any,
+    ) -> None:
         common = {
             "instanceId": self.instance_id,
             "definitionKey": self.d.key,
             "version": self.state["version"],
             "instanceKey": self.state["key"],
         }
-        self.intent("emit_event", type=event_type, payload={**common, **payload})
+        if addressees is None:
+            self.intent("emit_event", type=event_type, payload={**common, **payload})
+            return
+        # Candidate chains with expressions computed; the application resolves
+        # them into the payload's addressees (CP-ADR-0078 §3).
+        self.intent(
+            "emit_event", type=event_type, payload={**common, **payload}, addressees=addressees
+        )
 
     def make_id(self) -> str:
         made = new_id(self.instance_id, self.state["seq"], self.made)
@@ -637,6 +702,9 @@ class _Engine:
             self.repeat_start()
         elif kind == "calendar":
             self.recompute_timers(cause="calendar_changed", calendar=self.input.body.get("key"))
+            self.refreeze(self.input.body.get("key"))
+        elif kind == "migrated":
+            self.migrated()
         elif self.state["status"] == SUSPENDED and self.defer():
             pass
         else:
@@ -647,7 +715,7 @@ class _Engine:
         if kind == "event":
             self.event(body["event"])
         elif kind == "timer":
-            self.timer_fired(str(body["timerId"]))
+            self.timer_fired(str(body["timerId"]), body)
         elif kind == "intent_failed":
             self.intent_failed(body)
         else:
@@ -728,6 +796,10 @@ class _Engine:
         for timer in self.d.timers.values():
             if timer.stage is None:
                 self.boundary_timer(timer)
+        if self.sla_on and self.d.spec.get("due") is not None:
+            self.state["sla"] = self.deadline(
+                sla.PROCESS, sla.PROCESS, "/spec/due", self.d.spec["due"], self.values(), None, None
+            )
         self.drive()
 
     def repeat_start(self) -> None:
@@ -1324,7 +1396,7 @@ class _Engine:
         if body.get("title") is not None:
             title = str(self.evaluate(here + "/title", values, entry.id))
         assign = self.assignees(here + "/assign", body["assign"], values, entry.id)
-        due, due_recipe = self.due_of(here + "/due", body.get("due"), values, entry.id)
+        due, due_recipe, failed = self.due_of(here + "/due", body.get("due"), values, entry.id)
         activity = self.open_activity(tid, entry, "task", assign=assign, due=due)
         self.intent(
             "create_task",
@@ -1340,18 +1412,20 @@ class _Engine:
             input=self.step_input(entry, values),
             externalRef=self.external_ref(entry.id),
         )
-        self.escalation_timers(activity, here, body.get("escalations"), due_recipe, values)
+        self.open_sla(activity, here + "/due", body.get("due"), values, failed)
+        self.escalation_timers(activity, here, body.get("escalations"), due_recipe, values, failed)
 
     def step_approve(
         self, tid: str, entry: _Step, body: Mapping[str, Any], values: dict[str, Any]
     ) -> None:
         here = entry.path + "/approve"
         approvers = self.assignees(here + "/approvers", body["approvers"], values, entry.id)
-        excluded: list[str] = []
+        excluded: Any = []
         if body.get("separationOfDuties") is not None:
-            listed = self.evaluate(here + "/separationOfDuties", values, entry.id)
-            excluded = sorted({str(p) for p in listed or () if p not in (None, "")})
-        due, due_recipe = self.due_of(here + "/due", body.get("due"), values, entry.id)
+            # Passed on as computed: an empty value is no exclusion to drop but
+            # a refusal of the intent (CP-ADR-0074 §7), the application's to make.
+            excluded = self.evaluate(here + "/separationOfDuties", values, entry.id)
+        due, due_recipe, failed = self.due_of(here + "/due", body.get("due"), values, entry.id)
         quorum = body.get("quorum") or "all"
         activity = self.open_activity(
             tid,
@@ -1377,9 +1451,10 @@ class _Engine:
             context=self.context_profile(here + "/context", body.get("context"), values, entry.id),
             externalRef=self.external_ref(entry.id),
         )
+        self.open_sla(activity, here + "/due", body.get("due"), values, failed)
         if due_recipe is not None and body.get("onDue") in ("approve", "reject"):
             self.add_timer(activity, "due", due_recipe, values, onDue=body["onDue"])
-        self.escalation_timers(activity, here, body.get("escalations"), due_recipe, values)
+        self.escalation_timers(activity, here, body.get("escalations"), due_recipe, values, failed)
 
     def step_call(
         self, tid: str, entry: _Step, body: Mapping[str, Any], values: dict[str, Any]
@@ -1430,6 +1505,7 @@ class _Engine:
             )
         if body.get("timeout") is not None:
             self.add_timer(activity, "timeout", _recipe(body["timeout"], here + "/timeout"), values)
+        self.open_sla(activity, here + "/due", body.get("due"), values)
 
     def step_recall(
         self, tid: str, entry: _Step, body: Mapping[str, Any], values: dict[str, Any]
@@ -1461,6 +1537,7 @@ class _Engine:
             else {"kind": "duration", "value": _iso(DEFAULT_RECALL_TIMEOUT)}
         )
         self.add_timer(activity, "timeout", recipe, values)
+        self.open_sla(activity, here + "/due", body.get("due"), values)
 
     def step_listen(
         self, tid: str, entry: _Step, body: Mapping[str, Any], values: dict[str, Any]
@@ -1473,6 +1550,7 @@ class _Engine:
                 _recipe(body["timeout"], entry.path + "/listen/timeout"),
                 values,
             )
+        self.open_sla(activity, entry.path + "/listen/due", body.get("due"), values)
 
     def listen_matched(self, activity: Mapping[str, Any], event: Mapping[str, Any]) -> bool:
         entry = self.d.steps[activity["element"]]
@@ -1510,11 +1588,19 @@ class _Engine:
         return dict(value) if isinstance(value, dict) else {"value": value}
 
     def assignees(
-        self, path: str, chain: Sequence[Mapping[str, Any]], values: dict[str, Any], element: str
+        self,
+        path: str,
+        chain: Sequence[Mapping[str, Any]],
+        values: dict[str, Any],
+        element: str,
+        start: int = 0,
     ) -> list[dict[str, Any]]:
-        """The chain with expressions computed: ``agent:<key>``, ``role:<slug>`` or a principal."""
+        """The chain with expressions computed: ``agent:<key>``, ``role:<slug>`` or a principal.
+
+        ``start`` is the index of the chain's first item under ``path``.
+        """
         resolved: list[dict[str, Any]] = []
-        for index, item in enumerate(chain or ()):
+        for index, item in enumerate(chain or (), start):
             if item.get("expr") is None:
                 resolved.append(dict(item))
                 continue
@@ -1530,14 +1616,41 @@ class _Engine:
                 resolved.append({"principal": text})
         return resolved
 
+    def owner_chain(self) -> list[dict[str, Any]]:
+        """``spec.owner`` with expressions computed; a candidate that fails is skipped.
+
+        An owner is who an SLA event is addressed to, not a step: a failed
+        expression leaves its candidate unresolvable, as an unknown role does.
+        """
+        chain = self.d.spec.get("owner") or ()
+        values = self.values()
+        resolved: list[dict[str, Any]] = []
+        for index, item in enumerate(chain):
+            try:
+                resolved.extend(self.assignees("/spec/owner", [item], values, "process", index))
+            except _Raised:
+                continue
+        return resolved
+
     def due_of(
         self, path: str, value: Any, values: dict[str, Any], element: str
-    ) -> tuple[str | None, dict[str, Any] | None]:
+    ) -> tuple[str | None, dict[str, Any] | None, ProcessError | None]:
+        """The due of a ``human``/``approve`` step: its moment, recipe and why it failed.
+
+        Before SLA deadlines a due that cannot be computed is an error of the
+        step; since, it is ``process.sla_failed`` and the step runs without a
+        due (CP-ADR-0078 §3).
+        """
         if value is None:
-            return None, None
-        recipe = _recipe(value, path)
-        due, _, _ = self.compute(recipe, self.now, values, element)
-        return _rfc3339(due), recipe
+            return None, None, None
+        recipe = sla.due_recipe(value, path, self.d.spec.get("calendar"))
+        try:
+            due, _, _ = self.compute(recipe, self.now, values, element)
+        except _Raised as raised:
+            if not self.sla_on:
+                raise
+            return None, None, raised.error
+        return _rfc3339(due), recipe, None
 
     def escalation_plan(
         self, path: str, escalations: Any, values: dict[str, Any], element: str
@@ -1563,10 +1676,17 @@ class _Engine:
         escalations: Any,
         due_recipe: dict[str, Any] | None,
         values: dict[str, Any],
+        failed: ProcessError | None = None,
     ) -> None:
         for index, escalation in enumerate(escalations or ()):
+            if failed is not None:
+                # Levels count from the due; without it they have no moment.
+                self.decide(
+                    "escalation_skipped", activity["element"], level=index + 1, reason="due_failed"
+                )
+                continue
             after = escalation["after"]
-            recipe = {
+            recipe: dict[str, Any] = {
                 "kind": "after",
                 "due": due_recipe,
                 "after": None
@@ -2009,6 +2129,9 @@ class _Engine:
 
     def cancelled(self) -> None:
         closing = self.state["closing"] or {}
+        if self.sla_on:
+            # A suspension of the process's deadline ends with the instance.
+            self.close_stops()
         self.state.update(status=CANCELLED, outcome=None)
         self.decide(
             "cancelled",
@@ -2033,16 +2156,83 @@ class _Engine:
         for timer in sorted(self.state["timers"].values(), key=lambda t: t["n"]):
             if timer["state"] != "pending" or self.timer_runs_while_suspended(timer):
                 continue
-            due = _parse_time(timer["dueAt"])
-            timer.update(
-                state="frozen",
-                remaining=None if timer["reads"] else max(0.0, (due - self.now).total_seconds()),
-                frozenFrom=timer["dueAt"],
-                dueAt=None,
-            )
+            self.freeze(timer)
             self.intent("set_timer", **self.timer_row(timer))
+        if self.sla_on:
+            self.open_stops()
         self.decide("suspended", element, cause=cause, reason=reason)
         self.emit("process.suspended", cause=cause, reason=reason)
+
+    def freeze(self, timer: dict[str, Any]) -> None:
+        """Stop a pending timer: what is left of it is kept, in its unit (CP-ADR-0078 §4).
+
+        A timer that reads the data keeps nothing and is recomputed on resume,
+        as is a deadline from the data (``{at}``). A deadline in working units
+        keeps working time (or working days); should its calendar be gone, the
+        wall-clock seconds are kept instead.
+        """
+        due = _parse_time(timer["dueAt"])
+        remaining: float | None = (
+            None if timer["reads"] else max(0.0, (due - self.now).total_seconds())
+        )
+        unit = sla.WALL
+        if timer["kind"] in sla.SLA_TIMERS:
+            with contextlib.suppress(sla.DeadlineError):
+                remaining, unit = sla.remainder(
+                    timer["recipe"], due, self.now, self.input.calendars
+                )
+        timer.update(state="frozen", remaining=remaining, frozenFrom=timer["dueAt"], dueAt=None)
+        if self.sla_on:
+            # Revision 1 keeps the timer as it was before CP-ADR-0078: a
+            # replay of its journal compares the state too (FR-031).
+            timer.update(remainingUnit=unit, frozenAt=_rfc3339(self.now))
+
+    def thawed(self, timer: Mapping[str, Any]) -> tuple[datetime, bool]:
+        """The new moment of a frozen timer resumed now.
+
+        A deadline's warning is counted back from its resumed deadline, as when
+        it was set; a timer with nothing kept is recomputed from its recipe.
+        With SLA deadlines a timer already due at the freeze keeps its moment:
+        it fires right away, and a deadline is reported as declared.
+        """
+        if self.sla_on and self.due_at_freeze(timer):
+            return _parse_time(timer["frozenFrom"]), bool(timer["provisional"])
+        if timer["kind"] == sla.SLA_WARNING and timer["remaining"] is not None:
+            activity = self.state["activities"].get(timer.get("activity") or "")
+            record = self.sla_holder(timer, activity) or {}
+            due_timer = self.state["timers"].get(record.get("timer") or "")
+            if due_timer is not None and due_timer["state"] == "pending":
+                due = _parse_time(due_timer["dueAt"])
+                warn, marked = self.before(
+                    timer["recipe"]["span"], due, self.timer_values(timer), timer["element"]
+                )
+                return warn, bool(due_timer["provisional"]) or marked
+        if timer["remaining"] is None:
+            due, provisional, _ = self.compute(
+                timer["recipe"],
+                _parse_time(timer["base"]),
+                self.timer_values(timer),
+                timer["element"],
+            )
+            return due, provisional
+        unit = timer.get("remainingUnit") or sla.WALL
+        if unit == sla.WALL:
+            return self.now + timedelta(seconds=timer["remaining"]), bool(timer["provisional"])
+        try:
+            moment, provisional = sla.thaw(
+                timer["recipe"], timer["remaining"], unit, self.now, self.input.calendars
+            )
+        except sla.DeadlineError as exc:
+            raise _Raised(ProcessError(exc.code, 422, exc.message, timer["element"])) from None
+        return moment.astimezone(UTC), provisional
+
+    @staticmethod
+    def due_at_freeze(timer: Mapping[str, Any]) -> bool:
+        """Whether a frozen timer's moment had come when it was frozen (not yet taken)."""
+        frozen_from, frozen_at = timer.get("frozenFrom"), timer.get("frozenAt")
+        if timer["remaining"] is None or not frozen_from or not frozen_at:
+            return False
+        return _parse_time(str(frozen_from)) <= _parse_time(str(frozen_at))
 
     def timer_runs_while_suspended(self, timer: Mapping[str, Any]) -> bool:
         activity = self.state["activities"].get(timer.get("activity") or "")
@@ -2054,27 +2244,24 @@ class _Engine:
             return
         self.state["status"] = RUNNING
         for timer in sorted(self.state["timers"].values(), key=lambda t: t["n"]):
-            if timer["state"] != "frozen":
+            if timer["state"] != "frozen" or timer["id"] not in self.state["timers"]:
                 continue
-            if timer["remaining"] is not None:
-                due, provisional = (
-                    self.now + timedelta(seconds=timer["remaining"]),
-                    timer["provisional"],
-                )
-            else:
-                try:
-                    due, provisional, _ = self.compute(
-                        timer["recipe"],
-                        _parse_time(timer["base"]),
-                        self.timer_values(timer),
-                        timer["element"],
-                    )
-                except _Raised as raised:
-                    self.fail(raised.error)
-                    return
+            try:
+                due, provisional = self.thawed(timer)
+            except _Raised as raised:
+                if timer["kind"] in sla.SLA_TIMERS:
+                    self.sla_lost(timer, raised.error)
+                    continue
+                self.fail(raised.error)
+                return
+            if self.sla_on:
+                self.note_pause(timer, due)
             timer.update(
                 state="pending", dueAt=_rfc3339(due), remaining=None, provisional=provisional
             )
+            if self.sla_on:
+                timer.update(remainingUnit=sla.WALL, frozenAt=None)
+            self.sync_sla(timer)
             self.intent("set_timer", **self.timer_row(timer))
             self.emit(
                 "process.timer_rescheduled",
@@ -2086,12 +2273,94 @@ class _Engine:
                 cause="resumed",
                 changedFields=[],
             )
+        if self.sla_on:
+            self.close_stops()
         self.decide("resumed", element, cause=cause)
         self.emit("process.resumed", cause=cause)
         deferred, self.state["deferred"] = self.state["deferred"], []
         for record in deferred:
             self.decide("replayed", None, input=record["kind"])
             self.dispatch_deferred(record)
+
+    def note_pause(self, timer: dict[str, Any], due: datetime) -> None:
+        """Keep how far the resume moved a timer (``paused``), in the unit it was frozen in.
+
+        A recount counts the timer from its base again (a migration, a new
+        calendar version) and adds the pauses back (:meth:`paced`), so a past
+        suspension is not lost (FR-016). A timer with nothing kept (``{at}``,
+        one that reads the data) or already due at the freeze has no pause. A
+        warning counted back from its resumed deadline takes the deadline's.
+
+        A deadline already past at the freeze does not move: its record keeps
+        the suspension instead (``overdueStops``, :meth:`open_stops`).
+        """
+        if timer["kind"] == sla.SLA and self.due_at_freeze(timer):
+            return
+        if not timer["remaining"] or not timer.get("frozenFrom"):
+            return
+        if timer["kind"] == sla.SLA_WARNING:
+            activity = self.state["activities"].get(timer.get("activity") or "")
+            record = self.sla_holder(timer, activity) or {}
+            due_timer = self.state["timers"].get(record.get("timer") or "")
+            if due_timer is not None and due_timer["state"] == "pending":
+                if due_timer.get("paused"):
+                    timer["paused"] = copy.deepcopy(due_timer["paused"])
+                return
+        unit = timer.get("remainingUnit") or sla.WALL
+        try:
+            more = sla.pause(
+                timer["recipe"],
+                unit,
+                _parse_time(timer["frozenFrom"]),
+                due,
+                self.input.calendars,
+            )
+        except sla.DeadlineError:
+            return
+        if more is not None:
+            timer["paused"] = sla.add_pause(timer.get("paused") or [], more)
+
+    def open_stops(self) -> None:
+        """Start a suspension (``overdueStops``) of every deadline already past that stands.
+
+        The overdue clock of a past deadline stands with its thread, whether
+        the worker recorded the breach before the suspension or not (FR-021):
+        a record breached, or due by now, of a step whose thread waits (or of
+        the process) gets ``{from: now, to: null}``; :meth:`close_stops` ends
+        it. ``overdueSeconds`` of the breach, of the step's exit and of the
+        projection leave out what of it falls after the deadline.
+        """
+        holders: list[tuple[dict[str, Any], dict[str, Any] | None]] = [(self.state, None)]
+        holders += [(a, a) for a in self.state["activities"].values()]
+        for holder, activity in holders:
+            if activity is not None and not self.thread_paused(activity["thread"]):
+                continue
+            record = holder.get("sla")
+            if not isinstance(record, dict) or record.get("state") == sla.FAILED:
+                continue
+            due = record.get("dueAt")
+            if not due or (record.get("state") != sla.BREACHED and _parse_time(due) > self.now):
+                continue
+            stops = record.get("overdueStops") or []
+            if any(stop.get("to") is None for stop in stops):
+                continue
+            record["overdueStops"] = [*stops, {"from": _rfc3339(self.now), "to": None}]
+
+    def close_stops(self) -> None:
+        """End the suspensions deadline records keep open (``overdueStops``): resumed or closed.
+
+        The open ones come from :meth:`open_stops` and from a migration that
+        finds a deadline breached while its timer is frozen (the timer goes,
+        the record keeps the suspension from ``frozenAt``).
+        """
+        holders = [self.state, *self.state["activities"].values()]
+        for holder in holders:
+            record = holder.get("sla")
+            if not isinstance(record, dict):
+                continue
+            for stop in record.get("overdueStops") or ():
+                if stop.get("to") is None:
+                    stop["to"] = _rfc3339(self.now)
 
     def dispatch_deferred(self, record: Mapping[str, Any]) -> None:
         body = record["body"]
@@ -2164,21 +2433,24 @@ class _Engine:
         kind: str,
         recipe: dict[str, Any],
         values: dict[str, Any],
+        *,
+        base: datetime | None = None,
         **extra: Any,
-    ) -> None:
+    ) -> str:
         thread = self.state["threads"].get(activity["thread"])
         scope = thread["scope"] if thread is not None else "process"
         timer_id = self.new_timer(
             kind,
             activity["element"],
             recipe,
-            self.now,
+            self.now if base is None else base,
             values,
             scope=scope,
             activity=activity["id"],
             **extra,
         )
         activity["timers"].append(timer_id)
+        return timer_id
 
     def new_timer(
         self,
@@ -2189,7 +2461,7 @@ class _Engine:
         values: dict[str, Any],
         **extra: Any,
     ) -> str:
-        due, provisional, reads = self.compute(recipe, base, values, element)
+        due, provisional, reads = self.paced(recipe, base, values, element, extra.get("paused"))
         timer_id = self.make_id()
         timer = {
             "id": timer_id,
@@ -2208,12 +2480,7 @@ class _Engine:
         }
         self.state["timers"][timer_id] = timer
         if self.state["status"] == SUSPENDED and not self.timer_runs_while_suspended(timer):
-            timer.update(
-                state="frozen",
-                frozenFrom=timer["dueAt"],
-                dueAt=None,
-                remaining=None if reads else max(0.0, (due - self.now).total_seconds()),
-            )
+            self.freeze(timer)
         self.decide(
             "timer_set",
             element,
@@ -2226,7 +2493,7 @@ class _Engine:
         return timer_id
 
     def timer_row(self, timer: Mapping[str, Any]) -> dict[str, Any]:
-        return {
+        row = {
             "timerId": timer["id"],
             "element": timer["element"],
             "timerKind": timer["kind"],
@@ -2236,6 +2503,12 @@ class _Engine:
             "reads": timer["reads"],
             "provisional": timer["provisional"],
         }
+        # Only a remainder in working units names its unit: the rows of every
+        # journal before CP-ADR-0078 §4 stay as they were recorded.
+        unit = timer.get("remainingUnit") or sla.WALL
+        if unit != sla.WALL:
+            row["remainingUnit"] = unit
+        return row
 
     def cancel_timer(self, timer_id: str) -> None:
         timer = self.state["timers"].pop(timer_id, None)
@@ -2278,6 +2551,13 @@ class _Engine:
                     "invalid_due", 422, f"{recipe['path']} gives no moment or duration", element
                 )
             )
+        if kind in sla.WORKING:
+            moment, provisional = self.working(recipe, base, element)
+            return moment, provisional, set()
+        if kind == "before":
+            due, provisional, reads = self.compute(recipe["due"], base, values, element)
+            moment, more = self.before(recipe["span"], due, values, element)
+            return moment, provisional or more, reads
         due, provisional, reads = (
             (base, False, set())
             if recipe["due"] is None
@@ -2288,6 +2568,114 @@ class _Engine:
         moment, more, more_reads = self.compute(recipe["after"], due, values, element)
         return moment, provisional or more, reads | more_reads
 
+    def paced(
+        self,
+        recipe: Mapping[str, Any],
+        base: datetime,
+        values: Mapping[str, Any],
+        element: str,
+        pauses: Sequence[Mapping[str, Any]] | None,
+    ) -> tuple[datetime, bool, set[str]]:
+        """A timer's moment counted from ``base`` again, its past pauses added back.
+
+        A warning threshold is counted back from its deadline moved on by
+        them, as the resume counts it; a moment from the data does not move
+        with a pause.
+        """
+        if not pauses:
+            return self.compute(recipe, base, values, element)
+        if recipe["kind"] == "before":
+            due, provisional, reads = self.paced(recipe["due"], base, values, element, pauses)
+            moment, more = self.before(recipe["span"], due, values, element)
+            return moment, provisional or more, reads
+        moment, provisional, reads = self.compute(recipe, base, values, element)
+        if reads or recipe["kind"] == "at":
+            return moment, provisional, reads
+        for pause in pauses:
+            try:
+                moment, more = sla.extend(moment, pause, self.input.calendars)
+            except sla.DeadlineError as exc:
+                raise _Raised(ProcessError(exc.code, 422, exc.message, element)) from None
+            provisional = provisional or more
+        return moment.astimezone(UTC), provisional, reads
+
+    def before(
+        self, span: Mapping[str, Any], due: datetime, values: Mapping[str, Any], element: str
+    ) -> tuple[datetime, bool]:
+        """A warning threshold: ``span`` counted back from ``due``."""
+        if span["kind"] in sla.WORKING:
+            return self.working(span, due, element, back=True)
+        moment, _, _ = self.compute(span, due, values, element)
+        return due - (moment - due), False
+
+    def refreeze(self, calendar: Any) -> None:
+        """A new calendar version recounts what frozen deadlines in working units keep.
+
+        The deadline is recomputed from its base as a pending one would be, and
+        the remainder is measured again from the moment it was frozen. The
+        timer stays frozen: the new moment comes on resume
+        (``process.timer_rescheduled``, ``cause: resumed``). A timer kept in
+        ``wall`` is left alone: what is left of it does not depend on a calendar.
+        """
+        for timer in sorted(self.state["timers"].values(), key=lambda t: t["n"]):
+            if (
+                timer["state"] != "frozen"
+                or timer["kind"] not in sla.SLA_TIMERS
+                or (timer.get("remainingUnit") or sla.WALL) == sla.WALL
+                or not timer.get("frozenAt")
+                or not self.calls_calendar(timer["recipe"], calendar)
+            ):
+                continue
+            try:
+                due, provisional, _ = self.paced(
+                    timer["recipe"],
+                    _parse_time(timer["base"]),
+                    self.timer_values(timer),
+                    timer["element"],
+                    timer.get("paused"),
+                )
+                remaining, unit = sla.remainder(
+                    timer["recipe"],
+                    due,
+                    _parse_time(timer["frozenAt"]),
+                    self.input.calendars,
+                )
+            except (_Raised, sla.DeadlineError) as raised:
+                error = (
+                    raised.error
+                    if isinstance(raised, _Raised)
+                    else ProcessError(raised.code, 422, raised.message, timer["element"])
+                )
+                self.decide("timer_kept", timer["element"], timerId=timer["id"], error=error.out())
+                continue
+            previous = timer["frozenFrom"]
+            if (
+                _rfc3339(due) == previous
+                and remaining == timer["remaining"]
+                and unit == timer.get("remainingUnit")
+                and provisional == timer["provisional"]
+            ):
+                continue
+            timer.update(
+                frozenFrom=_rfc3339(due),
+                remaining=remaining,
+                remainingUnit=unit,
+                provisional=provisional,
+            )
+            self.sync_sla(timer)
+            self.decide(
+                "timer_rescheduled",
+                timer["element"],
+                timerId=timer["id"],
+                previousDueAt=previous,
+                dueAt=None,
+                frozenDueAt=timer["frozenFrom"],
+                remainingSeconds=remaining,
+                remainingUnit=unit,
+                cause="calendar_changed",
+            )
+            self.intent("set_timer", **self.timer_row(timer))
+
     def recompute_timers(
         self, *, cause: str, fields: Sequence[str] = (), calendar: Any = None
     ) -> None:
@@ -2297,14 +2685,15 @@ class _Engine:
                 continue
             if cause == "data_changed" and not _touches(timer["reads"], fields):
                 continue
-            if cause == "calendar_changed" and not self.calls_calendar(timer["recipe"]):
+            if cause == "calendar_changed" and not self.calls_calendar(timer["recipe"], calendar):
                 continue
             try:
-                due, provisional, reads = self.compute(
+                due, provisional, reads = self.paced(
                     timer["recipe"],
                     _parse_time(timer["base"]),
                     self.timer_values(timer),
                     timer["element"],
+                    timer.get("paused"),
                 )
             except _Raised as raised:
                 self.decide(
@@ -2316,6 +2705,7 @@ class _Engine:
             if _rfc3339(due) == previous and provisional == timer["provisional"]:
                 continue
             timer.update(dueAt=_rfc3339(due), provisional=provisional)
+            self.sync_sla(timer)
             self.decide(
                 "timer_rescheduled",
                 timer["element"],
@@ -2336,16 +2726,30 @@ class _Engine:
                 changedFields=list(fields),
             )
 
-    def calls_calendar(self, recipe: Mapping[str, Any] | None) -> bool:
+    def working(
+        self, recipe: Mapping[str, Any], base: datetime, element: str, *, back: bool = False
+    ) -> tuple[datetime, bool]:
+        try:
+            moment, provisional = sla.working(recipe, base, self.input.calendars, back=back)
+        except sla.DeadlineError as exc:
+            raise _Raised(ProcessError(exc.code, 422, exc.message, element)) from None
+        return moment.astimezone(UTC), provisional
+
+    def calls_calendar(self, recipe: Mapping[str, Any] | None, key: Any = None) -> bool:
         if recipe is None:
             return False
+        known = sla.calls_calendar(recipe, key)
+        if known is not None:
+            return known
         if recipe["kind"] == "at":
             return "cal." in self.d.programs[recipe["path"]].expression
         if recipe["kind"] == "after":
-            return self.calls_calendar(recipe["due"]) or self.calls_calendar(recipe["after"])
+            return self.calls_calendar(recipe["due"], key) or self.calls_calendar(
+                recipe["after"], key
+            )
         return False
 
-    def timer_fired(self, timer_id: str) -> None:
+    def timer_fired(self, timer_id: str, body: Mapping[str, Any]) -> None:
         timer = self.state["timers"].get(timer_id)
         if timer is None or timer["state"] != "pending":
             self.decide("ignored", reason="stale", input="timer", timerId=timer_id)
@@ -2365,10 +2769,14 @@ class _Engine:
             timerKind=timer["kind"],
             dueAt=timer["dueAt"],
         )
+        kind = timer["kind"]
+        if kind in sla.SLA_TIMERS:
+            # The fact of a deadline is its own event, not process.timer_fired (SC-010).
+            self.sla_fired(timer, activity, body)
+            return
         self.emit(
             "process.timer_fired", timerId=timer_id, element=timer["element"], dueAt=timer["dueAt"]
         )
-        kind = timer["kind"]
         if kind == "boundary":
             self.boundary_fired(timer)
         elif activity is None:
@@ -2419,7 +2827,7 @@ class _Engine:
         to = self.assignees(timer["escalation"] + "/to", escalation.get("to"), values, entry.id)
         self.decide("escalated", entry.id, level=timer["level"], action=action, to=to)
         self.emit(
-            "process.escalated",
+            ESCALATED,
             element=entry.id,
             level=timer["level"],
             action=action,
@@ -2444,6 +2852,661 @@ class _Engine:
                 activity["thread"],
                 ProcessError(error["type"], error.get("status"), detail, entry.id),
             )
+
+    # --- SLA deadlines (CP-ADR-0078 §3) ------------------------------------------------
+
+    def open_sla(
+        self,
+        activity: dict[str, Any],
+        path: str,
+        value: Any,
+        values: dict[str, Any],
+        failed: ProcessError | None = None,
+    ) -> None:
+        """The deadline of a waiting step: timers ``sla``/``sla_warning`` of its activity.
+
+        Every activity is an attempt of its own, counted from its opening; the
+        timers go with the activity when it closes.
+        """
+        if not self.sla_on or value is None:
+            return
+        activity["sla"] = self.deadline(
+            sla.STEP, str(activity["element"]), path, value, values, activity, failed
+        )
+
+    def deadline(
+        self,
+        scope: str,
+        element: str,
+        path: str,
+        value: Any,
+        values: dict[str, Any],
+        activity: dict[str, Any] | None,
+        failed: ProcessError | None,
+    ) -> dict[str, Any]:
+        """Set the timers of a deadline from now; the record of it the state keeps.
+
+        A deadline that cannot be computed (no calendar, an expression error)
+        does not stop the instance: it is ``process.sla_failed`` and a record
+        marked ``failed``.
+        """
+        calendar = self.d.spec.get("calendar")
+        due_recipe = sla.due_recipe(value, path, calendar)
+        warn_recipe = sla.warn_recipe(value, due_recipe, calendar)
+        due = warn = None
+        provisional = False
+        if failed is None:
+            try:
+                due, provisional, _ = self.compute(due_recipe, self.now, values, element)
+                if warn_recipe is not None:
+                    warn, marked, _ = self.compute(warn_recipe, self.now, values, element)
+                    provisional = provisional or marked
+            except _Raised as raised:
+                failed = raised.error
+        aid = activity["id"] if activity is not None else None
+        named = element if scope == sla.STEP else None
+        if failed is not None or due is None:
+            error = (failed or ProcessError("invalid_due", 422)).out()
+            self.sla_failure(scope, named, aid, error)
+            return sla.record(due_at=None, warn_at=None, provisional=False, error=error)
+        timers = [(sla.SLA, due_recipe)]
+        if warn_recipe is not None:
+            timers.append((sla.SLA_WARNING, warn_recipe))
+        made: list[str] = []
+        for kind, recipe in timers:
+            if activity is not None:
+                made.append(self.add_timer(activity, kind, recipe, values, sla=scope))
+            else:
+                made.append(
+                    self.new_timer(kind, element, recipe, self.now, values, scope=scope, sla=scope)
+                )
+        return sla.record(
+            due_at=_rfc3339(due),
+            warn_at=_rfc3339(warn) if warn is not None else None,
+            provisional=provisional,
+            timer=made[0],
+            warn_timer=made[1] if len(made) > 1 else None,
+        )
+
+    def sla_failure(
+        self, scope: str, element: str | None, aid: str | None, error: Mapping[str, Any]
+    ) -> None:
+        """``process.sla_failed``: addressed to the owner, no assignee (CP-ADR-0078 §3)."""
+        self.decide("sla_failed", element, scope=scope, activity=aid, error=dict(error))
+        self.emit(
+            "process.sla_failed",
+            scope=scope,
+            element=element,
+            attempt=None,
+            activityId=aid,
+            error=dict(error),
+            owner=None,
+            addressees={"owner": self.owner_chain()},
+        )
+
+    def sla_lost(self, timer: Mapping[str, Any], error: ProcessError) -> None:
+        """A frozen deadline that cannot be counted on resume fails; the instance goes on."""
+        activity = self.state["activities"].get(timer.get("activity") or "")
+        record = self.sla_holder(timer, activity)
+        ids = [timer["id"]]
+        if record is not None:
+            ids += [record.get("timer"), record.get("warnTimer")]
+        for timer_id in dict.fromkeys(i for i in ids if i):
+            self.cancel_timer(timer_id)
+        out = error.out()
+        if record is not None:
+            record.update(state=sla.FAILED, timer=None, warnTimer=None, error=out)
+        scope = str(timer.get("sla") or sla.STEP)
+        aid = activity["id"] if activity is not None and scope == sla.STEP else None
+        self.sla_failure(scope, timer["element"] if scope == sla.STEP else None, aid, out)
+
+    def sla_holder(
+        self, timer: Mapping[str, Any], activity: Mapping[str, Any] | None
+    ) -> dict[str, Any] | None:
+        """The record of the deadline a timer ``sla``/``sla_warning`` belongs to."""
+        holder = self.state if timer.get("sla") == sla.PROCESS else activity
+        found = (holder or {}).get("sla")
+        return found if isinstance(found, dict) else None
+
+    def sync_sla(self, timer: Mapping[str, Any]) -> None:
+        """A deadline timer moved (data, calendar, resume): its record follows."""
+        if timer["kind"] not in sla.SLA_TIMERS:
+            return
+        activity = self.state["activities"].get(timer.get("activity") or "")
+        record = self.sla_holder(timer, activity)
+        if record is None:
+            return
+        field_name = "dueAt" if timer["kind"] == sla.SLA else "warnAt"
+        moment = timer["dueAt"] if timer["state"] != "frozen" else timer.get("frozenFrom")
+        if moment is not None:
+            record[field_name] = moment
+        record["provisional"] = bool(timer["provisional"]) or any(
+            bool(self.state["timers"].get(other or "", {}).get("provisional"))
+            for other in (record.get("timer"), record.get("warnTimer"))
+            if other != timer["id"]
+        )
+
+    def sla_addressees(self, activity: Mapping[str, Any] | None) -> dict[str, Any]:
+        """Candidates of an SLA event's ``owner`` and ``assignee``: the chains, not ids.
+
+        The assignee of a step is its ``assign`` chain as it stands (a
+        reassignment replaces it; a ``call`` of an agent has one); a step
+        without one (``approve``, ``call`` of a skill…) and the process scope
+        have none. The application prefers the actual assignee of the step's
+        task and looks further for a step without a chain.
+        """
+        return {
+            "owner": self.owner_chain(),
+            "assignee": list((activity or {}).get("assign") or ()),
+        }
+
+    def sla_fired(
+        self, timer: Mapping[str, Any], activity: dict[str, Any] | None, body: Mapping[str, Any]
+    ) -> None:
+        """A deadline or its warning threshold passed while its step (process) is open."""
+        record = self.sla_holder(timer, activity)
+        if record is None:
+            self.decide("ignored", reason="stale", input="timer", timerId=timer["id"])
+            return
+        scope = str(timer.get("sla") or sla.STEP)
+        element = timer["element"] if scope == sla.STEP else None
+        aid = activity["id"] if activity is not None and scope == sla.STEP else None
+        common = {"scope": scope, "element": element, "attempt": None, "activityId": aid}
+        if timer["kind"] == sla.SLA_WARNING:
+            record["warnTimer"] = None
+            if record["state"] != sla.PENDING:
+                reason = "sla_" + record["state"]
+                self.decide("ignored", element, reason=reason, timerId=timer["id"])
+                return
+            record["state"] = sla.WARNING
+            self.decide(
+                "sla_warning",
+                element,
+                scope=scope,
+                activity=aid,
+                dueAt=record["dueAt"],
+                warnAt=timer["dueAt"],
+            )
+            self.emit(
+                "process.sla_warning",
+                **common,
+                dueAt=record["dueAt"],
+                warnAt=timer["dueAt"],
+                provisional=bool(record["provisional"]),
+                owner=None,
+                assignee=None,
+                addressees=self.sla_addressees(activity if scope == sla.STEP else None),
+            )
+            return
+        # The engine's time of a timer is its due; when the core noticed it is the input's.
+        detected = self.now
+        if body.get("detectedAt"):
+            detected = max(detected, _parse_time(str(body["detectedAt"])))
+        overdue = sla.overdue_seconds(
+            _parse_time(timer["dueAt"]), detected, record.get("overdueStops")
+        )
+        record.update(state=sla.BREACHED, timer=None, dueAt=timer["dueAt"])
+        self.decide(
+            "sla_breached",
+            element,
+            scope=scope,
+            activity=aid,
+            dueAt=timer["dueAt"],
+            detectedAt=_rfc3339(detected),
+            overdueSeconds=overdue,
+        )
+        self.emit(
+            "process.sla_breached",
+            **common,
+            dueAt=timer["dueAt"],
+            detectedAt=_rfc3339(detected),
+            overdueSeconds=overdue,
+            detectedBy="timer",
+            provisional=bool(record["provisional"]),
+            owner=None,
+            assignee=None,
+            addressees=self.sla_addressees(activity if scope == sla.STEP else None),
+        )
+
+    # --- deadlines of a migrated instance (CP-ADR-0074 §11, amendment 2026-09-29) --------
+
+    def migrated(self) -> None:
+        """The deadlines of an instance migrated to this version, counted by it.
+
+        The core takes this input right after the migration's journal entry:
+        the state is already the new version's, its deadlines still the old
+        one's. Every open waiting step recounts its ``due`` from its
+        activity's ``openedAt`` and the process its ``spec.due`` from the
+        start (FR-024): a moved timer is ``process.timer_rescheduled``
+        (``cause: migrated``), a deadline already past is one
+        ``process.sla_breached`` (``detectedBy: migration``), escalation
+        levels already past are skipped, not fired (decision B7), and the
+        task of a ``human`` step gets the new due (``update_task_due``).
+        Before SLA deadlines (revision 1) there is nothing to recount.
+        """
+        if not self.sla_on:
+            self.decide("ignored", reason="no_deadlines", input="migrated")
+            return
+        for activity in sorted(self.state["activities"].values(), key=lambda a: a["n"]):
+            entry = self.d.steps.get(str(activity.get("element")))
+            if entry is None:
+                continue
+            kind = step_kind(entry.node)
+            if activity["kind"] not in _DUE_ACTIVITIES.get(kind, ()):
+                continue
+            here = f"{entry.path}/{kind}"
+            body = entry.node[kind]
+            base = _parse_time(activity["openedAt"])
+            values = self.values(self.state["threads"].get(activity["thread"]))
+            pauses = self.deadline_pauses(self.deadline_timers(sla.STEP, activity))
+            due, recipe, failed = self.recount(
+                sla.STEP, entry.id, here + "/due", body.get("due"), values, activity, base
+            )
+            if kind in ("human", "approve"):
+                self.recount_escalations(activity, here, body, recipe, failed, values, base, pauses)
+            if activity["kind"] == "task" and activity.get("due") != due:
+                activity["due"] = due
+                self.intent("update_task_due", activityId=activity["id"], element=entry.id, due=due)
+        self.recount(
+            sla.PROCESS,
+            sla.PROCESS,
+            "/spec/due",
+            self.d.spec.get("due"),
+            self.values(),
+            None,
+            _parse_time(self.state["startedAt"]),
+        )
+
+    def recount(
+        self,
+        scope: str,
+        element: str,
+        path: str,
+        value: Any,
+        values: dict[str, Any],
+        activity: dict[str, Any] | None,
+        base: datetime,
+    ) -> tuple[str | None, dict[str, Any] | None, ProcessError | None]:
+        """One deadline counted by this version from ``base``: its moment, recipe and error.
+
+        The timers of the deadline move (or are set, or cancelled); the
+        record in the state is the new deadline's. Whether the deadline has
+        passed is judged at the moment its clock stopped when its timer is
+        frozen, otherwise now. The pauses the deadline's timer kept from past
+        suspensions are added back (:meth:`paced`): a clock that stood still
+        does not count against the deadline. ``deadline_migrated`` records
+        what changed.
+        """
+        holder = activity if activity is not None else self.state
+        old = holder.get("sla") if isinstance(holder.get("sla"), dict) else None
+        timers = self.deadline_timers(scope, activity)
+        # Before SLA deadlines the due of a human step was its task's alone.
+        previous = old.get("dueAt") if old is not None else (activity or {}).get("due")
+        aid = activity["id"] if activity is not None else None
+        named = element if scope == sla.STEP else None
+        report = {"scope": scope, "activity": aid, "previousDueAt": previous}
+        if value is None:
+            for timer in timers.values():
+                self.drop_timer(timer, activity)
+            if old is not None:
+                holder.pop("sla")
+                self.decide("deadline_migrated", named, **report, dueAt=None, breached=False)
+            return None, None, None
+        calendar = self.d.spec.get("calendar")
+        due_recipe = sla.due_recipe(value, path, calendar)
+        warn_recipe = sla.warn_recipe(value, due_recipe, calendar)
+        # The deadline keeps the pauses of its timer: a past suspension still counts.
+        pauses = self.deadline_pauses(timers)
+        paused: dict[str, Any] = {"paused": pauses} if pauses else {}
+        try:
+            due, provisional, _ = self.paced(due_recipe, base, values, element, pauses)
+            warn = None
+            if warn_recipe is not None:
+                warn, marked, _ = self.paced(warn_recipe, base, values, element, pauses)
+                provisional = provisional or marked
+        except _Raised as raised:
+            for timer in timers.values():
+                self.drop_timer(timer, activity)
+            error = raised.error.out()
+            holder["sla"] = sla.record(due_at=None, warn_at=None, provisional=False, error=error)
+            if old is None or old.get("state") != sla.FAILED or old.get("error") != error:
+                self.sla_failure(scope, named, aid, error)
+                self.decide("deadline_migrated", named, **report, dueAt=None, breached=False)
+            return None, None, raised.error
+        due_timer = timers.get(sla.SLA)
+        at = self.stopped_at(due_timer)
+        due_at = _rfc3339(due)
+        warn_at = _rfc3339(warn) if warn is not None else None
+        breached = due <= at
+        # The suspensions a past deadline sat through stay with the recounted one.
+        stops: dict[str, Any] = (
+            {"overdueStops": copy.deepcopy(old["overdueStops"])}
+            if old is not None and old.get("overdueStops")
+            else {}
+        )
+        if breached:
+            if at < self.now and not any(
+                s.get("to") is None for s in stops.get("overdueStops", ())
+            ):
+                # Past only by the new version, at the freeze: the clock stands with the
+                # frozen timer, which goes with the breach, so the record keeps the
+                # suspension open from then (a deadline past already has it, open_stops).
+                stops["overdueStops"] = [
+                    *stops.get("overdueStops", ()),
+                    {"from": _rfc3339(at), "to": None},
+                ]
+            for timer in timers.values():
+                self.drop_timer(timer, activity)
+            record = sla.record(due_at=due_at, warn_at=warn_at, provisional=provisional)
+            record.update(stops, state=sla.BREACHED)
+            holder["sla"] = record
+            if old is None or old.get("state") != sla.BREACHED:
+                overdue = sla.overdue_seconds(due, at, stops.get("overdueStops"))
+                self.migration_breach(scope, named, aid, due, overdue, provisional, activity)
+        else:
+            made = self.place_timer(
+                due_timer, sla.SLA, due_recipe, element, values, activity, base, scope, **paused
+            )
+            warn_timer = timers.get(sla.SLA_WARNING)
+            warned = warn is not None and warn <= at
+            if warn_recipe is None or warned:
+                if warn_timer is not None:
+                    self.drop_timer(warn_timer, activity)
+                warn_made = None
+            else:
+                warn_made = self.place_timer(
+                    warn_timer,
+                    sla.SLA_WARNING,
+                    warn_recipe,
+                    element,
+                    values,
+                    activity,
+                    base,
+                    scope,
+                    **paused,
+                )
+            record = sla.record(
+                due_at=due_at,
+                warn_at=warn_at,
+                provisional=provisional,
+                timer=made,
+                warn_timer=warn_made,
+            )
+            record.update(stops)
+            if warned:
+                # A threshold already past is not reported afterwards, like a past escalation.
+                record["state"] = sla.WARNING
+            holder["sla"] = record
+        if old is None or previous != due_at or (old.get("state") == sla.BREACHED) != breached:
+            self.decide("deadline_migrated", named, **report, dueAt=due_at, breached=breached)
+        return due_at, due_recipe, None
+
+    def frozen_at(self, timer: Mapping[str, Any]) -> datetime:
+        """When a frozen timer was frozen.
+
+        A timer frozen under revision 1 (before CP-ADR-0078, or by a version
+        of revision 1 since) has no ``frozenAt``: what it keeps is counted up
+        to the freeze, so the moment is ``frozenFrom`` less the remainder;
+        with nothing kept it is unknown, and the clock stands now. A timer
+        already due at the freeze kept ``0``: the moment comes out as its
+        ``frozenFrom``, the earliest it could be, and what is left of a new
+        moment after it is overstated by as much (CP-ADR-0078 §4).
+        """
+        if timer.get("frozenAt"):
+            return _parse_time(timer["frozenAt"])
+        if timer.get("frozenFrom") and timer.get("remaining") is not None:
+            return _parse_time(timer["frozenFrom"]) - timedelta(seconds=timer["remaining"])
+        return self.now
+
+    def stopped_at(self, timer: Mapping[str, Any] | None) -> datetime:
+        """The moment a timer's clock stands at: when it was frozen (:meth:`frozen_at`), or now."""
+        if timer is not None and timer["state"] == "frozen":
+            return self.frozen_at(timer)
+        return self.now
+
+    def deadline_timers(
+        self, scope: str, activity: Mapping[str, Any] | None
+    ) -> dict[str, dict[str, Any]]:
+        """The live timers ``sla``/``sla_warning`` of a step's (the process's) deadline."""
+        if activity is not None:
+            found = [self.state["timers"].get(t) for t in activity["timers"]]
+        else:
+            found = [t for t in self.state["timers"].values() if t.get("sla") == scope]
+        return {
+            timer["kind"]: timer
+            for timer in found
+            if timer is not None and timer["kind"] in sla.SLA_TIMERS
+        }
+
+    @staticmethod
+    def deadline_pauses(timers: Mapping[str, Mapping[str, Any]]) -> list[dict[str, Any]] | None:
+        """The pauses a deadline's timer ``sla`` keeps (:meth:`note_pause`)."""
+        due_timer = timers.get(sla.SLA)
+        return copy.deepcopy(due_timer.get("paused")) if due_timer is not None else None
+
+    def drop_timer(self, timer: Mapping[str, Any], activity: dict[str, Any] | None) -> None:
+        self.cancel_timer(timer["id"])
+        if activity is not None and timer["id"] in activity["timers"]:
+            activity["timers"].remove(timer["id"])
+
+    def place_timer(
+        self,
+        timer: dict[str, Any] | None,
+        kind: str,
+        recipe: dict[str, Any],
+        element: str,
+        values: dict[str, Any],
+        activity: dict[str, Any] | None,
+        base: datetime,
+        scope: str | None = None,
+        **extra: Any,
+    ) -> str:
+        """A timer of a recounted deadline: the live one moved, or a new one from ``base``."""
+        if timer is not None:
+            timer.update(extra)
+            self.move_timer(timer, recipe, base, values)
+            return str(timer["id"])
+        if scope is not None:
+            extra["sla"] = scope
+        if activity is not None:
+            return self.add_timer(activity, kind, recipe, values, base=base, **extra)
+        return self.new_timer(kind, element, recipe, base, values, scope=scope, **extra)
+
+    def move_timer(
+        self, timer: dict[str, Any], recipe: dict[str, Any], base: datetime, values: dict[str, Any]
+    ) -> None:
+        """A live timer counted by another recipe from ``base``: ``timer_rescheduled``.
+
+        A frozen timer keeps what is left of its new moment from when it was
+        frozen; ``process.timer_rescheduled`` comes on resume, as after a new
+        calendar version.
+        """
+        due, provisional, reads = self.paced(
+            recipe, base, values, timer["element"], timer.get("paused")
+        )
+        timer.update(recipe=recipe, base=_rfc3339(base), reads=sorted(reads))
+        if timer["state"] == "frozen":
+            frozen_at = self.frozen_at(timer)
+            remaining: float | None = None if reads else max(0.0, (due - frozen_at).total_seconds())
+            unit = sla.WALL
+            if timer["kind"] in sla.SLA_TIMERS:
+                with contextlib.suppress(sla.DeadlineError):
+                    remaining, unit = sla.remainder(recipe, due, frozen_at, self.input.calendars)
+            # A timer frozen under revision 1 keeps the moment made out for it.
+            timer["frozenAt"] = _rfc3339(frozen_at)
+            previous = timer["frozenFrom"]
+            if (_rfc3339(due), remaining, unit, provisional) == (
+                previous,
+                timer["remaining"],
+                timer.get("remainingUnit") or sla.WALL,
+                timer["provisional"],
+            ):
+                return
+            timer.update(
+                frozenFrom=_rfc3339(due),
+                remaining=remaining,
+                remainingUnit=unit,
+                provisional=provisional,
+            )
+            self.decide(
+                "timer_rescheduled",
+                timer["element"],
+                timerId=timer["id"],
+                previousDueAt=previous,
+                dueAt=None,
+                frozenDueAt=timer["frozenFrom"],
+                remainingSeconds=remaining,
+                remainingUnit=unit,
+                cause="migrated",
+            )
+            self.intent("set_timer", **self.timer_row(timer))
+            return
+        previous = timer["dueAt"]
+        if _rfc3339(due) == previous and provisional == timer["provisional"]:
+            return
+        timer.update(dueAt=_rfc3339(due), provisional=provisional)
+        self.decide(
+            "timer_rescheduled",
+            timer["element"],
+            timerId=timer["id"],
+            previousDueAt=previous,
+            dueAt=timer["dueAt"],
+            cause="migrated",
+        )
+        self.intent("set_timer", **self.timer_row(timer))
+        self.emit(
+            "process.timer_rescheduled",
+            timerId=timer["id"],
+            element=timer["element"],
+            previousDueAt=previous,
+            dueAt=timer["dueAt"],
+            provisional=provisional,
+            cause="migrated",
+            changedFields=[],
+        )
+
+    def migration_breach(
+        self,
+        scope: str,
+        element: str | None,
+        aid: str | None,
+        due: datetime,
+        overdue: int,
+        provisional: bool,
+        activity: dict[str, Any] | None,
+    ) -> None:
+        """A recounted deadline already past: one breach, found by the migration.
+
+        ``overdue`` is counted to the moment the deadline's clock stands at, the
+        suspensions it sat through past due left out, as a timer's breach is.
+        """
+        self.decide(
+            "sla_breached",
+            element,
+            scope=scope,
+            activity=aid,
+            dueAt=_rfc3339(due),
+            detectedAt=_rfc3339(self.now),
+            overdueSeconds=overdue,
+            detectedBy="migration",
+        )
+        self.emit(
+            "process.sla_breached",
+            scope=scope,
+            element=element,
+            attempt=None,
+            activityId=aid,
+            dueAt=_rfc3339(due),
+            detectedAt=_rfc3339(self.now),
+            overdueSeconds=overdue,
+            detectedBy="migration",
+            provisional=provisional,
+            owner=None,
+            assignee=None,
+            addressees=self.sla_addressees(activity),
+        )
+
+    def recount_escalations(
+        self,
+        activity: dict[str, Any],
+        here: str,
+        body: Mapping[str, Any],
+        due_recipe: dict[str, Any] | None,
+        failed: ProcessError | None,
+        values: dict[str, Any],
+        base: datetime,
+        pauses: list[dict[str, Any]] | None = None,
+    ) -> None:
+        """Escalation levels (and ``onDue``) of a ``human``/``approve`` step, from the new due.
+
+        A level whose moment has passed is skipped, not fired
+        (``escalation_skipped``, ``reason: migrated``); a future one moves or
+        is set. A level the new version no longer has is cancelled. A level
+        that fired on the old version has no timer left, so it is not told
+        from one the new version adds: a future moment sets it again. A
+        level keeps the pauses of its timer; a new one takes its deadline's
+        (``pauses``).
+        """
+        live = [self.state["timers"].get(t) for t in list(activity["timers"])]
+        levels = {t["level"]: t for t in live if t is not None and t["kind"] == "escalation"}
+        on_due = next((t for t in live if t is not None and t["kind"] == "due"), None)
+        element = str(activity["element"])
+        timers: list[tuple[dict[str, Any] | None, str, dict[str, Any], dict[str, Any]]] = []
+        if body.get("onDue") in ("approve", "reject") and due_recipe is not None:
+            timers.append((on_due, "due", due_recipe, {"onDue": body["onDue"]}))
+        elif on_due is not None:
+            self.drop_timer(on_due, activity)
+        for index, escalation in enumerate(body.get("escalations") or ()):
+            level = index + 1
+            old = levels.pop(level, None)
+            if failed is not None:
+                if old is not None:
+                    self.drop_timer(old, activity)
+                self.decide("escalation_skipped", element, level=level, reason="due_failed")
+                continue
+            after = escalation["after"]
+            recipe: dict[str, Any] = {
+                "kind": "after",
+                "due": due_recipe,
+                "after": None
+                if after == "due"
+                else _recipe(after, f"{here}/escalations/{index}/after"),
+            }
+            extra: dict[str, Any] = {"level": level, "escalation": f"{here}/escalations/{index}"}
+            timers.append((old, "escalation", recipe, extra))
+        for old in levels.values():
+            self.drop_timer(old, activity)
+        for old, kind, recipe, extra in timers:
+            # A live timer keeps its own pauses; a new one takes its deadline's.
+            own = old.get("paused") if old is not None else pauses
+            if old is None and own:
+                extra["paused"] = copy.deepcopy(own)
+            try:
+                moment, _, _ = self.paced(recipe, base, values, element, own)
+            except _Raised as raised:
+                if old is not None:
+                    self.drop_timer(old, activity)
+                self.decide(
+                    "escalation_skipped",
+                    element,
+                    level=extra.get("level"),
+                    reason="due_failed",
+                    error=raised.error.out(),
+                )
+                continue
+            if moment <= self.stopped_at(old):
+                if old is not None:
+                    self.drop_timer(old, activity)
+                self.decide(
+                    "escalation_skipped",
+                    element,
+                    level=extra.get("level"),
+                    reason="migrated",
+                    dueAt=_rfc3339(moment),
+                    **({"onDue": extra["onDue"]} if "onDue" in extra else {}),
+                )
+                continue
+            self.place_timer(old, kind, recipe, element, values, activity, base, **extra)
 
     # --- retrospective ----------------------------------------------------------------
 
@@ -2936,3 +3999,16 @@ def _assignee_text(assignee: Mapping[str, Any]) -> str:
     if assignee.get("role"):
         return f"role:{assignee['role']}"
     return str(assignee.get("principal") or "")
+
+
+def assignee_of_text(target: str) -> dict[str, str]:
+    """The candidate a ``to`` target of ``process.escalated`` names: its text form read back.
+
+    The inverse of the event's text form (``role:<slug>``, ``agent:<key>`` or a
+    principal id), so the application resolves the targets from the payload
+    and the engine's intents stay as they were (CP-ADR-0078, amendment 2026-09-30).
+    """
+    for prefix in ("agent", "role"):
+        if target.startswith(prefix + ":"):
+            return {prefix: target[len(prefix) + 1 :]}
+    return {"principal": target}

@@ -12,6 +12,7 @@ from control_plane.domain.agent_instructions import (
     assemble_instructions,
     layer,
 )
+from control_plane_agent.blocked import BLOCKED_COMMENT_PREFIX
 from control_plane_agent.comments import (
     HEADING,
     MAX_COMMENTS,
@@ -172,6 +173,23 @@ def test_the_thread_is_read_page_by_page_and_filtered() -> None:
     assert comments["items"][2]["editedAt"] == "2026-09-30T11:00:00+00:00"
     # The author comes with the comment: no principal is requested at all.
     assert client.principal_reads == []
+
+
+def test_own_blocked_comments_are_left_out_in_both_wordings() -> None:
+    """settle_blocked writes "The run stopped ..." since universal-runner; older
+    daemons wrote "The executor stopped ...", and such comments stay on tasks."""
+    current = f"{BLOCKED_COMMENT_PREFIX} (services_blocked): no database.\nThe task waits."
+    thread = [
+        comment(1, current, SELF, run_id="r-1"),
+        comment(2, BLOCKED, SELF, run_id="r-2"),
+        comment(3, current, OTHER_AGENT, run_id="r-9"),
+    ]
+
+    comments = _read(FakeClient(thread))
+
+    assert comments is not None
+    # Only another executor's comment of the same wording is kept: not ours.
+    assert [item["body"] for item in comments["items"]] == [current]
 
 
 def test_the_owner_is_told_from_an_agent_without_principals_read() -> None:

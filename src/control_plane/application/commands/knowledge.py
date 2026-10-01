@@ -46,11 +46,13 @@ from control_plane.domain.errors import (
     AuthorizationError,
     ConflictError,
     DependencyUnavailableError,
+    NotFoundError,
     UpstreamError,
     ValidationError,
 )
 from control_plane.infrastructure.context_provider import (
     ContextProviderError,
+    GraphProvider,
     KnowledgeProvider,
     tenant_namespace,
     workspace_namespace,
@@ -406,10 +408,24 @@ async def record_document_stored(
 # only pinned ``name@version`` references; ``tenant:name@version`` names a pack
 # of the tenant (amendment 2026-09-28), which Memory finds only under its owner.
 PACK_REF_RE = re.compile(r"^(?:tenant:)?[a-z0-9][a-z0-9._-]{0,63}@[0-9A-Za-z][0-9A-Za-z.+-]{0,31}$")
+# A pack to read: pinned, or by name alone for its latest version.
+PACK_READ_REF_RE = re.compile(
+    r"^(?P<tenant>tenant:)?(?P<name>[a-z0-9][a-z0-9._-]{0,63})"
+    r"(?:@(?P<version>[0-9A-Za-z][0-9A-Za-z.+-]{0,31}))?$"
+)
 # Memory's 409 ``detail.code`` when a tenant pack's name, a kind or a relation
 # clashes with a shared pack: the manifest is wrong, not a version conflict.
 PACK_SCOPE_CONFLICTS = frozenset({"pack_name_conflict", "kind_conflict", "relation_conflict"})
 TENANT_PACK_SCOPE = "tenant"
+
+
+def is_pack_admin(ctx: AuthContext, settings: Settings) -> bool:
+    """The caller is a platform administrator of packs (``CP_KNOWLEDGE_PACK_ADMINS``)."""
+    admins = {item.strip() for item in settings.knowledge_pack_admins if item.strip()}
+    actor = {str(ctx.principal_id)}
+    if ctx.iam_principal_id is not None:
+        actor.add(str(ctx.iam_principal_id))
+    return bool(admins & actor)
 
 
 def authorize_pack_registration(ctx: AuthContext, settings: Settings) -> None:
@@ -421,11 +437,7 @@ def authorize_pack_registration(ctx: AuthContext, settings: Settings) -> None:
     ``CP_KNOWLEDGE_PACK_ADMINS`` (Control Plane or IAM principal ids); empty
     closes the endpoint.
     """
-    admins = {item.strip() for item in settings.knowledge_pack_admins if item.strip()}
-    actor = {str(ctx.principal_id)}
-    if ctx.iam_principal_id is not None:
-        actor.add(str(ctx.iam_principal_id))
-    if not admins & actor:
+    if not is_pack_admin(ctx, settings):
         raise AuthorizationError(
             "Registering knowledge packs is reserved to platform administrators",
             details={"required": "knowledge_pack_admin"},
@@ -629,3 +641,125 @@ async def record_workspace_packs_set(
         },
     )
     return event.id
+
+
+# --- reading what is installed ----------------------------------------------
+#
+# What a pack install writes, read back so that a plan can show the difference
+# (CP-ADR-0060, amendment 2026-09-30): the PUT above replaces the whole set, and
+# a pack version is registered once. Reads journal nothing.
+
+
+async def prepare_workspace_packs_read(
+    session: AsyncSession, ctx: AuthContext, settings: Settings, *, workspace_id: uuid.UUID
+) -> KnowledgeTarget:
+    """Authorize reading a workspace's packs and resolve its tree's namespace.
+
+    Any workspace of the tree answers with the root's set: packs belong to the
+    namespace, and a sub-workspace works under them too."""
+    await authorize(
+        ctx,
+        Permission.WORKSPACES_READ,
+        Permission.WORKSPACES_MANAGE,
+        resource=ResourceRef("workspace", str(workspace_id)),
+    )
+    return await _workspace_target(session, ctx, settings, workspace_id)
+
+
+async def read_workspace_packs(
+    provider: GraphProvider,
+    target: KnowledgeTarget,
+    *,
+    trace_run_id: str | None = None,
+) -> dict[str, Any]:
+    """The enabled packs and strictness of the tree's namespace, in the shape
+    ``PUT .../knowledge-packs`` takes them, plus what is in effect.
+
+    Memory keeps ``packages: null`` for a namespace nobody configured (its
+    default pack applies): ``configured: false`` and ``packs: []``. The
+    namespace itself stays out of the answer, as everywhere a client reads."""
+    try:
+        answer = await provider.namespace_kinds(
+            namespace=target.namespace, trace_run_id=trace_run_id
+        )
+    except ContextProviderError as exc:
+        raise memory_failure(exc) from exc
+    conf = answer.get("settings")
+    conf = conf if isinstance(conf, dict) else {}
+    catalog = answer.get("catalog")
+    catalog = catalog if isinstance(catalog, dict) else {}
+    packs = conf.get("packages")
+    effective = catalog.get("packages")
+    updated_at = conf.get("updated_at")
+    return {
+        "workspaceId": str(target.workspace_id),
+        "rootWorkspaceId": str(target.root_workspace_id),
+        "configured": isinstance(packs, list),
+        "packs": [ref for ref in packs if isinstance(ref, str)] if isinstance(packs, list) else [],
+        "strict": conf.get("strict") is True,
+        "effective": (
+            [ref for ref in effective if isinstance(ref, str)]
+            if isinstance(effective, list)
+            else []
+        ),
+        "updatedAt": updated_at if isinstance(updated_at, str) and updated_at else None,
+    }
+
+
+@dataclass(frozen=True)
+class PackRead:
+    """One pack version to read, as Memory is asked for it."""
+
+    ref: str
+    name: str  # ``tenant:<name>`` for a tenant pack
+    version: str  # empty: the latest
+    namespace: str  # the tenant's namespace for a tenant pack, empty for a shared one
+
+
+async def prepare_pack_read(ctx: AuthContext, settings: Settings, ref: str) -> PackRead:
+    """Parse ``name[@version]`` or ``tenant:name[@version]`` and authorize.
+
+    Reading a pack takes the right to read the tenant's journal (``events.read``,
+    where pack registrations are recorded) or to register tenant packs
+    (``knowledge.packs.manage``); a platform administrator of packs reads a
+    shared pack without either. A tenant pack is read in the tenant's own
+    namespace: another tenant's pack of the same name is not seen."""
+    match = PACK_READ_REF_RE.match(ref)
+    if match is None:
+        raise ValidationError(
+            "invalid_pack_ref",
+            "A pack is read by name, name@version or tenant:name@version",
+            details={"pack": ref[:128]},
+        )
+    tenant = match["tenant"] is not None
+    if tenant or not is_pack_admin(ctx, settings):
+        await authorize(ctx, Permission.EVENTS_READ, Permission.KNOWLEDGE_PACKS_MANAGE)
+    return PackRead(
+        ref=ref,
+        name=f"{TENANT_PACK_SCOPE}:{match['name']}" if tenant else match["name"],
+        version=match["version"] or "",
+        namespace=tenant_namespace(settings, ctx.tenant_id) if tenant else "",
+    )
+
+
+async def read_pack(
+    provider: GraphProvider,
+    read: PackRead,
+    *,
+    trace_run_id: str | None = None,
+) -> dict[str, Any]:
+    """Memory's pack version as is (``name``, ``version``, ``kinds``,
+    ``relations``, ``description``, ``scope``, ``ref``), without the owner's
+    namespace. Unknown, or a tenant pack of another tenant -- 404."""
+    try:
+        answer = await provider.get_package(
+            name=read.name,
+            version=read.version,
+            namespace=read.namespace,
+            trace_run_id=trace_run_id,
+        )
+    except ContextProviderError as exc:
+        if exc.status == 404:
+            raise NotFoundError("Knowledge pack not found", details={"pack": read.ref}) from exc
+        raise memory_failure(exc) from exc
+    return {key: value for key, value in answer.items() if key != "namespace"}

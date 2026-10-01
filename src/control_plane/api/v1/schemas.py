@@ -6,7 +6,15 @@ from collections.abc import Sequence
 from datetime import date, datetime
 from typing import Annotated, Any, Literal
 
-from pydantic import AfterValidator, AwareDatetime, BaseModel, ConfigDict, Field, model_validator
+from pydantic import (
+    AfterValidator,
+    AwareDatetime,
+    BaseModel,
+    BeforeValidator,
+    ConfigDict,
+    Field,
+    model_validator,
+)
 from pydantic.alias_generators import to_camel
 
 from control_plane.domain.work_item import MAX_COMMENT_BODY_LENGTH
@@ -646,6 +654,37 @@ class KnowledgePackRegisterRequest(BaseModel):
 class WorkspaceKnowledgePacksRequest(ApiModel):
     packs: list[Annotated[str, Field(min_length=1, max_length=128)]] = Field(max_length=64)
     strict: bool = False
+
+
+class WorkspaceKnowledgePacksOut(ApiModel):
+    """The packs of a workspace tree's namespace (CP-ADR-0060, amendment
+    2026-09-30): ``packs`` and ``strict`` as ``PUT .../knowledge-packs`` takes
+    them, ``effective`` -- the packs Memory applies (its default pack while
+    nobody configured the namespace, ``configured: false``)."""
+
+    workspace_id: uuid.UUID
+    root_workspace_id: uuid.UUID
+    configured: bool
+    packs: list[str]
+    strict: bool
+    effective: list[str]
+    updated_at: str | None = None
+
+
+class KnowledgePackOut(BaseModel):
+    """A registered pack version as Memory gives it (``kinds`` with their
+    ``idPatterns``, ``relations``, ``description``), with ``scope`` (``common``
+    or ``tenant``) and ``ref``, the pinned reference Memory enables it by
+    (``name@version`` or ``tenant:name@version``)."""
+
+    model_config = ConfigDict(extra="allow")
+
+    name: str
+    version: str
+    scope: Literal["common", "tenant"] = "common"
+    ref: str | None = None
+    kinds: list[dict[str, Any]] = Field(default_factory=list)
+    relations: list[dict[str, Any]] = Field(default_factory=list)
 
 
 # --- Responses ----------------------------------------------------------------
@@ -2117,15 +2156,15 @@ class RuleEvaluationOut(ApiModel):
 #
 # The contract lands before the implementation (constitution art. V): the
 # routes answer 501 until declarative-agents D005. ``AgentSpec`` describes the
-# same object as ``$defs.agentSpec`` of the superproject catalog schema
-# (``packages/schema/v1/object.schema.json``); a contract test keeps the two
-# together. The core validates the shape of every section; the executor
-# parameters are data of the executor kind (``$defs.agentExecutors``) and pass
-# through uninterpreted.
+# same object as ``$defs.agentSpec`` of the package-sdk catalog schema
+# (``schema/v1/object.schema.json``); a contract test keeps the two
+# together. The core validates the shape of every section but two: the executor
+# parameters (``$defs.agentExecutors``) and the working copy
+# (``$defs.agentWorkingCopies``) are data of the executor kind and pass through
+# uninterpreted (TAI-ADR-0063); the core only looks for secret material in them.
 
 AGENT_KEY_PATTERN = r"^[a-z0-9][a-z0-9-]*$"
 _AGENT_KEY_FIELD = Field(min_length=1, max_length=63, pattern=AGENT_KEY_PATTERN)
-_AGENT_DIRECTORY = Annotated[str, Field(pattern=r"^[a-z0-9][a-z0-9._-]*$")]
 _AGENT_REF = Annotated[str, Field(min_length=1, max_length=500)]
 _AGENT_NODE_LABEL = Annotated[
     str, Field(max_length=100, pattern=r"^[a-z0-9][a-z0-9.-]*(=[a-zA-Z0-9._-]+)?$")
@@ -2201,6 +2240,21 @@ class AgentWorkSpec(ApiModel):
     )
 
 
+# An OCI image reference with a tag or a digest (the ``distribution/reference``
+# grammar with the implicit ``latest`` taken away): ``[registry[:port]/]path``
+# then ``:tag``, ``@sha256:<hex>`` or both. ``@`` only precedes ``sha256:``, so
+# a reference cannot carry credentials (ADR-0073 E1).
+_OCI_HOST_PART = r"[a-zA-Z0-9](?:[a-zA-Z0-9-]*[a-zA-Z0-9])?"
+_OCI_REGISTRY = rf"{_OCI_HOST_PART}(?:\.{_OCI_HOST_PART})*"
+_OCI_COMPONENT = r"[a-z0-9]+(?:(?:[._]|__|-+)[a-z0-9]+)*"
+_OCI_DIGEST = r"@sha256:[a-f0-9]{64}"
+AGENT_IMAGE_PATTERN = (
+    rf"^(?:{_OCI_REGISTRY}(?::[0-9]{{1,5}})?/)?"
+    rf"{_OCI_COMPONENT}(?:/{_OCI_COMPONENT})*"
+    rf"(?::[A-Za-z0-9_][A-Za-z0-9_.-]{{0,127}}(?:{_OCI_DIGEST})?|{_OCI_DIGEST})$"
+)
+
+
 class AgentExecutorSpec(ApiModel):
     """How the agent executes. ``kind`` is a string, never a vendor enum (art. II)."""
 
@@ -2210,35 +2264,18 @@ class AgentExecutorSpec(ApiModel):
         description="Parameters of the executor kind; checked by its schema, not by the core",
     )
     instructions: str = Field(default="", max_length=AGENT_INSTRUCTIONS_MAX_CHARS)
-
-
-class AgentReviewSpec(ApiModel):
-    """How the branch of a task goes to review."""
-
-    mode: Literal["human", "agent", "none"] | None = None
-    task_type: Annotated[str, _TYPE_KEY_FIELD] | None = None
-    task_types: list[Annotated[str, _TYPE_KEY_FIELD]] = Field(
-        default_factory=list,
-        max_length=_AGENT_ITEMS,
-        description="Task types whose branches get a review",
+    image: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=255,
+        pattern=AGENT_IMAGE_PATTERN,
+        description=(
+            "OCI image reference the placing node runs this agent from (tag or digest "
+            "required). The node runs it only if its allow-list for the executor kind "
+            "admits it; otherwise the placement reason is image_not_allowed. Absent: the "
+            "node's default image of the kind. The core checks the form only."
+        ),
     )
-    reviewer: _AGENT_TOPOLOGY | None = None
-    base: str | None = Field(default=None, min_length=1, max_length=200)
-
-
-class AgentWorkingCopySpec(ApiModel):
-    """The working copy of a task (TAI-ADR-0016 p.5): repository, neighbours, publishing."""
-
-    repository: _AGENT_REF
-    directory: _AGENT_DIRECTORY | None = None
-    base_ref: str | None = Field(default=None, min_length=1, max_length=200)
-    neighbours: dict[_AGENT_DIRECTORY, _AGENT_REF] = Field(
-        default_factory=dict,
-        description="Neighbour repositories at the revisions the superproject pins",
-    )
-    superproject: _AGENT_REF | None = None
-    publish: bool = True
-    review: AgentReviewSpec | None = None
 
 
 # A pinned skill version the agent invokes: ``name@version``.
@@ -2314,7 +2351,11 @@ class AgentSpec(ApiModel):
         default=None, description="Absent for identities that take no work (placement none)"
     )
     executor: AgentExecutorSpec | None = None
-    working_copy: AgentWorkingCopySpec | None = None
+    working_copy: dict[str, Any] | None = Field(
+        default=None,
+        description="The working copy the executor daemon builds; stored as data, its shape is "
+        "checked by the schema of the executor kind, not by the core (TAI-ADR-0063)",
+    )
     skills: AgentSkillsSpec | None = None
     placement: AgentPlacementSpec | Literal["none"] | None = Field(
         default=None, description="Absent means placed with the defaults; none means no process"
@@ -2503,8 +2544,8 @@ class AgentRevisionPageOut(ApiModel):
 #
 # The contract lands before the implementation (constitution art. V): the
 # routes answer 501 until the steps of the feature that implement them. The
-# spec of a process is ``$defs.processSpec`` of the superproject catalog schema
-# (``packages/schema/v1/object.schema.json``); the core checks it by that
+# spec of a process is ``$defs.processSpec`` of the package-sdk catalog schema
+# (``schema/v1/object.schema.json``); the core checks it by that
 # schema and then by the language (CP-ADR-0074 §2, CP-ADR-0075), so the body
 # here is the document as the catalog holds it. The calendar is small and
 # modelled field by field; a contract test keeps both sides together.
@@ -2542,6 +2583,56 @@ class ProcessDefinitionPublishRequest(ApiModel):
     )
 
 
+CatalogStatus = Literal["active", "retired"]
+STATUS_FILTER_DESCRIPTION = (
+    "active — only keys in use, retired — only retired ones; both without it (CP-ADR-0074 Zh1)"
+)
+
+
+class RetirementOut(ApiModel):
+    """When, by whom and why a process or calendar key was retired (CP-ADR-0074 Zh1)."""
+
+    at: datetime
+    by: uuid.UUID
+    reason: str
+
+
+_STATUS_FIELD: Any = Field(
+    default="active",
+    description="retired — every version of the key is out of use (CP-ADR-0074 Zh1)",
+)
+_RETIRED_FIELD = Field(default=None, description="The retirement of the key; null when in use")
+
+
+class CatalogRetireRequest(ApiModel):
+    reason: str = Field(min_length=1, max_length=500)
+
+
+class ProcessRetireVersionOut(ApiModel):
+    version: int = Field(ge=1)
+    open_instances: int = Field(ge=1)
+
+
+class ProcessRetireOut(ApiModel):
+    """``POST /process-definitions/{key}:retire``: no new instances, open ones run to the end."""
+
+    key: str
+    status: Literal["retired"] = "retired"
+    retired: RetirementOut
+    open_instances: int = Field(
+        ge=0, description="Open (running, suspended) instances of every workspace"
+    )
+    by_version: list[ProcessRetireVersionOut] = Field(
+        description="Only the versions with open instances"
+    )
+
+
+class CalendarRetireOut(ApiModel):
+    key: str
+    status: Literal["retired"] = "retired"
+    retired: RetirementOut
+
+
 class ProcessDefinitionOut(ApiModel):
     id: uuid.UUID
     tenant_id: uuid.UUID
@@ -2558,10 +2649,15 @@ class ProcessDefinitionOut(ApiModel):
         " (regulation drift, failed instances); null when the process has none",
     )
     expression_profile: str = Field(description="CEL profile of its expressions, e.g. cp/1")
+    engine_revision: int = Field(
+        description="Revision of the engine semantics the version runs under (CP-ADR-0074)"
+    )
     spec: dict[str, Any]
     warnings: list[ProcessProblemOut] = Field(
         default_factory=list, description="Findings that did not refuse the version"
     )
+    status: CatalogStatus = _STATUS_FIELD
+    retired: RetirementOut | None = _RETIRED_FIELD
     created_by: uuid.UUID
     created_at: datetime
     package: PackageLinkOut | None = _PACKAGE_LINK_FIELD
@@ -2579,7 +2675,10 @@ class ProcessVersionOut(ApiModel):
     definition_hash: str
     identity_agent: str | None
     expression_profile: str
+    engine_revision: int
     warnings: list[ProcessProblemOut] = Field(default_factory=list)
+    status: CatalogStatus = _STATUS_FIELD
+    retired: RetirementOut | None = _RETIRED_FIELD
     created_by: uuid.UUID
     created_at: datetime
 
@@ -2630,12 +2729,51 @@ class ProcessStageStateOut(ApiModel):
     state: Literal["available", "active", "completed", "terminated"]
 
 
+SlaState = Literal["ok", "warning", "breached", "paused", "unknown", "none"]
+_SLA_STATE_DESCRIPTION = (
+    "Computed on read from dueAt, warnAt and now (CP-ADR-0078 §6): ok, warning,"
+    " breached; paused while its clock stands (its timer is frozen while the"
+    " instance is suspended); unknown when the deadline"
+    " could not be computed; none without a deadline"
+)
+
+
+class ProcessSlaOut(ApiModel):
+    """The deadline of a step or of the whole process (CP-ADR-0078 §6)."""
+
+    due_at: datetime | None = Field(default=None, description="Null while frozen")
+    warn_at: datetime | None = Field(
+        default=None, description="Null without warnBefore and while frozen"
+    )
+    provisional: bool = Field(default=False, description="Computed on a provisional calendar year")
+    remaining_seconds: int | None = Field(
+        default=None,
+        description="Until dueAt while running; kept while frozen, in remainingUnit;"
+        " null once breached",
+    )
+    remaining_unit: Literal["wall", "working_seconds", "workdays"] | None = Field(
+        default=None,
+        description="Unit of remainingSeconds: wall — seconds of wall-clock time (always"
+        " while running), working_seconds — seconds of working time, workdays — whole"
+        " working days times 86400 plus the second of the day the deadline falls on,"
+        " local to the calendar (CP-ADR-0078 §4); null with remainingSeconds",
+    )
+
+
 class ProcessOpenElementOut(ApiModel):
     id: str
     kind: str = Field(description="Step kind: human, approve, call, recall, listen, wait...")
     since: datetime
     task_id: uuid.UUID | None
     approval_ids: list[uuid.UUID]
+    attempt: int | None = Field(
+        default=None, description="Entry into this element within the instance, from 1"
+    )
+    due: ProcessSlaOut | None = Field(default=None, description="Null without a deadline")
+    sla_state: SlaState | None = Field(default=None, description=_SLA_STATE_DESCRIPTION)
+    overdue_seconds: int | None = Field(
+        default=None, description="How far past dueAt the open step is; null while in time"
+    )
 
 
 class ProcessTimerOut(ApiModel):
@@ -2660,6 +2798,12 @@ class ProcessInstanceOut(ApiModel):
     stages: list[ProcessStageStateOut]
     open_elements: list[ProcessOpenElementOut]
     timers: list[ProcessTimerOut]
+    sla: ProcessSlaOut | None = Field(
+        default=None, description="The deadline of the process (spec.due), counted from start"
+    )
+    sla_state: SlaState | None = Field(
+        default=None, description="The worst state of the process and its open steps"
+    )
     started_at: datetime
     updated_at: datetime
     completed_at: datetime | None
@@ -2742,6 +2886,50 @@ def _unique_weekdays(items: list[int]) -> list[int]:
     return items
 
 
+class CalendarInterval(ApiModel):
+    """One interval of a working day, local time of the calendar (``$defs.workingIntervals``)."""
+
+    from_: str = Field(alias="from", pattern=r"^([01][0-9]|2[0-3]):[0-5][0-9]$")
+    to: str = Field(pattern=r"^(([01][0-9]|2[0-3]):[0-5][0-9]|24:00)$")
+
+
+def _weekday_keys(value: Any) -> Any:
+    # YAML reads the key 6 of `weekdays: {6: []}` as an integer.
+    if isinstance(value, dict):
+        return {str(key) if isinstance(key, int) else key: item for key, item in value.items()}
+    return value
+
+
+# $defs.duration of the catalog schema; look-ahead needs Python's re, not the model's regex.
+_ISO_DURATION = re.compile(r"P(?!$)(\d+Y)?(\d+M)?(\d+W)?(\d+D)?(T(?=\d)(\d+H)?(\d+M)?(\d+S)?)?")
+
+
+def _iso_duration(value: str) -> str:
+    if not _ISO_DURATION.fullmatch(value):
+        raise ValueError("must be an ISO 8601 duration such as PT1H")
+    return value
+
+
+_Weekday = Literal["1", "2", "3", "4", "5", "6", "7"]
+_CalendarIntervals = Annotated[list[CalendarInterval], Field(max_length=10)]
+
+
+class CalendarWorkingHours(ApiModel):
+    """Working hours of a calendar (CP-ADR-0078 §2): only the shape.
+
+    The order of intervals and what they mean are the calendar's business.
+    """
+
+    intervals: Annotated[list[CalendarInterval], Field(min_length=1, max_length=10)]
+    weekdays: (
+        Annotated[dict[_Weekday, _CalendarIntervals], BeforeValidator(_weekday_keys)] | None
+    ) = Field(default=None, description="Intervals by ISO weekday instead of intervals; [] is none")
+    short_day_reduction: Annotated[str, AfterValidator(_iso_duration)] | None = Field(
+        default=None,
+        description="How much shorter a short day is, taken off the end of its last interval",
+    )
+
+
 class CalendarSpec(ApiModel):
     """``$defs.calendarSpec`` of the catalog schema."""
 
@@ -2750,6 +2938,7 @@ class CalendarSpec(ApiModel):
     weekend: (
         Annotated[list[Annotated[int, Field(ge=1, le=7)]], AfterValidator(_unique_weekdays)] | None
     ) = Field(default=None, description="ISO weekdays, 1 is Monday; [6, 7] by default")
+    working_hours: CalendarWorkingHours | None = None
     years: list[CalendarYear] = Field(min_length=1)
 
 
@@ -2767,6 +2956,8 @@ class CalendarOut(ApiModel):
     calendar_hash: str
     spec: dict[str, Any]
     provisional_years: list[int]
+    status: CatalogStatus = _STATUS_FIELD
+    retired: RetirementOut | None = _RETIRED_FIELD
     created_by: uuid.UUID
     created_at: datetime
     package: PackageLinkOut | None = _PACKAGE_LINK_FIELD
@@ -2821,7 +3012,9 @@ class PackageTestFailureOut(ApiModel):
 class PackageTestResultOut(ApiModel):
     file: str
     name: str
-    process: str
+    subject: Literal["process", "rule", "taskType"]
+    object: str = Field(description="Key of the process, rule or task type under test")
+    process: str | None = Field(description="Key of the process; null for rule and taskType tests")
     status: Literal["passed", "failed", "error"]
     duration_ms: int
     failures: list[PackageTestFailureOut]
@@ -2842,12 +3035,45 @@ class ProcessCoverageOut(ApiModel):
     handlers: CoverageCounterOut
 
 
+class RuleCoverageOut(ApiModel):
+    """A rule of the package (CP-ADR-0074 Z3): branches of its expressions, its outcomes."""
+
+    rule: str
+    tests: int = Field(ge=0)
+    branches: CoverageCounterOut = Field(
+        description="Each operand of and/or, not and comparison of condition and where, "
+        "true and false: '/condition/and/1:true'"
+    )
+    outcomes: CoverageCounterOut = Field(
+        description="matched, not_matched; with an interpretation also "
+        "interpretation:answered and interpretation:failed"
+    )
+
+
+class TaskTypeCoverageOut(ApiModel):
+    """A task type of the package with gates, work after completion or acceptance (Z3)."""
+
+    task_type: str
+    version: int
+    tests: int = Field(ge=0)
+    outcomes: CoverageCounterOut = Field(
+        description="<gate>/<outcome> and <gate>/<outcome>/<i>/onSuccess|onFailure"
+    )
+    preconditions: CoverageCounterOut = Field(
+        description="<gate>/preconditions/approved/<i>:held|refused"
+    )
+    completion: CoverageCounterOut = Field(description="completion/<i>")
+    acceptance: CoverageCounterOut = Field(description="acceptance/<key>:passed|failed")
+
+
 class PackageTestOut(ApiModel):
     status: Literal["passed", "failed", "invalid"]
     check_only: bool
     problems: list[ProcessProblemOut]
     tests: list[PackageTestResultOut]
-    coverage: list[ProcessCoverageOut]
+    coverage: list[ProcessCoverageOut] = Field(description="Coverage of the processes")
+    rule_coverage: list[RuleCoverageOut]
+    task_type_coverage: list[TaskTypeCoverageOut]
     duration_ms: int
 
 
@@ -2885,7 +3111,7 @@ class PlanChangeOut(ApiModel):
         description="The kinds the core plans, in the order the apply publishes them"
     )
     key: str
-    action: Literal["create", "update", "rename", "retire", "unchanged"]
+    action: Literal["create", "update", "rename", "restore", "retire", "unchanged"]
     renamed_from: str | None
     fields: list[PlanFieldOut]
     deprecates: list[int] = Field(
@@ -2917,12 +3143,38 @@ class PlanInstancesOut(ApiModel):
     )
 
 
+class PlanDeadlineOut(ApiModel):
+    """An open instance whose deadline the migration sets, moves or lifts (FR-023).
+
+    The section also lists a deadline the new version finds already past
+    (``breached``): the apply records its breach. A deadline breached on the
+    old version and past by the new one at the same moment is not listed.
+    """
+
+    instance_id: uuid.UUID
+    element: str | None = Field(description="Null for the deadline of the process")
+    previous_due_at: datetime | None = Field(description="Null when the deadline is new")
+    due_at: datetime | None = Field(description="Null when the new version lifts it")
+    breached: bool = Field(
+        description="The deadline by the new version has already passed at the time of the plan"
+    )
+
+
 class PlanProcessOut(ApiModel):
     key: str
     from_version: int | None
     to_version: int
     behaviour: PlanReplayOut | None
     instances: list[PlanInstancesOut]
+    deadlines: list[PlanDeadlineOut] = Field(
+        default_factory=list,
+        description="Deadlines of migrated instances recomputed by the new version, at most 200",
+    )
+    deadlines_total: int = Field(
+        default=0,
+        description="Deadlines the migration moves, all of them: more than listed when the"
+        " section is cut to its limit",
+    )
 
 
 class RegulationCoverageOut(ApiModel):
@@ -2957,7 +3209,7 @@ class PackageApplyRequest(ApiModel):
 class PackageAppliedOut(ApiModel):
     kind: str
     key: str
-    action: Literal["create", "update", "rename", "retire", "unchanged"]
+    action: Literal["create", "update", "rename", "restore", "retire", "unchanged"]
     version: int | None
 
 

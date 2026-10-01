@@ -1,0 +1,17 @@
+subject: rule
+rule: invoice-received
+name: полученный счёт заводит работу на оплату с реквизитами и критериями
+given:
+  variables: {FINANCE_DIRECTOR_ROLE_ID: 00000000-0000-4000-8000-00000000f1d0}
+  observation:
+    kind: invoice.received
+    data: {invoice: INV-7, supplier: Acme, amount: "1500.00"}
+steps:
+  - expect:
+      result: matched
+      ensureWork:
+        - type: invoice-payment
+          title: Оплатить счёт INV-7 поставщика Acme
+          customFields: {invoice: INV-7, supplier: Acme, invoiceAmount: "1500.00"}
+      invokeSkill: []
+      noSideEffects: true

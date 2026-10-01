@@ -9,10 +9,18 @@ where the decisions or the intents differ from the recorded ones. Memory is
 never asked: the engine sees memory only through the recorded ``recall``
 inputs (SC-011).
 
+The engine revision is the one of the version record the definition was
+built from (``process_definitions.engine_revision``, CP-ADR-0074, amendment
+2026-09-29): an instance replays under the revision it ran under, and one
+migrated since runs under its target version's revision from the migration
+on — the entry the replay starts from, followed by the engine's input
+``migrated`` that counted its deadlines by that version.
+
 A candidate version replays the journal the same way
 (``POST /process-definitions/{key}:replay``, CP-ADR-0074 §10):
-:func:`as_version` runs it under the number of the instance's version, and
-:func:`first_divergence` names the first journal entry where the paths part.
+:func:`as_version` runs it under the number and the engine revision of the
+instance's version, and :func:`first_divergence` names the first journal
+entry where the paths part.
 
 A package test has no journal: its ``mocks.recall`` answer the ``recall``
 steps (:func:`mock_recall`), checked against the form of a memory answer.
@@ -141,6 +149,9 @@ def replay(
     A migration (``input.kind: migrate``, CP-ADR-0074 §11) moved the
     instance to another version with the state it records: the replay starts
     from the last one, since the entries before it ran on another version.
+    The input ``migrated`` after it — the deadlines counted by the new
+    version — is the first step replayed: an input of the engine like any
+    other, recorded with the calendar versions it counted by.
     """
     result = Replay()
     state: dict[str, Any] | None = None
@@ -187,17 +198,24 @@ def replay(
 # --- a candidate version against real journals -------------------------------------------
 
 
-def as_version(definition: engine.Definition, version: int) -> engine.Definition:
-    """The candidate under the number of the version an instance ran.
+def as_version(
+    definition: engine.Definition, version: int, engine_revision: int
+) -> engine.Definition:
+    """The candidate under the number and the engine revision of the version an instance ran.
 
     The number is not behaviour, yet the engine writes it into the state and
     into every ``process.*`` event: a candidate under its own number would
-    differ from the journal on every step it emits. The check and the
-    compiled programs stay those of the candidate.
+    differ from the journal on every step it emits. The revision is
+    behaviour, but not the candidate's: the instance keeps its revision until
+    a migration moves it, so the candidate is compared under the semantics
+    its journal was recorded with. The check and the compiled programs stay
+    those of the candidate.
     """
-    if definition.version == version:
-        return definition
-    return replace(definition, spec={**definition.spec, "version": version})
+    if definition.version != version:
+        definition = replace(definition, spec={**definition.spec, "version": version})
+    if definition.engine_revision != engine_revision:
+        definition = replace(definition, engine_revision=engine_revision)
+    return definition
 
 
 @dataclass(frozen=True)
@@ -359,6 +377,7 @@ _JOURNAL_KIND = {
     "compensation_started": "compensation",
     "compensated": "compensation",
     "migrated": "migration",
+    "deadline_migrated": "migration",
     "error_raised": "error",
     "error_caught": "error",
     "error_handled": "error",

@@ -1,0 +1,15 @@
+# Machine-readable conventions of this repository for the runner daemon.
+# Format: src/control_plane_agent/runner_config.md; prose conventions: AGENTS.md.
+# Checks call the same make targets as CI (.github/workflows/ci.yml).
+version: 1
+neighbours: [platform-auth-sdk, memory-service]
+setup: make install
+services:
+  db:
+    template: postgres-16
+    env:
+      CP_TEST_DATABASE_URL: "postgresql+psycopg://{user}:{password}@{host}:{port}/{database}"
+checks:
+  - {name: lint, run: make lint}
+  - {name: types, run: make typecheck}
+  - {name: tests, run: make test, services: [db]}

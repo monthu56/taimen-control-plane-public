@@ -1,0 +1,960 @@
+{
+ "calendars": [],
+ "catalog": {
+  "agents": [
+   "sample-process"
+  ],
+  "taskTypes": [
+   {
+    "display_name": "Review",
+    "field_schema": {
+     "properties": {
+      "decision": {
+       "type": "string"
+      }
+     },
+     "type": "object"
+    },
+    "key": "review",
+    "version": 1
+   },
+   {
+    "display_name": "Task",
+    "field_schema": {},
+    "key": "task",
+    "version": 1
+   }
+  ]
+ },
+ "definitions": [
+  {
+   "created_at": "2026-09-30T16:26:21.093377Z",
+   "definition_hash": "sha256:a6671359440eb8031f8f93a6ceee6043c55960b65344d1dc77727bac172d2ddc",
+   "display_name": "Replay: a duration due",
+   "expression_profile": "cp/1",
+   "governed_by": [],
+   "id": "33a84c04-371a-4d6f-867f-a712618a162a",
+   "identity_agent": "sample-process",
+   "key": "replay-duration",
+   "spec": {
+    "data": {
+     "properties": {
+      "decision": {
+       "type": "string"
+      }
+     },
+     "type": "object"
+    },
+    "displayName": "Replay: a duration due",
+    "identity": {
+     "agent": "sample-process"
+    },
+    "owner": [
+     {
+      "role": "lead"
+     }
+    ],
+    "stages": [
+     {
+      "id": "work",
+      "steps": [
+       {
+        "human": {
+         "assign": [
+          {
+           "principal": "c8dd3b48-bc33-4419-b75a-820e212223c6"
+          }
+         ],
+         "due": "PT2S",
+         "escalations": [
+          {
+           "action": "notify",
+           "after": "due",
+           "to": [
+            {
+             "principal": "c8dd3b48-bc33-4419-b75a-820e212223c6"
+            }
+           ]
+          },
+          {
+           "action": "notify",
+           "after": "PT1H",
+           "to": [
+            {
+             "principal": "c8dd3b48-bc33-4419-b75a-820e212223c6"
+            }
+           ]
+          }
+         ],
+         "taskType": "review"
+        },
+        "id": "ack",
+        "output": {
+         "as": {
+          "decision": "step.result.decision"
+         }
+        }
+       },
+       {
+        "complete": {
+         "outcome": "acknowledged"
+        },
+        "id": "done"
+       }
+      ]
+     }
+    ],
+    "start": {
+     "key": "event.payload.data.number",
+     "on": {
+      "observation": "sample.quick"
+     }
+    },
+    "version": 1
+   },
+   "version": 1,
+   "warnings": []
+  }
+ ],
+ "instances": [
+  {
+   "completed_at": "2026-09-30T16:26:24.278436Z",
+   "data": {
+    "decision": "yes"
+   },
+   "definition_id": "33a84c04-371a-4d6f-867f-a712618a162a",
+   "definition_key": "replay-duration",
+   "definition_version": 1,
+   "error": null,
+   "id": "5eb49ba5-3368-49cb-b94f-1d33307befea",
+   "instance_key": "Q-escalated",
+   "journal": [
+    {
+     "actor_id": "c8dd3b48-bc33-4419-b75a-820e212223c6",
+     "at": "2026-09-30T16:26:21.111428Z",
+     "calendars": {},
+     "created_at": "2026-09-30T16:26:21.144118Z",
+     "decisions": [
+      {
+       "element": null,
+       "key": "Q-escalated",
+       "kind": "started",
+       "trigger": {
+        "eventId": "088417e4-de72-472c-8c8d-ea0b324e3fe0",
+        "type": "observation:sample.quick"
+       }
+      },
+      {
+       "element": "work",
+       "entry": null,
+       "kind": "stage_entered",
+       "run": 1
+      },
+      {
+       "activity": "0ff789ff-facc-576f-8d03-d630088964e5",
+       "activityKind": "task",
+       "element": "ack",
+       "kind": "activity_opened"
+      },
+      {
+       "dueAt": "2026-09-30T16:26:23.111428Z",
+       "element": "ack",
+       "kind": "timer_set",
+       "provisional": false,
+       "timerId": "b9929f02-b170-55bd-ae97-f388cc661aea",
+       "timerKind": "escalation"
+      },
+      {
+       "dueAt": "2026-09-30T17:26:23.111428Z",
+       "element": "ack",
+       "kind": "timer_set",
+       "provisional": false,
+       "timerId": "aca31065-2e58-5582-9702-e5e6aa039526",
+       "timerKind": "escalation"
+      }
+     ],
+     "event_id": "088417e4-de72-472c-8c8d-ea0b324e3fe0",
+     "input": {
+      "actorId": "c8dd3b48-bc33-4419-b75a-820e212223c6",
+      "at": "2026-09-30T16:26:21.111428Z",
+      "body": {
+       "event": {
+        "actorId": "c8dd3b48-bc33-4419-b75a-820e212223c6",
+        "correlationId": "req_a673fb9c377242bf96d4808c4b065d8a",
+        "entityId": "223fd7a6-16f8-4b51-a47d-f193084e9050",
+        "entityType": "observation",
+        "id": "088417e4-de72-472c-8c8d-ea0b324e3fe0",
+        "observation": "sample.quick",
+        "payload": {
+         "content": "sample.quick seen",
+         "data": {
+          "number": "Q-escalated"
+         },
+         "kind": "sample.quick",
+         "observedAt": "2026-09-30T16:26:21.111428+00:00"
+        },
+        "time": "2026-09-30T16:26:21.111428Z",
+        "type": "observation.recorded"
+       },
+       "instanceId": "5eb49ba5-3368-49cb-b94f-1d33307befea"
+      },
+      "kind": "start"
+     },
+     "intents": [
+      {
+       "executed": {
+        "ok": true
+       },
+       "kind": "emit_event",
+       "payload": {
+        "definitionKey": "replay-duration",
+        "instanceId": "5eb49ba5-3368-49cb-b94f-1d33307befea",
+        "instanceKey": "Q-escalated",
+        "memory": null,
+        "triggerEventId": "088417e4-de72-472c-8c8d-ea0b324e3fe0",
+        "triggerType": "observation:sample.quick",
+        "version": 1
+       },
+       "type": "process.started"
+      },
+      {
+       "executed": {
+        "ok": true
+       },
+       "kind": "emit_event",
+       "payload": {
+        "definitionKey": "replay-duration",
+        "instanceId": "5eb49ba5-3368-49cb-b94f-1d33307befea",
+        "instanceKey": "Q-escalated",
+        "stage": "work",
+        "version": 1
+       },
+       "type": "process.stage_entered"
+      },
+      {
+       "activityId": "0ff789ff-facc-576f-8d03-d630088964e5",
+       "assign": [
+        {
+         "principal": "c8dd3b48-bc33-4419-b75a-820e212223c6"
+        }
+       ],
+       "context": null,
+       "due": "2026-09-30T16:26:23.111428Z",
+       "element": "ack",
+       "escalations": [
+        {
+         "action": "notify",
+         "after": "due",
+         "level": 1,
+         "to": [
+          {
+           "principal": "c8dd3b48-bc33-4419-b75a-820e212223c6"
+          }
+         ]
+        },
+        {
+         "action": "notify",
+         "after": "PT1H",
+         "level": 2,
+         "to": [
+          {
+           "principal": "c8dd3b48-bc33-4419-b75a-820e212223c6"
+          }
+         ]
+        }
+       ],
+       "executed": {
+        "ok": true,
+        "taskId": "c8c50906-c47e-4387-b17a-52d7eca006ac"
+       },
+       "externalRef": "process/5eb49ba5-3368-49cb-b94f-1d33307befea/ack",
+       "form": null,
+       "input": null,
+       "kind": "create_task",
+       "taskType": "review",
+       "title": "ack"
+      },
+      {
+       "dueAt": "2026-09-30T16:26:23.111428Z",
+       "element": "ack",
+       "executed": {
+        "ok": true
+       },
+       "kind": "set_timer",
+       "provisional": false,
+       "reads": [],
+       "remainingSeconds": null,
+       "state": "pending",
+       "timerId": "b9929f02-b170-55bd-ae97-f388cc661aea",
+       "timerKind": "escalation"
+      },
+      {
+       "dueAt": "2026-09-30T17:26:23.111428Z",
+       "element": "ack",
+       "executed": {
+        "ok": true
+       },
+       "kind": "set_timer",
+       "provisional": false,
+       "reads": [],
+       "remainingSeconds": null,
+       "state": "pending",
+       "timerId": "aca31065-2e58-5582-9702-e5e6aa039526",
+       "timerKind": "escalation"
+      }
+     ],
+     "kind": "start",
+     "seq": 0,
+     "source_ref": "event:088417e4-de72-472c-8c8d-ea0b324e3fe0"
+    },
+    {
+     "actor_id": null,
+     "at": "2026-09-30T16:26:23.111428Z",
+     "calendars": {},
+     "created_at": "2026-09-30T16:26:24.239194Z",
+     "decisions": [
+      {
+       "dueAt": "2026-09-30T16:26:23.111428Z",
+       "element": "ack",
+       "kind": "timer_fired",
+       "timerId": "b9929f02-b170-55bd-ae97-f388cc661aea",
+       "timerKind": "escalation"
+      },
+      {
+       "action": "notify",
+       "element": "ack",
+       "kind": "escalated",
+       "level": 1,
+       "to": [
+        {
+         "principal": "c8dd3b48-bc33-4419-b75a-820e212223c6"
+        }
+       ]
+      }
+     ],
+     "event_id": null,
+     "input": {
+      "actorId": null,
+      "at": "2026-09-30T16:26:23.111428Z",
+      "body": {
+       "timerId": "b9929f02-b170-55bd-ae97-f388cc661aea"
+      },
+      "kind": "timer"
+     },
+     "intents": [
+      {
+       "executed": {
+        "ok": true
+       },
+       "kind": "emit_event",
+       "payload": {
+        "definitionKey": "replay-duration",
+        "dueAt": "2026-09-30T16:26:23.111428Z",
+        "element": "ack",
+        "instanceId": "5eb49ba5-3368-49cb-b94f-1d33307befea",
+        "instanceKey": "Q-escalated",
+        "timerId": "b9929f02-b170-55bd-ae97-f388cc661aea",
+        "version": 1
+       },
+       "type": "process.timer_fired"
+      },
+      {
+       "executed": {
+        "ok": true
+       },
+       "kind": "emit_event",
+       "payload": {
+        "action": "notify",
+        "definitionKey": "replay-duration",
+        "element": "ack",
+        "instanceId": "5eb49ba5-3368-49cb-b94f-1d33307befea",
+        "instanceKey": "Q-escalated",
+        "level": 1,
+        "taskId": null,
+        "to": [
+         "c8dd3b48-bc33-4419-b75a-820e212223c6"
+        ],
+        "version": 1
+       },
+       "type": "process.escalated"
+      }
+     ],
+     "kind": "timer",
+     "seq": 1,
+     "source_ref": "timer:b9929f02-b170-55bd-ae97-f388cc661aea"
+    },
+    {
+     "actor_id": "c8dd3b48-bc33-4419-b75a-820e212223c6",
+     "at": "2026-09-30T16:26:24.260943Z",
+     "calendars": {},
+     "created_at": "2026-09-30T16:26:24.274420Z",
+     "decisions": [
+      {
+       "activity": "0ff789ff-facc-576f-8d03-d630088964e5",
+       "actor": "c8dd3b48-bc33-4419-b75a-820e212223c6",
+       "element": "ack",
+       "kind": "task_completed",
+       "taskId": "c8c50906-c47e-4387-b17a-52d7eca006ac"
+      },
+      {
+       "element": "ack",
+       "fields": [
+        "decision"
+       ],
+       "kind": "data_set"
+      },
+      {
+       "element": "ack",
+       "kind": "step_completed"
+      },
+      {
+       "cause": "completed",
+       "element": "work",
+       "exit": null,
+       "kind": "stage_exited"
+      },
+      {
+       "element": "done",
+       "kind": "completed",
+       "outcome": "acknowledged"
+      }
+     ],
+     "event_id": "62e3177d-2629-4c73-a2c1-f5e01b127260",
+     "input": {
+      "actorId": "c8dd3b48-bc33-4419-b75a-820e212223c6",
+      "at": "2026-09-30T16:26:24.260943Z",
+      "body": {
+       "activityId": "0ff789ff-facc-576f-8d03-d630088964e5",
+       "status": "completed",
+       "task": {
+        "assigneeId": "c8dd3b48-bc33-4419-b75a-820e212223c6",
+        "customFields": {
+         "decision": "yes"
+        },
+        "id": "c8c50906-c47e-4387-b17a-52d7eca006ac",
+        "publicId": "TASK-000001",
+        "status": "done"
+       }
+      },
+      "kind": "task"
+     },
+     "intents": [
+      {
+       "element": "ack",
+       "executed": {
+        "ok": true
+       },
+       "kind": "cancel_timer",
+       "timerId": "aca31065-2e58-5582-9702-e5e6aa039526"
+      },
+      {
+       "executed": {
+        "ok": true
+       },
+       "kind": "emit_event",
+       "payload": {
+        "changedFields": [
+         "decision"
+        ],
+        "definitionKey": "replay-duration",
+        "element": "ack",
+        "instanceId": "5eb49ba5-3368-49cb-b94f-1d33307befea",
+        "instanceKey": "Q-escalated",
+        "memory": null,
+        "version": 1
+       },
+       "type": "process.data_changed"
+      },
+      {
+       "executed": {
+        "ok": true
+       },
+       "kind": "emit_event",
+       "payload": {
+        "definitionKey": "replay-duration",
+        "instanceId": "5eb49ba5-3368-49cb-b94f-1d33307befea",
+        "instanceKey": "Q-escalated",
+        "stage": "work",
+        "version": 1
+       },
+       "type": "process.stage_exited"
+      },
+      {
+       "executed": {
+        "ok": true
+       },
+       "kind": "emit_event",
+       "payload": {
+        "definitionKey": "replay-duration",
+        "instanceId": "5eb49ba5-3368-49cb-b94f-1d33307befea",
+        "instanceKey": "Q-escalated",
+        "memory": null,
+        "outcome": "acknowledged",
+        "version": 1
+       },
+       "type": "process.completed"
+      },
+      {
+       "error": null,
+       "executed": {
+        "ok": true
+       },
+       "kind": "complete",
+       "outcome": "acknowledged",
+       "status": "completed"
+      }
+     ],
+     "kind": "task",
+     "seq": 2,
+     "source_ref": "event:62e3177d-2629-4c73-a2c1-f5e01b127260"
+    }
+   ],
+   "outcome": "acknowledged",
+   "refs": {
+    "task:c8c50906-c47e-4387-b17a-52d7eca006ac": {
+     "activity": "0ff789ff-facc-576f-8d03-d630088964e5",
+     "element": "ack"
+    }
+   },
+   "started_at": "2026-09-30T16:26:21.139845Z",
+   "state": {
+    "activities": {},
+    "attention": null,
+    "clock": "2026-09-30T16:26:24.260943Z",
+    "closing": null,
+    "counters": {
+     "activity": 1,
+     "done": 0,
+     "thread": 1,
+     "timer": 2
+    },
+    "data": {
+     "decision": "yes"
+    },
+    "deferred": [],
+    "definitionKey": "replay-duration",
+    "done": [],
+    "error": null,
+    "instanceId": "5eb49ba5-3368-49cb-b94f-1d33307befea",
+    "key": "Q-escalated",
+    "lastTask": {
+     "assigneeId": "c8dd3b48-bc33-4419-b75a-820e212223c6",
+     "customFields": {
+      "decision": "yes"
+     },
+     "id": "c8c50906-c47e-4387-b17a-52d7eca006ac",
+     "publicId": "TASK-000001",
+     "status": "done"
+    },
+    "milestones": {},
+    "outcome": "acknowledged",
+    "retrospective": null,
+    "seq": 2,
+    "stages": {
+     "work": {
+      "closedSeq": 2,
+      "enteredAt": "2026-09-30T16:26:21.111428Z",
+      "runs": 1,
+      "state": "completed"
+     }
+    },
+    "startedAt": "2026-09-30T16:26:21.111428Z",
+    "status": "completed",
+    "threads": {},
+    "timers": {},
+    "version": 1
+   },
+   "status": "completed",
+   "story": "the due of two seconds passes: notify, then acknowledged",
+   "updated_at": "2026-09-30T16:26:24.278436Z"
+  },
+  {
+   "completed_at": "2026-09-30T16:26:21.216593Z",
+   "data": {
+    "decision": "yes"
+   },
+   "definition_id": "33a84c04-371a-4d6f-867f-a712618a162a",
+   "definition_key": "replay-duration",
+   "definition_version": 1,
+   "error": null,
+   "id": "c4daddee-b0a3-4d61-892e-e40d92fba48b",
+   "instance_key": "Q-quick",
+   "journal": [
+    {
+     "actor_id": "c8dd3b48-bc33-4419-b75a-820e212223c6",
+     "at": "2026-09-30T16:26:21.114528Z",
+     "calendars": {},
+     "created_at": "2026-09-30T16:26:21.160891Z",
+     "decisions": [
+      {
+       "element": null,
+       "key": "Q-quick",
+       "kind": "started",
+       "trigger": {
+        "eventId": "37e01156-32f0-4286-9e25-6d5ae229184e",
+        "type": "observation:sample.quick"
+       }
+      },
+      {
+       "element": "work",
+       "entry": null,
+       "kind": "stage_entered",
+       "run": 1
+      },
+      {
+       "activity": "a8ad3a6d-4ffb-5c4b-a46f-5861ce8c9550",
+       "activityKind": "task",
+       "element": "ack",
+       "kind": "activity_opened"
+      },
+      {
+       "dueAt": "2026-09-30T16:26:23.114528Z",
+       "element": "ack",
+       "kind": "timer_set",
+       "provisional": false,
+       "timerId": "3578f82f-8c2f-55c8-85a3-3283ea40da3a",
+       "timerKind": "escalation"
+      },
+      {
+       "dueAt": "2026-09-30T17:26:23.114528Z",
+       "element": "ack",
+       "kind": "timer_set",
+       "provisional": false,
+       "timerId": "0fdd0c73-2bd2-5fc9-9c77-1bca43dca543",
+       "timerKind": "escalation"
+      }
+     ],
+     "event_id": "37e01156-32f0-4286-9e25-6d5ae229184e",
+     "input": {
+      "actorId": "c8dd3b48-bc33-4419-b75a-820e212223c6",
+      "at": "2026-09-30T16:26:21.114528Z",
+      "body": {
+       "event": {
+        "actorId": "c8dd3b48-bc33-4419-b75a-820e212223c6",
+        "correlationId": "req_4cded6cac7994ad78980371e95990473",
+        "entityId": "23581846-6dc0-4e01-bd32-b020356d1afb",
+        "entityType": "observation",
+        "id": "37e01156-32f0-4286-9e25-6d5ae229184e",
+        "observation": "sample.quick",
+        "payload": {
+         "content": "sample.quick seen",
+         "data": {
+          "number": "Q-quick"
+         },
+         "kind": "sample.quick",
+         "observedAt": "2026-09-30T16:26:21.114528+00:00"
+        },
+        "time": "2026-09-30T16:26:21.114528Z",
+        "type": "observation.recorded"
+       },
+       "instanceId": "c4daddee-b0a3-4d61-892e-e40d92fba48b"
+      },
+      "kind": "start"
+     },
+     "intents": [
+      {
+       "executed": {
+        "ok": true
+       },
+       "kind": "emit_event",
+       "payload": {
+        "definitionKey": "replay-duration",
+        "instanceId": "c4daddee-b0a3-4d61-892e-e40d92fba48b",
+        "instanceKey": "Q-quick",
+        "memory": null,
+        "triggerEventId": "37e01156-32f0-4286-9e25-6d5ae229184e",
+        "triggerType": "observation:sample.quick",
+        "version": 1
+       },
+       "type": "process.started"
+      },
+      {
+       "executed": {
+        "ok": true
+       },
+       "kind": "emit_event",
+       "payload": {
+        "definitionKey": "replay-duration",
+        "instanceId": "c4daddee-b0a3-4d61-892e-e40d92fba48b",
+        "instanceKey": "Q-quick",
+        "stage": "work",
+        "version": 1
+       },
+       "type": "process.stage_entered"
+      },
+      {
+       "activityId": "a8ad3a6d-4ffb-5c4b-a46f-5861ce8c9550",
+       "assign": [
+        {
+         "principal": "c8dd3b48-bc33-4419-b75a-820e212223c6"
+        }
+       ],
+       "context": null,
+       "due": "2026-09-30T16:26:23.114528Z",
+       "element": "ack",
+       "escalations": [
+        {
+         "action": "notify",
+         "after": "due",
+         "level": 1,
+         "to": [
+          {
+           "principal": "c8dd3b48-bc33-4419-b75a-820e212223c6"
+          }
+         ]
+        },
+        {
+         "action": "notify",
+         "after": "PT1H",
+         "level": 2,
+         "to": [
+          {
+           "principal": "c8dd3b48-bc33-4419-b75a-820e212223c6"
+          }
+         ]
+        }
+       ],
+       "executed": {
+        "ok": true,
+        "taskId": "7a3af0db-1da1-4f62-abc9-534152f02887"
+       },
+       "externalRef": "process/c4daddee-b0a3-4d61-892e-e40d92fba48b/ack",
+       "form": null,
+       "input": null,
+       "kind": "create_task",
+       "taskType": "review",
+       "title": "ack"
+      },
+      {
+       "dueAt": "2026-09-30T16:26:23.114528Z",
+       "element": "ack",
+       "executed": {
+        "ok": true
+       },
+       "kind": "set_timer",
+       "provisional": false,
+       "reads": [],
+       "remainingSeconds": null,
+       "state": "pending",
+       "timerId": "3578f82f-8c2f-55c8-85a3-3283ea40da3a",
+       "timerKind": "escalation"
+      },
+      {
+       "dueAt": "2026-09-30T17:26:23.114528Z",
+       "element": "ack",
+       "executed": {
+        "ok": true
+       },
+       "kind": "set_timer",
+       "provisional": false,
+       "reads": [],
+       "remainingSeconds": null,
+       "state": "pending",
+       "timerId": "0fdd0c73-2bd2-5fc9-9c77-1bca43dca543",
+       "timerKind": "escalation"
+      }
+     ],
+     "kind": "start",
+     "seq": 0,
+     "source_ref": "event:37e01156-32f0-4286-9e25-6d5ae229184e"
+    },
+    {
+     "actor_id": "c8dd3b48-bc33-4419-b75a-820e212223c6",
+     "at": "2026-09-30T16:26:21.198393Z",
+     "calendars": {},
+     "created_at": "2026-09-30T16:26:21.212603Z",
+     "decisions": [
+      {
+       "activity": "a8ad3a6d-4ffb-5c4b-a46f-5861ce8c9550",
+       "actor": "c8dd3b48-bc33-4419-b75a-820e212223c6",
+       "element": "ack",
+       "kind": "task_completed",
+       "taskId": "7a3af0db-1da1-4f62-abc9-534152f02887"
+      },
+      {
+       "element": "ack",
+       "fields": [
+        "decision"
+       ],
+       "kind": "data_set"
+      },
+      {
+       "element": "ack",
+       "kind": "step_completed"
+      },
+      {
+       "cause": "completed",
+       "element": "work",
+       "exit": null,
+       "kind": "stage_exited"
+      },
+      {
+       "element": "done",
+       "kind": "completed",
+       "outcome": "acknowledged"
+      }
+     ],
+     "event_id": "705cbefa-af09-4a74-9872-e3643c191ccf",
+     "input": {
+      "actorId": "c8dd3b48-bc33-4419-b75a-820e212223c6",
+      "at": "2026-09-30T16:26:21.198393Z",
+      "body": {
+       "activityId": "a8ad3a6d-4ffb-5c4b-a46f-5861ce8c9550",
+       "status": "completed",
+       "task": {
+        "assigneeId": "c8dd3b48-bc33-4419-b75a-820e212223c6",
+        "customFields": {
+         "decision": "yes"
+        },
+        "id": "7a3af0db-1da1-4f62-abc9-534152f02887",
+        "publicId": "TASK-000002",
+        "status": "done"
+       }
+      },
+      "kind": "task"
+     },
+     "intents": [
+      {
+       "element": "ack",
+       "executed": {
+        "ok": true
+       },
+       "kind": "cancel_timer",
+       "timerId": "3578f82f-8c2f-55c8-85a3-3283ea40da3a"
+      },
+      {
+       "element": "ack",
+       "executed": {
+        "ok": true
+       },
+       "kind": "cancel_timer",
+       "timerId": "0fdd0c73-2bd2-5fc9-9c77-1bca43dca543"
+      },
+      {
+       "executed": {
+        "ok": true
+       },
+       "kind": "emit_event",
+       "payload": {
+        "changedFields": [
+         "decision"
+        ],
+        "definitionKey": "replay-duration",
+        "element": "ack",
+        "instanceId": "c4daddee-b0a3-4d61-892e-e40d92fba48b",
+        "instanceKey": "Q-quick",
+        "memory": null,
+        "version": 1
+       },
+       "type": "process.data_changed"
+      },
+      {
+       "executed": {
+        "ok": true
+       },
+       "kind": "emit_event",
+       "payload": {
+        "definitionKey": "replay-duration",
+        "instanceId": "c4daddee-b0a3-4d61-892e-e40d92fba48b",
+        "instanceKey": "Q-quick",
+        "stage": "work",
+        "version": 1
+       },
+       "type": "process.stage_exited"
+      },
+      {
+       "executed": {
+        "ok": true
+       },
+       "kind": "emit_event",
+       "payload": {
+        "definitionKey": "replay-duration",
+        "instanceId": "c4daddee-b0a3-4d61-892e-e40d92fba48b",
+        "instanceKey": "Q-quick",
+        "memory": null,
+        "outcome": "acknowledged",
+        "version": 1
+       },
+       "type": "process.completed"
+      },
+      {
+       "error": null,
+       "executed": {
+        "ok": true
+       },
+       "kind": "complete",
+       "outcome": "acknowledged",
+       "status": "completed"
+      }
+     ],
+     "kind": "task",
+     "seq": 1,
+     "source_ref": "event:705cbefa-af09-4a74-9872-e3643c191ccf"
+    }
+   ],
+   "outcome": "acknowledged",
+   "refs": {
+    "task:7a3af0db-1da1-4f62-abc9-534152f02887": {
+     "activity": "a8ad3a6d-4ffb-5c4b-a46f-5861ce8c9550",
+     "element": "ack"
+    }
+   },
+   "started_at": "2026-09-30T16:26:21.158819Z",
+   "state": {
+    "activities": {},
+    "attention": null,
+    "clock": "2026-09-30T16:26:21.198393Z",
+    "closing": null,
+    "counters": {
+     "activity": 1,
+     "done": 0,
+     "thread": 1,
+     "timer": 2
+    },
+    "data": {
+     "decision": "yes"
+    },
+    "deferred": [],
+    "definitionKey": "replay-duration",
+    "done": [],
+    "error": null,
+    "instanceId": "c4daddee-b0a3-4d61-892e-e40d92fba48b",
+    "key": "Q-quick",
+    "lastTask": {
+     "assigneeId": "c8dd3b48-bc33-4419-b75a-820e212223c6",
+     "customFields": {
+      "decision": "yes"
+     },
+     "id": "7a3af0db-1da1-4f62-abc9-534152f02887",
+     "publicId": "TASK-000002",
+     "status": "done"
+    },
+    "milestones": {},
+    "outcome": "acknowledged",
+    "retrospective": null,
+    "seq": 1,
+    "stages": {
+     "work": {
+      "closedSeq": 1,
+      "enteredAt": "2026-09-30T16:26:21.114528Z",
+      "runs": 1,
+      "state": "completed"
+     }
+    },
+    "startedAt": "2026-09-30T16:26:21.114528Z",
+    "status": "completed",
+    "threads": {},
+    "timers": {},
+    "version": 1
+   },
+   "status": "completed",
+   "story": "acknowledged before the due",
+   "updated_at": "2026-09-30T16:26:21.216593Z"
+  }
+ ],
+ "process": "replay-duration",
+ "recordedWith": {
+  "commit": "5f352a3867952e8e157bcf7628d4ebc35938d018",
+  "ref": "main"
+ }
+}

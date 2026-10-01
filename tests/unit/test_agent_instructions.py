@@ -128,7 +128,7 @@ def test_render_writes_layers_in_order_with_sources_and_hash() -> None:
         text.index(f"### Platform contract ({PLATFORM_CONTRACT_REF} v{PLATFORM_CONTRACT_VERSION})"),
         text.index("### Project (project:p-1 v3)"),
         text.index("### Task type (taskType:sdd.spec v2)"),
-        text.index("### Repository conventions"),
+        text.index("### Agent conventions"),
     ]
     assert positions == sorted(positions)
     assert "Пиши спецификацию, не код." in text
@@ -139,7 +139,7 @@ def test_render_without_block_keeps_only_conventions() -> None:
     assert render_instructions(None) == ""
     assert render_instructions({"layers": "junk"}) == ""
     text = render_instructions(None, "conventions")
-    assert "### Repository conventions" in text and "Instructions hash" not in text
+    assert "### Agent conventions" in text and "Instructions hash" not in text
 
 
 def test_conventions_file_is_optional(tmp_path: Path) -> None:
@@ -196,6 +196,9 @@ def test_render_is_the_same_for_the_three_adapters(tmp_path: Path) -> None:
         assert "effectiveConfig" not in prompt and "Effective configuration" not in prompt
         assert "Пиши спецификацию, не код." in prompt
         assert "uv.lock не коммитить." in prompt
+        # The fourth layer is the agent's, not the repository's (universal-runner U009).
+        assert "### Agent conventions\n\nuv.lock не коммитить." in prompt, name
+        assert "Repository conventions" not in prompt, name
 
 
 def test_type_without_instructions_keeps_the_prompt_shape() -> None:

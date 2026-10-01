@@ -7,8 +7,10 @@ memory, so a Memory failure is the caller's failure (502).
 
 The company-knowledge amendment of CP-ADR-0060 is implemented: the snapshot
 preview and ``expectedState`` (K008), knowledge base documents (K009) and tenant
-packs (K010). ``POST /knowledge/entities:query`` (K031) is the one read here:
-the entities of a workspace's knowledge, with the caller's visibility.
+packs (K010). ``POST /knowledge/entities:query`` (K031) reads the entities of
+a workspace's knowledge, with the caller's visibility; ``GET
+/workspaces/{id}/knowledge-packs`` and ``GET /knowledge/packs/{ref}`` read back
+what a pack install writes (amendment 2026-09-30).
 """
 
 import uuid
@@ -24,10 +26,12 @@ from control_plane.api.v1.schemas import (
     KnowledgeDocumentRequest,
     KnowledgeEntitiesPageOut,
     KnowledgeEntitiesQueryRequest,
+    KnowledgePackOut,
     KnowledgePackRegisterRequest,
     KnowledgeSnapshotPreviewOut,
     KnowledgeSnapshotPreviewRequest,
     KnowledgeSnapshotRequest,
+    WorkspaceKnowledgePacksOut,
     WorkspaceKnowledgePacksRequest,
 )
 from control_plane.application.commands import knowledge as commands
@@ -189,6 +193,46 @@ async def register_pack(
     answer = await commands.register_pack(_provider(request), payload, trace_run_id=_trace(request))
     async with transaction(session_factory) as db:
         await commands.record_pack_registered(db, ctx, payload, answer)
+    return JSONResponse(answer)
+
+
+@router.get(
+    "/knowledge/packs/{ref}",
+    response_model=KnowledgePackOut,
+    responses={**_MEMORY_RESPONSES, 404: {"model": ErrorEnvelope, "description": "No such pack"}},
+)
+async def get_pack(
+    ref: str,
+    request: Request,
+    ctx: AuthDep,
+    settings: SettingsDep,
+) -> JSONResponse:
+    """A registered pack version: ``name@version``, ``name`` for the latest,
+    ``tenant:name[@version]`` for a pack of the caller's tenant."""
+    read = await commands.prepare_pack_read(ctx, settings, ref)
+    provider = recall.require_graph(getattr(request.app.state, "context_provider", None))
+    return JSONResponse(await commands.read_pack(provider, read, trace_run_id=_trace(request)))
+
+
+@router.get(
+    "/workspaces/{workspace_id}/knowledge-packs",
+    response_model=WorkspaceKnowledgePacksOut,
+    responses=_MEMORY_RESPONSES,
+)
+async def get_workspace_packs(
+    workspace_id: uuid.UUID,
+    request: Request,
+    ctx: AuthDep,
+    settings: SettingsDep,
+    session_factory: SessionFactoryDep,
+) -> JSONResponse:
+    """The packs enabled for the workspace's tree and its strictness."""
+    async with transaction(session_factory) as db:
+        target = await commands.prepare_workspace_packs_read(
+            db, ctx, settings, workspace_id=workspace_id
+        )
+    provider = recall.require_graph(getattr(request.app.state, "context_provider", None))
+    answer = await commands.read_workspace_packs(provider, target, trace_run_id=_trace(request))
     return JSONResponse(answer)
 
 

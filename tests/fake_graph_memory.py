@@ -218,7 +218,12 @@ class FakeGraphMemory:
         return {**CONTRACT["namespaceKinds"], "settings": {"namespace": namespace}}
 
     async def get_package(
-        self, *, name: str, version: str = "", trace_run_id: str | None = None
+        self,
+        *,
+        name: str,
+        version: str = "",
+        namespace: str = "",
+        trace_run_id: str | None = None,
     ) -> dict[str, Any]:
         self.package_requests.append((name, version))
         return CONTRACT["packages"][f"{name}@{version}"]

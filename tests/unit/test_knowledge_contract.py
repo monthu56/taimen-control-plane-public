@@ -221,3 +221,39 @@ def test_knowledge_packs_manage_is_in_the_enum_and_the_catalog() -> None:
     assert Permission.KNOWLEDGE_PACKS_MANAGE.value == "knowledge.packs.manage"
     catalog = yaml.safe_load((ROOT / "authz" / "catalog.yaml").read_text("utf-8"))
     assert catalog["actions"]["knowledge.packs.manage"] == {"resource": "tenant"}
+
+
+# --- reading back what a pack install writes (amendment 2026-09-30) -------------
+
+
+@pytest.mark.parametrize(
+    ("path", "schema"),
+    [
+        ("/api/v1/workspaces/{workspace_id}/knowledge-packs", "WorkspaceKnowledgePacksOut"),
+        ("/api/v1/knowledge/packs/{ref}", "KnowledgePackOut"),
+    ],
+)
+def test_the_install_reads_are_published(path: str, schema: str) -> None:
+    get = PATHS[path]["get"]
+    assert "requestBody" not in get
+    ok = get["responses"]["200"]
+    assert _ref(ok["content"]["application/json"]["schema"]) == schema
+    assert {"403", "502", "503"} <= set(get["responses"])
+
+
+def test_the_workspace_set_reads_as_the_put_takes_it() -> None:
+    out = SCHEMAS["WorkspaceKnowledgePacksOut"]
+    put = SCHEMAS["WorkspaceKnowledgePacksRequest"]["properties"]
+    assert set(put) <= set(out["properties"])
+    assert {"workspaceId", "rootWorkspaceId", "configured", "effective"} <= set(out["required"])
+    # The namespace is the core's to compute and never the client's to see.
+    assert "namespace" not in out["properties"]
+    # Same path, the write still there.
+    assert "put" in PATHS["/api/v1/workspaces/{workspace_id}/knowledge-packs"]
+
+
+def test_a_pack_reads_as_memory_gives_it() -> None:
+    pack = SCHEMAS["KnowledgePackOut"]
+    assert {"name", "version"} <= set(pack["required"])
+    assert pack.get("additionalProperties", True) is True
+    assert "404" in PATHS["/api/v1/knowledge/packs/{ref}"]["get"]["responses"]

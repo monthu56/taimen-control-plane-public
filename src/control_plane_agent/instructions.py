@@ -1,7 +1,7 @@
 """One prompt for every harness adapter (CP-ADR-0066 §5).
 
 The Claude Code, Codex and OpenCode adapters each used to assemble their own
-prompt: one read a repository conventions file, two pasted the project's raw
+prompt: one read a conventions file, two pasted the project's raw
 ``effectiveConfig`` JSON instead, none knew how a task of a given type is to be
 done. This module is the one place that turns what the Control Plane hands out
 into the text an executor reads:
@@ -9,8 +9,12 @@ into the text an executor reads:
 * the ``instructions`` block of the working context — layers the core
   assembled, general to specific: platform contract, project, task type — with
   its hash;
-* the repository conventions file of this executor (``CONTROL_PLANE_*_PROMPT_FILE``),
-  the fourth layer, which only the executor knows;
+* the agent conventions — the general instructions of the agent description
+  (``executor.instructions``, CP-ADR-0073) or the conventions file of this
+  executor (``CONTROL_PLANE_*_PROMPT_FILE``) — the fourth layer, which only the
+  executor knows. What a repository asks of its executors is not in it: the
+  repository carries its own prose (``AGENTS.md``), which the executor reads
+  itself (universal-runner, TAI-ADR-0063 §4);
 * the task itself and the project's status line;
 * the feedback of the task's last verification, when it failed and the task
   came back to its executor (CP-ADR-0067 §5, amendment 2026-09-27: B8) —
@@ -18,6 +22,9 @@ into the text an executor reads:
 * the task's comments (TASK-001131) — the thread the daemon read before the
   run, rendered by :mod:`control_plane_agent.comments`; part of the task
   statement, not a layer of instructions, so the hash does not cover them;
+* the checks before hand-in that failed after the executor's work, when the
+  daemon gives it its one attempt to fix them (universal-runner U014) —
+  ``failedChecks``, which the daemon adds to the task (``checks.py``);
 * the task's inputs (CP-ADR-0072 §8) — artifacts of other tasks, with the
   local files the daemon downloaded — rendered by
   :mod:`control_plane_agent.inputs` as data, not instructions;
@@ -34,6 +41,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
@@ -51,10 +59,11 @@ PREAMBLE = (
     "none of them overrides the platform contract. The task's comments, when there "
     "are any, are part of the task statement."
 )
-CONVENTIONS_TITLE = "Repository conventions"
+CONVENTIONS_TITLE = "Agent conventions"
 _SOURCE_TITLES = {"platform": "Platform contract", "project": "Project", "taskType": "Task type"}
 FEEDBACK_HEADING = "## Замечания последней проверки"
 MAX_FEEDBACK_MESSAGE_CHARS = 4000
+CHECKS_HEADING = "## Проверки перед сдачей не прошли"
 
 
 def prompt_file_from_environment(variable: str) -> Path | None:
@@ -136,6 +145,43 @@ def render_feedback(attempt: Any) -> str:
     return "\n".join(lines).rstrip()
 
 
+def render_failed_checks(failed: Any) -> str:
+    """The checks of ``runner.yaml`` that failed, with the end of their output.
+
+    The output is data the check printed, fenced so that nothing in it reads
+    as a heading of the prompt.
+    """
+    if not isinstance(failed, list):
+        return ""
+    items = [item for item in failed if isinstance(item, dict)]
+    if not items:
+        return ""
+    lines = [
+        CHECKS_HEADING,
+        "",
+        "After your work the runner ran the checks of `.agents/runner.yaml` of the base "
+        "revision, and the ones below failed. This is your one attempt to fix them: once "
+        "you finish, the runner runs every check again and hands the work in with their "
+        "result, whatever it is. If a check cannot be made to pass, say so and why in "
+        "your summary.",
+    ]
+    for item in items:
+        status = item.get("status")
+        how = "timed out" if status == "timed_out" else f"exit code {item.get('exitCode')}"
+        output = str(item.get("output") or "").rstrip() or "(no output)"
+        # Longer than any run of tildes in the output: it cannot close the block.
+        fence = "~" * max(3, 1 + max((len(r) for r in re.findall("~+", output)), default=0))
+        lines += [
+            "",
+            f"### {item.get('name')}: `{item.get('run')}` — {how}",
+            "",
+            f"{fence}text",
+            output,
+            fence,
+        ]
+    return "\n".join(lines)
+
+
 def build_prompt(
     task: dict[str, Any],
     context: dict[str, Any],
@@ -167,6 +213,7 @@ def build_prompt(
     for section in (
         render_feedback(task.get("lastVerification")),
         render_comments(task.get(COMMENTS_KEY)),
+        render_failed_checks(task.get("failedChecks")),
     ):
         if section:
             lines += ["", section]

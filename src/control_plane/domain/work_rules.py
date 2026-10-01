@@ -435,6 +435,49 @@ def evaluate(expression: Any, resolve: Resolver, *, roots: frozenset[str]) -> bo
     return _ordered(operator, left, right)
 
 
+_BOOLS = ("true", "false")
+
+
+def _branch_nodes(expression: Any, at: str) -> list[tuple[str, Any]]:
+    """Every operator node of a validated expression with its JSON pointer, outermost first."""
+    if not isinstance(expression, dict) or len(expression) != 1:
+        return []
+    ((operator, args),) = expression.items()
+    nodes = [(at, expression)]
+    if operator in _LOGICAL:
+        for index, item in enumerate(args):
+            nodes.extend(_branch_nodes(item, f"{at}/{operator}/{index}"))
+    elif operator == "not":
+        nodes.extend(_branch_nodes(args, f"{at}/not"))
+    return nodes
+
+
+def expression_branches(expression: Any, at: str) -> list[str]:
+    """The branches of an expression: each operator node true and false (``/condition:true``).
+
+    What the coverage of a rule counts (CP-ADR-0074 Z3): every operand of
+    ``and``/``or``, every ``not`` and every comparison has been both.
+    """
+    return [f"{path}:{value}" for path, _ in _branch_nodes(expression, at) for value in _BOOLS]
+
+
+def branch_outcomes(
+    expression: Any, resolve: Resolver, *, roots: frozenset[str], at: str
+) -> set[str]:
+    """The branches these facts reach: each node evaluated on its own, not short-circuited.
+
+    A node whose evaluation breaks (a type clash) reaches neither of its branches.
+    """
+    reached = set()
+    for path, node in _branch_nodes(expression, at):
+        try:
+            value = evaluate(node, resolve, roots=roots)
+        except ConditionError:
+            continue
+        reached.add(f"{path}:{'true' if value else 'false'}")
+    return reached
+
+
 # --- templates ----------------------------------------------------------------------
 
 

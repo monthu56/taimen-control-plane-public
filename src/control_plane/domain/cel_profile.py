@@ -15,7 +15,8 @@ bindings to cel-cpp — with the pieces the bindings do not offer built here:
   ``format: duration`` a duration; an object without ``properties`` is
   ``map(string, dyn)``; what cannot be typed is ``dyn``.
 - **Functions.** ``cal.addWorkdays``, ``cal.isWorkday``,
-  ``cal.workdaysBetween`` over ``domain/calendar.py``; the ``strings``,
+  ``cal.workdaysBetween``, ``cal.addWorkingTime``, ``cal.workingTimeBetween``
+  over ``domain/calendar.py`` (CP-ADR-0078 §2); the ``strings``,
   ``optional`` and ``bindings`` extensions of cel-cpp; the list functions
   ``slice``, ``flatten``, ``sort``, ``distinct`` (cel-cpp does not bind its
   ``lists`` extension to Python; ``reverse`` is the strings one). There is no ``now()``: time enters
@@ -539,6 +540,26 @@ def _workdays_between(a: datetime, b: datetime, key: str | None = None) -> int:
     return result
 
 
+def _add_working_time(ts: datetime, amount: timedelta, key: str | None = None) -> datetime:
+    def call() -> datetime:
+        answer = _calendar(key).add_working_time_at(ts, amount)
+        _mark(answer.provisional)
+        return answer.value
+
+    result: datetime = _calendar_call(call)
+    return result
+
+
+def _working_time_between(a: datetime, b: datetime, key: str | None = None) -> timedelta:
+    def call() -> timedelta:
+        answer = _calendar(key).working_time_between_at(a, b)
+        _mark(answer.provisional)
+        return answer.value
+
+    result: timedelta = _calendar_call(call)
+    return result
+
+
 def _flatten(items: list[Any]) -> list[Any]:
     flat: list[Any] = []
     for item in items:
@@ -568,6 +589,7 @@ def _slice(items: list[Any], start: int, end: int) -> list[Any]:
 
 
 _T, _I, _B, _S = cel.Type.TIMESTAMP, cel.Type.INT, cel.Type.BOOL, cel.Type.STRING
+_D = cel.Type.DURATION
 _LIST = cel.Type.List(cel.Type.DYN)
 
 
@@ -575,15 +597,25 @@ def _functions(with_default_calendar: bool) -> list[Any]:
     add = [cel.Overload("cal_add_workdays_key", _T, [_T, _I, _S], impl=_add_workdays)]
     is_day = [cel.Overload("cal_is_workday_key", _B, [_T, _S], impl=_is_workday)]
     between = [cel.Overload("cal_workdays_between_key", _I, [_T, _T, _S], impl=_workdays_between)]
+    add_time = [cel.Overload("cal_add_working_time_key", _T, [_T, _D, _S], impl=_add_working_time)]
+    time_between = [
+        cel.Overload("cal_working_time_between_key", _D, [_T, _T, _S], impl=_working_time_between)
+    ]
     if with_default_calendar:
         add.append(cel.Overload("cal_add_workdays", _T, [_T, _I], impl=_add_workdays))
         is_day.append(cel.Overload("cal_is_workday", _B, [_T], impl=_is_workday))
         between.append(cel.Overload("cal_workdays_between", _I, [_T, _T], impl=_workdays_between))
+        add_time.append(cel.Overload("cal_add_working_time", _T, [_T, _D], impl=_add_working_time))
+        time_between.append(
+            cel.Overload("cal_working_time_between", _D, [_T, _T], impl=_working_time_between)
+        )
     member = {"is_member": True}
     return [
         cel.FunctionDecl("cal.addWorkdays", add),
         cel.FunctionDecl("cal.isWorkday", is_day),
         cel.FunctionDecl("cal.workdaysBetween", between),
+        cel.FunctionDecl("cal.addWorkingTime", add_time),
+        cel.FunctionDecl("cal.workingTimeBetween", time_between),
         cel.FunctionDecl(
             "slice", [cel.Overload("list_slice", _LIST, [_LIST, _I, _I], impl=_slice, **member)]
         ),

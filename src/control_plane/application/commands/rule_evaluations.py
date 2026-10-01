@@ -44,6 +44,8 @@ cancelled is ``work.reconciled``.
 
 import logging
 import uuid
+from collections.abc import Callable
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Any
@@ -374,6 +376,19 @@ class Facts:
             ROOT_ITEM: item,
         }
         return walk(documents.get(path.root), path.segments)
+
+
+# A package test sees the facts each expression of a rule is evaluated on
+# (``condition``, or ``where`` with its item): its coverage counts the branches
+# they reach (CP-ADR-0074 Z3). Unset, as everywhere but in a test.
+FactsObserver = Callable[[str, Facts, Any], None]
+observe_facts: ContextVar[FactsObserver | None] = ContextVar("rule_facts_observer", default=None)
+
+
+def _observe(where: str, facts: Facts, item: Any = None) -> None:
+    observer = observe_facts.get()
+    if observer is not None:
+        observer(where, facts, item)
 
 
 def _event_facts(rule: WorkRule, event: JournalEvent) -> Facts:
@@ -1291,6 +1306,7 @@ async def _act(
         def selected(entry: Any) -> bool:
             if where is None:
                 return True
+            _observe("where", facts, entry)
             return bool(evaluate(where, lambda path: facts.resolve(path, entry), roots=roots))
 
         try:
@@ -1474,6 +1490,7 @@ async def evaluate_trigger(
         await acting.require_standing(session)
         await authorize(ctx, Permission.EVENTS_READ, resource=rule_scope(rule.workspace_id))
         await _load_views(session, ctx, rule, facts)
+        _observe("condition", facts)
         matched = evaluate(
             rule.condition,
             facts.resolve,

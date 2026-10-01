@@ -43,6 +43,7 @@ from control_plane_agent.instructions import (
     read_conventions,
 )
 from control_plane_agent.main import ArtifactSpec
+from control_plane_agent.runner_config import run_environment
 from control_plane_agent.trace import (
     TraceRecorder,
     TraceSettings,
@@ -106,11 +107,11 @@ class ClaudeCodeAdapter:
     include_memory: bool = True
     withhold_authoritative_tools: bool = True
     trace: TraceSettings = field(default_factory=TraceSettings)
-    # Repository conventions appended to every prompt (naming, registries,
-    # what never goes into a commit, how to run tests). Read at execute time
-    # so an operator can edit the file without restarting the runner. A task
-    # description says WHAT; this file says HOW this repository works — the
-    # kind of knowledge that otherwise costs a review round per branch.
+    # Agent conventions, the fourth instructions layer (CP-ADR-0066), appended
+    # to every prompt: how this agent works whatever the repository. Read at
+    # execute time so an operator can edit the file without restarting the
+    # runner. What a repository asks is in its own AGENTS.md, which Claude
+    # Code reads itself.
     prompt_file: Path | None = None
     # Executor instructions of the agent's revision (CP-ADR-0073): the same
     # fourth layer, given as text instead of a file. When set, the file is
@@ -125,7 +126,14 @@ class ClaudeCodeAdapter:
         client: ControlPlaneClient,
         workspace: Workspace | None,
         inputs: Sequence[LocalInput] | None = None,
+        env: Mapping[str, str] | None = None,
     ) -> list[ArtifactSpec]:
+        """Run one turn; ``env`` is this run's environment (``runner.yaml``).
+
+        It reaches the ``claude`` process of this turn and its children only,
+        after :func:`run_environment` drops what a run may not set; nothing of
+        it is kept on the adapter, so the next run starts without it.
+        """
         run_id = str(run["id"])
         public_id = str(task.get("publicId") or task["id"])
         cwd = workspace.path if workspace is not None else Path.cwd()
@@ -165,7 +173,12 @@ class ClaudeCodeAdapter:
                 # The MCP server the agent starts inherits these: what it
                 # records — artifacts, checkpoints, actions — belongs to this
                 # run. Ids, not credentials; the lease stays with the daemon.
-                env={MCP_TASK_ENV: str(task["id"]), MCP_RUN_ENV: run_id},
+                # The run's own environment goes first: it cannot override them.
+                env={
+                    **run_environment(env),
+                    MCP_TASK_ENV: str(task["id"]),
+                    MCP_RUN_ENV: run_id,
+                },
                 log_name=public_id,
                 on_event=lambda event: consume_stream_event(recorder, event),
             )

@@ -8,19 +8,29 @@ The body is the package as its files. The core
    process is checked (§2) against the tenant's catalog with the package's
    own objects over it — a task type, skill, agent, calendar, role or process
    the package brings is known to its processes before it is applied;
-3. unless ``checkOnly``, runs the tests ``tests/*.test.yaml`` in the sandbox
-   (:mod:`control_plane.domain.process_sandbox`) with the same engine a live
-   instance runs, and reports the coverage of every process.
+3. checks the form and vocabulary of its ``WorkRule`` and ``TaskType``
+   objects by the pure functions of the domain (``invalid_rule``,
+   ``invalid_task_type``; CP-ADR-0074 Z4);
+4. unless ``checkOnly``, runs the tests ``tests/*.test.yaml``: a process test
+   in the sandbox (:mod:`control_plane.domain.process_sandbox`) with the same
+   engine a live instance runs, a rule or task type test by the application
+   code of the core in a transaction that is rolled back
+   (:mod:`control_plane.application.commands.package_trials`, Z2); and reports
+   the coverage of every process, rule and task type.
 
-Nothing is written. The transaction of the run is ``READ ONLY`` — the
-catalog, roles and calendars are read from it — and a guard on the session
-counts every statement that would write; that count is what a test's
-``expect: {noSideEffects: true}`` checks. The sandbox gets no client: no
-HTTP, no memory, no content store. The one outgoing read is the check of
-``governedBy`` against memory (CP-ADR-0076 §7), made after the transaction
-closes, for the problems of the package, never for a test.
+Nothing is written. The transaction of the process tests is ``READ ONLY`` —
+the catalog, roles and calendars are read from it — and a guard on the
+session counts every statement that would write; that count is what a
+process test's ``expect: {noSideEffects: true}`` checks. The sandbox gets no
+client: no HTTP, no memory, no content store. The tests of rules and task
+types run each in a transaction of its own, which writes and is always
+rolled back; there, any outgoing call is refused (:mod:`control_plane.sandbox`). The one
+outgoing read is the check of ``governedBy`` against memory (CP-ADR-0076 §7),
+made after the transactions close, for the problems of the package, never
+for a test.
 """
 
+import asyncio
 import re
 import time
 import uuid
@@ -29,18 +39,25 @@ from dataclasses import dataclass, field, replace
 from itertools import pairwise
 from typing import Any
 
-from sqlalchemy import event, func, or_, select, text
+from sqlalchemy import event, or_, select, text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sqlalchemy.orm import ORMExecuteState, Session
 from sqlalchemy.sql.elements import TextClause
 
 from control_plane.application.authorization import AuthContext, authorize
+from control_plane.application.commands import package_trials
+from control_plane.application.commands.package_catalog import SpecShape
 from control_plane.application.commands.process_definitions import (
+    engine_revision_for,
     load_catalog,
     previous_version,
     process_scope,
 )
-from control_plane.application.commands.process_instances import definition_of, get_instance
+from control_plane.application.commands.process_instances import (
+    definition_of,
+    get_instance,
+    latest_calendar_versions,
+)
 from control_plane.application.context.graph import GraphScope
 from control_plane.application.queries.process_regulations import (
     governed_by_problems,
@@ -53,6 +70,7 @@ from control_plane.domain.calendar import Calendar
 from control_plane.domain.enums import ApprovalStatus, Permission
 from control_plane.domain.errors import NotFoundError
 from control_plane.domain.package_source import (
+    SUBJECT_PROCESS,
     PackageObject,
     PackageTestFile,
     ParsedPackage,
@@ -73,7 +91,6 @@ from control_plane.infrastructure.context_provider import GraphProvider
 from control_plane.infrastructure.db.engine import transaction
 from control_plane.infrastructure.db.models import (
     Approval,
-    CalendarVersion,
     ProcessDefinition,
     Role,
     Workspace,
@@ -89,8 +106,10 @@ class PackageTestReport:
 
     check_only: bool
     problems: list[Problem] = field(default_factory=list)
-    tests: list[sandbox.TestResult] = field(default_factory=list)
+    tests: list[sandbox.TestResult | package_trials.SubjectResult] = field(default_factory=list)
     coverage: list[sandbox.Coverage] = field(default_factory=list)
+    rule_coverage: list[package_trials.RuleCoverage] = field(default_factory=list)
+    task_type_coverage: list[package_trials.TaskTypeCoverage] = field(default_factory=list)
     duration_ms: int = 0
 
     @property
@@ -106,10 +125,19 @@ class PackageTestReport:
             "status": self.status,
             "checkOnly": self.check_only,
             "problems": [problem.out() for problem in self.problems],
-            "tests": [test.out() for test in self.tests],
+            "tests": [_result_out(test) for test in self.tests],
             "coverage": [item.out() for item in self.coverage],
+            "ruleCoverage": [item.out() for item in self.rule_coverage],
+            "taskTypeCoverage": [item.out() for item in self.task_type_coverage],
             "durationMs": self.duration_ms,
         }
+
+
+def _result_out(result: sandbox.TestResult | package_trials.SubjectResult) -> dict[str, Any]:
+    out = result.out()
+    if isinstance(result, sandbox.TestResult):
+        out = {**out, "subject": SUBJECT_PROCESS, "object": result.process}
+    return out
 
 
 # The first keywords of raw SQL that writes; a WITH writes when its body names one.
@@ -194,14 +222,26 @@ def overlay_catalog(catalog: Catalog, package: ParsedPackage, calendars: frozens
     processes = catalog.processes
     if processes is not None:
         processes = processes | {obj.key for obj in package.of_kind("Process")}
+    calendars_with_hours = catalog.calendars_with_hours
+    if calendars_with_hours is not None:
+        # A calendar of the package is the version the process will see.
+        own = package.of_kind("Calendar")
+        calendars_with_hours = (calendars_with_hours - {obj.key for obj in own}) | {
+            obj.key for obj in own if obj.spec.get("workingHours") is not None
+        }
     return replace(
         catalog,
         skills=skills,
         task_types=task_types,
         agents=agents,
         calendars=catalog.calendars | calendars,
+        calendars_with_hours=calendars_with_hours,
         artifact_types=artifact_types,
         processes=processes,
+        # A key the package publishes again is in use again (CP-ADR-0074 Zh1).
+        retired_calendars=catalog.retired_calendars - calendars,
+        retired_processes=catalog.retired_processes
+        - {obj.key for obj in package.of_kind("Process")},
     )
 
 
@@ -214,28 +254,6 @@ def with_workspace(spec: dict[str, Any], workspace_id: uuid.UUID | None) -> dict
             body["workspaceId"] = str(workspace_id)
         return body
     return spec
-
-
-async def _latest_calendars(
-    session: AsyncSession, tenant_id: uuid.UUID, keys: set[str]
-) -> dict[str, Calendar]:
-    if not keys:
-        return {}
-    latest = (
-        select(CalendarVersion.key, func.max(CalendarVersion.version).label("version"))
-        .where(CalendarVersion.tenant_id == tenant_id, CalendarVersion.key.in_(sorted(keys)))
-        .group_by(CalendarVersion.key)
-        .subquery()
-    )
-    rows = await session.scalars(
-        select(CalendarVersion)
-        .join(
-            latest,
-            (CalendarVersion.key == latest.c.key) & (CalendarVersion.version == latest.c.version),
-        )
-        .where(CalendarVersion.tenant_id == tenant_id)
-    )
-    return {row.key: Calendar.from_spec(row.spec) for row in rows}
 
 
 async def _role_slugs(
@@ -301,14 +319,27 @@ async def run_package_tests(
     workspace_id: uuid.UUID | None,
     check_only: bool,
     check_calendar: CalendarCheck,
+    shapes: Mapping[str, SpecShape],
+    supporting: Mapping[str, package_trials.SupportingShape],
 ) -> PackageTestReport:
-    """Check a package and, unless ``check_only``, run its tests; nothing is written."""
+    """Check a package and, unless ``check_only``, run its tests; nothing is written.
+
+    ``shapes`` — the shape of a ``TaskType``, ``Agent`` and ``WorkRule`` as
+    their routes take them (as for a plan); ``supporting`` — of an
+    ``ArtifactType``, ``Role`` and ``Skill``: the arguments of their commands.
+    """
     started = time.monotonic()
     report = PackageTestReport(check_only=check_only)
-    package = parse_package(files)
+    # Parsing is CPU work bounded by its budget: off the event loop, which the
+    # other requests share.
+    package = await asyncio.to_thread(parse_package, files)
     report.problems.extend(package.problems)
     chosen, missing = select_tests(package, tests)
     report.problems.extend(missing)
+    report.problems.extend(package_trials.static_problems(package, shapes, workspace_id))
+    processes = [t for t in chosen if t.subject == SUBJECT_PROCESS]
+    subjects = [t for t in chosen if t.subject != SUBJECT_PROCESS]
+    report.problems.extend(package_trials.limit_problems(subjects))
     checked: list[_Checked] = []
     if workspace_id is not None:
         # The run reads the roles and calendars of the workspace as its processes would.
@@ -337,16 +368,37 @@ async def run_package_tests(
                     checked.append(done)
             report.problems.extend(_test_problems(package, checked))
             if not check_only and not any(p.error for p in report.problems):
-                given = {str((t.data.get("given") or {}).get("calendar") or "") for t in chosen}
+                given = {str((t.data.get("given") or {}).get("calendar") or "") for t in processes}
                 world = await _world(
                     db, ctx, package, checked, calendars, given - {""}, workspace_id
                 )
-                live = await _live_instances(db, ctx, chosen)
+                live = await _live_instances(db, ctx, processes)
                 world = replace(world, live=live, writes=lambda: guard.count)
-                report.tests = [sandbox.run_test(world, t.file, t.data) for t in chosen]
+                process_results = [sandbox.run_test(world, t.file, t.data) for t in processes]
+                report.tests.extend(process_results)
                 report.coverage = sandbox.package_coverage(
-                    [c.definition for c in checked if c.definition is not None], report.tests
+                    [c.definition for c in checked if c.definition is not None], process_results
                 )
+
+    if not check_only and not any(p.error for p in report.problems):
+        # Rules and task types run the code of the core: a transaction per test,
+        # which writes and is rolled back (Z2, Z7).
+        trials = await package_trials.run_subject_tests(
+            session_factory,
+            ctx,
+            settings,
+            package=package,
+            tests=subjects,
+            workspace_id=workspace_id,
+            shapes=shapes,
+            supporting=supporting,
+        )
+        report.problems.extend(trials.problems)
+        report.tests.extend(trials.tests)
+        report.rule_coverage = trials.rule_coverage
+        report.task_type_coverage = trials.task_type_coverage
+        order = {test.file: index for index, test in enumerate(chosen)}
+        report.tests.sort(key=lambda result: order.get(result.file, len(order)))
 
     for item in checked:
         if item.scope is None:
@@ -382,7 +434,8 @@ async def _check_process(
     result = check_process(obj.key, spec, catalog, file=obj.file, locate=obj.locate)
     item = _Checked(obj, spec, catalog)
     if not result.errors:
-        item.definition = engine.Definition.build(obj.key, spec, catalog)
+        revision = await engine_revision_for(db, ctx.tenant_id, obj.key, spec)
+        item.definition = engine.Definition.build(obj.key, spec, catalog, engine_revision=revision)
     if governed_references(spec):
         item.scope = await regulation_scope(db, ctx, settings, spec)
     return item, list(result.problems)
@@ -468,6 +521,10 @@ async def _live_instances(
             approvals=tuple(approvals),
             pending={k: list(r.get("pending") or ()) for k, r in records.items()},
             totals={k: int(r["total"]) for k, r in records.items() if r.get("total") is not None},
+            attempts=dict(instance.step_attempts or {}),
+            entered={
+                k: int(r["attempt"]) for k, r in records.items() if r.get("attempt") is not None
+            },
         )
     return live
 
@@ -503,10 +560,8 @@ async def _world(
         skills = {**catalog.skills, **skills}
         task_types = {**catalog.task_types, **task_types}
         agents |= catalog.agents
-    all_calendars = {
-        **await _latest_calendars(db, ctx.tenant_id, wanted_calendars - set(calendars)),
-        **calendars,
-    }
+    latest, _ = await latest_calendar_versions(db, ctx.tenant_id, wanted_calendars - set(calendars))
+    all_calendars = {**latest, **calendars}
     roles = await _role_slugs(db, ctx.tenant_id, workspace_id)
     return sandbox.World(
         definitions={**nested, **definitions},

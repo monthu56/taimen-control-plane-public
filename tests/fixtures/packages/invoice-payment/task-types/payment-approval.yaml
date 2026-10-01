@@ -1,0 +1,63 @@
+# «Согласовать оплату счёта»: решение гейта. Одобрение сверяет суммы скиллом и закрывает
+# задачу; расхождение — комментарий. Отказ заводит доработку оплаты. Задача проходит
+# приёмку: решение человека и сверка сумм. После завершения — работа «оплатить счёт».
+# Тесты: tests/payment-approval-*.test.yaml.
+apiVersion: taimen.ai/v1
+kind: TaskType
+key: payment-approval
+spec:
+  displayName: Согласовать оплату счёта
+  description: Решение об оплате счёта поставщика
+  fieldSchema:
+    type: object
+    properties:
+      invoice: {type: string}
+      dispute: {type: string}
+      invoiceAmount: {type: string, pattern: '^\d+(\.\d{1,2})?$'}
+      paymentAmount: {type: string, pattern: '^\d+(\.\d{1,2})?$'}
+  approvalSchema:
+    gates:
+      default:
+        outcomes:
+          approved:
+            - invokeSkill:
+                skill: invoice.amount_match@1
+                inputs:
+                  invoiceAmount: $.task.customFields.invoiceAmount!
+                  paymentAmount: $.task.customFields.paymentAmount!
+                expect: {matches: true}
+                onSuccess:
+                  - completeTask: {}
+                onFailure:
+                  - comment: {body: "Суммы расходятся на $.invocation.output.difference"}
+          rejected:
+            - ensureWork:
+                type: invoice-payment
+                key: "rework:$.task.publicId"
+                title: "Доработать оплату счёта $.task.customFields.invoice"
+                customFields: {invoice: $.task.customFields.invoice}
+            - comment: {body: "Оплата счёта $.task.customFields.invoice отклонена"}
+  completionSchema:
+    onComplete:
+      actions:
+        - ensureWork:
+            type: invoice-payment
+            key: "pay:$.task.customFields.invoice"
+            title: "Оплатить счёт $.task.customFields.invoice"
+            customFields:
+              invoice: $.task.customFields.invoice
+              invoiceAmount: $.task.customFields.invoiceAmount
+        - comment: {body: "Оплата счёта $.task.customFields.invoice согласована"}
+  acceptance:
+    - key: decided
+      kind: human
+      description: Решение об оплате принято человеком
+    - key: amounts-match
+      kind: deterministic
+      description: Сумма платёжного поручения равна сумме счёта
+      spec:
+        skill: invoice.amount_match@1
+        inputs:
+          invoiceAmount: $.task.customFields.invoiceAmount
+          paymentAmount: $.task.customFields.paymentAmount
+        expect: {matches: true}

@@ -80,7 +80,11 @@ ADR-0067 (грамматика `$.` исходов approval и `when` крите
   - `cal.addWorkdays(ts, n, calendarKey)` — сдвиг на `n` рабочих дней
     (отрицательное `n` — назад);
   - `cal.isWorkday(ts, calendarKey)`;
-  - `cal.workdaysBetween(a, b, calendarKey)`.
+  - `cal.workdaysBetween(a, b, calendarKey)`;
+  - `cal.addWorkingTime(ts, duration, calendarKey)` → timestamp и
+    `cal.workingTimeBetween(a, b, calendarKey)` → duration — рабочее время
+    по рабочим часам календаря (ADR-0078 §2); у календаря без часов —
+    `expression_error` с `reason: calendar_without_hours`.
 
   `calendarKey` необязателен, если у процесса есть `spec.calendar`. Если
   вычисление затронуло год с `provisional: true` или вышло за опубликованные

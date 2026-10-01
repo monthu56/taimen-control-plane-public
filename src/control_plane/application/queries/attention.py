@@ -12,6 +12,10 @@ Rules (CP-ADR-0071 §2):
   assigned to it, or requiring a role it holds in the approval's scope.
 * ``approval.review`` — the same for a gate approval: the work is waiting on
   a check ("on review") and cannot move until it is decided.
+* ``approval.undecidable`` — a pending approval nobody may decide: every
+  holder of its required role in scope is excluded from deciding it
+  (separation of duties, CP-ADR-0074 §7). Raised to the owner of the process
+  whose step asked for it, else to whoever requested it.
 * ``task.due_not_started`` — the principal's task (assignee, else owner) is
   due within 48 hours or overdue and nobody has started it: no active claim,
   no run ever.
@@ -37,17 +41,19 @@ from __future__ import annotations
 
 import logging
 import uuid
-from collections.abc import Awaitable, Callable, Iterable, Sequence
+from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Any
 
-from sqlalchemy import ColumnElement, and_, func, or_, select
+from sqlalchemy import ColumnElement, Text, and_, cast, exists, func, or_, select
+from sqlalchemy.dialects import postgresql
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from control_plane import observability
-from control_plane.application.authorization import AuthContext, authorize
+from control_plane.application.authorization import AuthContext, ResourceRef, authorize
 from control_plane.application.common import utcnow
+from control_plane.application.queries.org import role_assignment_scope
 from control_plane.domain.enums import ApprovalStatus, Permission, RunStatus
 from control_plane.domain.errors import (
     AuthorizationError,
@@ -59,6 +65,7 @@ from control_plane.infrastructure.db.models import (
     Approval,
     AttentionFeedback,
     PrincipalRole,
+    ProcessInstance,
     Run,
     Task,
 )
@@ -71,9 +78,12 @@ DUE_SOON = timedelta(hours=48)
 FAILED_RUNS_THRESHOLD = 3
 # Rows one rule contributes at most; more is reported as ``truncated``.
 RULE_LIMIT = 100
+# Approvals nobody may decide that ``approval.undecidable`` reads per call.
+UNDECIDABLE_SCAN = 500
 
 KIND_DECISION = "decision"
 KIND_REVIEW = "review"
+KIND_UNDECIDABLE = "undecidable"
 KIND_DEADLINE = "deadline"
 KIND_BLOCKED = "blocked"
 KIND_DELEGATED_FAILURE = "delegated_failure"
@@ -180,6 +190,10 @@ def approval_score(*, gate: bool, waiting: timedelta, priority: str | None) -> i
     base = 80 if gate else 70
     days = min(10, max(0, int(waiting.total_seconds() // 86400)))
     return _clamp(base + days + _PRIORITY_BONUS.get(priority or "", 0))
+
+
+def undecidable_score(*, waiting: timedelta) -> int:
+    return _clamp(75 + min(waiting.days, 10))
 
 
 def due_score(*, left: timedelta, priority: str) -> int:
@@ -301,6 +315,165 @@ def _approval_fetch(*, gate: bool) -> RuleFetch:
         return items
 
     return fetch
+
+
+async def _undecidable_filter(
+    session: AsyncSession, tenant_id: uuid.UUID, candidates: Sequence[ColumnElement[bool]]
+) -> ColumnElement[bool] | None:
+    """Approvals among ``candidates`` whose required role no principal that is
+    not excluded holds in the approval's scope; ``None`` when there is none.
+
+    One condition per workspace the candidates are in: role assignments count
+    in a workspace through its ancestors (``role_assignment_scope``).
+    """
+    workspaces = (
+        await session.scalars(select(Approval.workspace_id).where(*candidates).distinct())
+    ).all()
+    conditions: list[ColumnElement[bool]] = []
+    for workspace_id in workspaces:
+        holder = exists().where(
+            PrincipalRole.tenant_id == Approval.tenant_id,
+            PrincipalRole.role_id == Approval.required_role_id,
+            ~Approval.excluded_principals.has_key(cast(PrincipalRole.principal_id, Text)),
+            await role_assignment_scope(session, tenant_id, workspace_id),
+        )
+        here = (
+            Approval.workspace_id.is_(None)
+            if workspace_id is None
+            else Approval.workspace_id == workspace_id
+        )
+        conditions.append(and_(here, ~holder))
+    return or_(*conditions) if conditions else None
+
+
+async def _is_addressee(
+    session: AsyncSession, scope: Scope, address: Mapping[str, Any] | None
+) -> bool:
+    """Whether the caller is an addressee of a process (CP-ADR-0078 §3): the
+    principal itself, or a holder of the role in the instance's workspace."""
+    if not address:
+        return False
+    me = scope.ctx.principal_id
+    if address.get("principalId"):
+        return str(me) == str(address["principalId"])
+    if not address.get("roleId"):
+        return False
+    workspace = address.get("workspaceId")
+    scope_filter = await role_assignment_scope(
+        session, scope.ctx.tenant_id, uuid.UUID(workspace) if workspace else None
+    )
+    held = await session.scalar(
+        select(PrincipalRole.id).where(
+            PrincipalRole.tenant_id == scope.ctx.tenant_id,
+            PrincipalRole.principal_id == me,
+            PrincipalRole.role_id == uuid.UUID(address["roleId"]),
+            scope_filter,
+        )
+    )
+    return held is not None
+
+
+async def _undecidable(
+    session: AsyncSession, scope: Scope, rule: AttentionRule, limit: int
+) -> list[AttentionItem]:
+    """Pending approvals whose every eligible decider is excluded (CP-ADR-0074 §7).
+
+    Only an approval for a role can come to this: one assigned to an excluded
+    principal is refused when requested. The owner of the process that asked
+    for it hears of it (the addressee the step recorded), else whoever started
+    the instance; a direct request — its requester. A role granted later makes
+    the approval decidable, and the item goes away by itself.
+
+    Whether anyone may decide is one query, not a query per approval: only
+    approvals nobody may decide are read, at most ``UNDECIDABLE_SCAN`` of them,
+    the oldest first — a state an operator repairs, not a daily one.
+    """
+    candidates: list[ColumnElement[bool]] = [
+        Approval.tenant_id == scope.ctx.tenant_id,
+        Approval.status == ApprovalStatus.PENDING,
+        Approval.required_role_id.is_not(None),
+        func.jsonb_array_length(Approval.excluded_principals) > 0,
+    ]
+    if scope.workspaces is not None:
+        candidates.append(Approval.workspace_id.in_(scope.workspaces))
+    if scope.entity_id is not None:
+        candidates.append(Approval.id == scope.entity_id)
+    nobody = await _undecidable_filter(session, scope.ctx.tenant_id, candidates)
+    if nobody is None:
+        return []
+    approvals = (
+        await session.scalars(
+            select(Approval)
+            .where(*candidates, nobody)
+            .order_by(Approval.created_at, Approval.id)
+            .limit(UNDECIDABLE_SCAN)
+        )
+    ).all()
+    if not approvals:
+        return []
+    refs = [f"approval:{approval.id}" for approval in approvals]
+    instances: dict[str, ProcessInstance] = {}
+    for row in await session.scalars(
+        select(ProcessInstance).where(
+            ProcessInstance.tenant_id == scope.ctx.tenant_id,
+            ProcessInstance.refs.has_any(postgresql.array(refs)),
+        )
+    ):
+        for ref in refs:
+            if ref in (row.refs or {}):
+                instances[ref] = row
+    items: list[AttentionItem] = []
+    for approval in approvals:
+        ref = f"approval:{approval.id}"
+        instance = instances.get(ref)
+        if instance is not None:
+            refs_of = instance.refs or {}
+            activity = (refs_of.get(ref) or {}).get("activity")
+            owner = (refs_of.get(f"activity:{activity}") or {}).get("owner")
+            reason = "undecidable_process_owner"
+            if not owner and instance.started_by is not None:
+                # A process without ``spec.owner``: whoever started the instance.
+                owner = {"principalId": str(instance.started_by)}
+                reason = "undecidable_process_starter"
+            if not await _is_addressee(session, scope, owner):
+                continue
+            # The owner is no relation of the approval (authz/catalog.yaml):
+            # the item is shown only to an owner who may read it.
+            try:
+                await authorize(
+                    scope.ctx,
+                    Permission.APPROVALS_READ,
+                    resource=ResourceRef("approval", str(approval.id)),
+                )
+            except AuthorizationError:
+                continue
+        elif approval.requested_by_principal_id == scope.ctx.principal_id:
+            reason = "undecidable_requester"
+        else:
+            continue
+        items.append(
+            AttentionItem(
+                rule_key=rule.key,
+                rule_version=rule.version,
+                kind=KIND_UNDECIDABLE,
+                reason_code=reason,
+                entity_type="approval",
+                entity_id=approval.id,
+                score=undecidable_score(waiting=scope.now - approval.created_at),
+                title=approval.comment[:200],
+                workspace_id=approval.workspace_id,
+                since=approval.created_at,
+                task_id=approval.task_id,
+                details={
+                    "requiredRoleId": str(approval.required_role_id),
+                    "excludedPrincipals": list(approval.excluded_principals),
+                    "processInstanceId": str(instance.id) if instance is not None else None,
+                },
+            )
+        )
+        if len(items) >= limit:
+            break
+    return items
 
 
 # --- tasks -------------------------------------------------------------------
@@ -479,6 +652,7 @@ async def _delegated_failing(
 RULES: tuple[AttentionRule, ...] = (
     AttentionRule("approval.review", 1, Permission.APPROVALS_READ, _approval_fetch(gate=True)),
     AttentionRule("approval.decide", 1, Permission.APPROVALS_READ, _approval_fetch(gate=False)),
+    AttentionRule("approval.undecidable", 1, Permission.APPROVALS_READ, _undecidable),
     AttentionRule("task.due_not_started", 1, Permission.TASKS_READ, _due_not_started),
     AttentionRule("task.blocked", 1, Permission.TASKS_READ, _blocked),
     AttentionRule("task.delegated_failing", 1, Permission.TASKS_READ, _delegated_failing),
@@ -630,7 +804,13 @@ def item_actions(item: AttentionItem) -> list[dict[str, str]]:
     """What the principal can do about the item, as calls of this API."""
     api = "/api/v1"
     actions: list[dict[str, str]] = []
-    if item.entity_type == "approval":
+    if item.kind == KIND_UNDECIDABLE:
+        # Nobody may decide: the owner opens the approval and its process.
+        actions.append(_action("open", "GET", f"{api}/approvals/{item.entity_id}"))
+        instance = item.details.get("processInstanceId")
+        if instance:
+            actions.append(_action("openProcess", "GET", f"{api}/process-instances/{instance}"))
+    elif item.entity_type == "approval":
         base = f"{api}/approvals/{item.entity_id}"
         actions += [
             _action("approve", "POST", f"{base}:approve"),

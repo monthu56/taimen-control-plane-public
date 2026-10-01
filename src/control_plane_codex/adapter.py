@@ -59,6 +59,7 @@ from control_plane_agent.instructions import (
     read_conventions,
 )
 from control_plane_agent.main import ArtifactSpec
+from control_plane_agent.runner_config import run_environment
 from control_plane_agent.trace import TraceRecorder, TraceSettings, TranscriptBuilder
 from control_plane_agent.workspace import Workspace, assert_portable, redact_local_paths
 from control_plane_client import ControlPlaneClient, ControlPlaneError, is_transient
@@ -119,7 +120,7 @@ class CodexAdapter:
     # the pool that will one day choose it automatically.
     credential_class: str | None = None
     trace: TraceSettings = field(default_factory=TraceSettings)
-    # Repository conventions, the fourth instructions layer (CP-ADR-0066):
+    # Agent conventions, the fourth instructions layer (CP-ADR-0066):
     # read at execute time, like the Claude Code adapter's file.
     prompt_file: Path | None = None
     # Executor instructions of the agent's revision (CP-ADR-0073), instead of
@@ -133,7 +134,14 @@ class CodexAdapter:
         client: ControlPlaneClient,
         workspace: Workspace | None,
         inputs: Sequence[LocalInput] | None = None,
+        env: Mapping[str, str] | None = None,
     ) -> list[ArtifactSpec]:
+        """Run one turn; ``env`` is this run's environment (``runner.yaml``).
+
+        It reaches the ``codex`` process of this turn and its children only,
+        after :func:`run_environment` drops what a run may not set; nothing of
+        it is kept on the adapter, so the next run starts without it.
+        """
         run_id = str(run["id"])
         public_id = str(task.get("publicId") or task["id"])
         cwd = workspace.path if workspace is not None else Path.cwd()
@@ -189,7 +197,8 @@ class CodexAdapter:
                     cwd=cwd,
                     resume_session_id=resume_id,
                     # Outside the working copy: the signal is never committed.
-                    env={ENV_BLOCKED_FILE: str(stop_file)},
+                    # The run's own environment goes first and cannot move it.
+                    env={**run_environment(env), ENV_BLOCKED_FILE: str(stop_file)},
                     log_name=public_id,
                     on_thread_id=on_thread_id,
                     on_event=mapper.consume,

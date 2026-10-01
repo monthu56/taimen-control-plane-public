@@ -124,6 +124,7 @@ async def test_a_version_is_published_once_with_its_hash(client: httpx.AsyncClie
     assert body["identityAgent"] == AGENT
     assert body["owner"] == [{"role": "lead"}]
     assert body["expressionProfile"] == "cp/1"
+    assert body["engineRevision"] == 2
     assert body["warnings"] == []
     assert body["workspaceId"] is None
     assert body["spec"]["displayName"] == "Sample"
@@ -440,3 +441,40 @@ async def test_versions_are_immutable(client: httpx.AsyncClient, sync_engine: En
     ):
         with pytest.raises(Exception, match="immutable"), sync_engine.begin() as connection:
             connection.execute(text(statement))
+
+
+async def test_a_due_in_working_units_needs_a_calendar_that_counts_it(
+    client: httpx.AsyncClient,
+) -> None:
+    """CP-ADR-0078 §1 (P009): the two refusals, and a calendar that gained its hours."""
+    key = await _setup(client)
+    spec = _spec()
+    spec["stages"][1]["steps"][0]["call"]["due"] = {"workhours": 8}
+    here = "/spec/stages/1/steps/0/call/due/workhours"
+
+    # The calendar ru of the catalog declares no working hours.
+    refused = await _publish(client, key, spec)
+    assert refused.status_code == 422, refused.text
+    error = refused.json()["error"]
+    assert error["code"] == "invalid_process"
+    [problem] = error["details"]["problems"]
+    assert (problem["code"], problem["path"]) == ("sla_calendar_without_hours", here)
+    assert "'ru' declares none" in problem["message"]
+
+    alone = copy.deepcopy(spec)
+    del alone["calendar"]
+    alone["stages"][0]["steps"][2]["human"]["due"] = "P2D"
+    missing = await _publish(client, key, alone)
+    assert missing.status_code == 422, missing.text
+    problems = missing.json()["error"]["details"]["problems"]
+    assert [(p["code"], p["path"]) for p in problems] == [("sla_calendar_missing", here)]
+
+    hours = {"intervals": [{"from": "09:00", "to": "18:00"}], "shortDayReduction": "PT1H"}
+    calendar = await client.post(
+        "/api/v1/calendars",
+        json={"key": "ru", "spec": {**CALENDAR["spec"], "workingHours": hours}},
+        headers=auth(key),
+    )
+    assert calendar.status_code == 201, calendar.text
+    published = await _publish(client, key, spec)
+    assert published.status_code == 201, published.text

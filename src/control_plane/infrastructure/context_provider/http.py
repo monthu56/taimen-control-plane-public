@@ -41,7 +41,9 @@ Wire contract (the Memory Service's public ``/api/memory/*`` API):
 * ``GET /api/memory/namespaces/{ns}/kinds`` → the kind catalog of a namespace
   (``catalog.packages`` — the enabled packs as ``name@version``);
   ``GET /api/memory/packages/{name}?version=`` → one pack version with the
-  ``idPatterns`` of its kinds. Pack versions are immutable.
+  ``idPatterns`` of its kinds (the latest without ``version``); a tenant pack
+  (``tenant:<name>``) only with ``?namespace=`` of a namespace that sees it,
+  otherwise 404. Pack versions are immutable.
 * ``GET /healthz`` → unauthenticated liveness.
 
 Auth: either a single static bearer token or — the platform way (superproject
@@ -59,6 +61,7 @@ from urllib.parse import quote
 
 import httpx
 
+from control_plane import sandbox
 from control_plane.infrastructure.context_provider.base import ContextProviderError, IngestResult
 
 TokenProvider = Callable[[], Awaitable[str]]
@@ -139,6 +142,7 @@ class HttpContextProvider:
         trace_run_id: str | None = None,
         params: dict[str, str] | None = None,
     ) -> httpx.Response:
+        sandbox.refuse_outgoing("memory")
         # X-Run-Id ties this call to the caller's trace on the Memory side
         # (ADR-0039). It is correlation only and carries no authority.
         headers = await self._auth_headers()
@@ -405,15 +409,21 @@ class HttpContextProvider:
         return await self._json_object(response, "namespace kinds")
 
     async def get_package(
-        self, *, name: str, version: str = "", trace_run_id: str | None = None
+        self,
+        *,
+        name: str,
+        version: str = "",
+        namespace: str = "",
+        trace_run_id: str | None = None,
     ) -> dict[str, Any]:
+        params = {"version": version, "namespace": namespace}
         response = await self._send(
             "GET",
             f"/api/memory/packages/{quote(name, safe='')}",
             None,
             request_timeout=self._timeout,
             trace_run_id=trace_run_id,
-            params={"version": version} if version else None,
+            params={key: value for key, value in params.items() if value} or None,
         )
         return await self._json_object(response, "package")
 

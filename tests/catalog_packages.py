@@ -33,9 +33,12 @@ VARIABLE = re.compile(r"\$\{([A-Z][A-Z0-9_]*)\}")
 
 
 def load_package(name: str) -> list[dict[str, Any]]:
-    """The objects of package ``name``, ``package.yaml`` excluded."""
+    """The objects of package ``name``, ``package.yaml`` and the tests excluded."""
     objects: list[dict[str, Any]] = []
-    for path in sorted((PACKAGES / name).rglob("*.yaml")):
+    root = PACKAGES / name
+    for path in sorted(root.rglob("*.yaml")):
+        if path.relative_to(root).parts[0] == "tests":
+            continue  # tests/*.test.yaml: run by POST /packages:test, not installed
         document = yaml.safe_load(path.read_text(encoding="utf-8"))
         assert document["apiVersion"].endswith("/v1"), path
         if document["kind"] == "Package":

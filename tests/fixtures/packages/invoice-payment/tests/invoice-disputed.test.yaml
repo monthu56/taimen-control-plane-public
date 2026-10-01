@@ -1,0 +1,21 @@
+subject: rule
+rule: invoice-disputed
+name: претензия разбирается скиллом, и её род попадает в согласование
+given:
+  observation:
+    kind: invoice.disputed
+    content: сумма в счёте больше, чем в договоре
+    data: {invoice: INV-8, supplier: Acme}
+mocks:
+  skills:
+    invoice.classify_dispute@1:
+      - output: {category: overcharge, confidence: 0.93}
+steps:
+  - expect:
+      result: matched
+      invokeSkill:
+        - skill: invoice.classify_dispute@1
+          inputs: {text: "сумма в счёте больше, чем в договоре"}
+      ensureWork:
+        - type: payment-approval
+          customFields: {invoice: INV-8, dispute: overcharge}

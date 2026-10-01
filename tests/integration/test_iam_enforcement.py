@@ -638,6 +638,50 @@ async def test_channel_token_rejects_and_a_direct_call_has_no_channel(
     assert channels == {"approval.rejected": "telegram", "approval.approved": None}
 
 
+async def test_channel_token_of_an_excluded_principal_decides_nothing(
+    iam_app: FastAPI, iam_client: httpx.AsyncClient, sync_engine: Engine, signing_key: SigningKey
+) -> None:
+    """Separation of duties holds on the channel path too (CP-ADR-0074 §7): the
+    button in the channel is the same decision command as the API."""
+    enable_iam(iam_app, signing_key)
+    admin_key, task, own, _, iam_principal, iam_tenant = await _channel_setup(
+        iam_client, sync_engine
+    )
+    person = own["assignedPrincipalId"]
+    role = await iam_client.post(
+        "/api/v1/roles", json={"slug": "payer", "name": "Payer"}, headers=auth(admin_key)
+    )
+    assert role.status_code == 201, role.text
+    granted = await iam_client.post(
+        f"/api/v1/principals/{person}/roles",
+        json={"roleId": role.json()["id"]},
+        headers=auth(admin_key),
+    )
+    assert granted.status_code in (200, 201), granted.text
+    approval = (
+        await iam_client.post(
+            "/api/v1/approvals",
+            json={
+                "task": task["id"],
+                "requiredRoleId": role.json()["id"],
+                "excludedPrincipals": [person],
+            },
+            headers=auth(admin_key),
+        )
+    ).json()
+
+    token = _decision_token(signing_key, iam_principal, iam_tenant, approval["id"])
+    for action in ("approve", "reject"):
+        refused = await iam_client.post(
+            f"/api/v1/approvals/{approval['id']}:{action}",
+            headers={**auth(token), "Idempotency-Key": f"callback-sod-{action}"},
+        )
+        assert refused.status_code == 403, refused.text
+        assert refused.json()["error"]["code"] == "separation_of_duties_violation"
+    after = await iam_client.get(f"/api/v1/approvals/{approval['id']}", headers=auth(admin_key))
+    assert after.json()["status"] == "pending"
+
+
 async def test_decision_token_without_a_purpose_or_the_right_is_refused(
     iam_app: FastAPI, iam_client: httpx.AsyncClient, sync_engine: Engine, signing_key: SigningKey
 ) -> None:

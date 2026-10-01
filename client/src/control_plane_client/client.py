@@ -1681,6 +1681,18 @@ class ControlPlaneClient:
             idempotent=True,
         )
 
+    async def get_workspace_knowledge_packs(self, workspace_id: str) -> Json:
+        """The packs enabled for the workspace's tree and ``strict``, in the
+        shape :meth:`set_workspace_knowledge_packs` takes them, plus
+        ``effective`` (what Memory applies) and ``configured``."""
+        return await self._request("GET", f"/workspaces/{workspace_id}/knowledge-packs")
+
+    async def get_knowledge_pack(self, ref: str) -> Json:
+        """A registered pack version: ``name@version``, ``name`` for the latest,
+        ``tenant:name[@version]`` for a pack of the caller's tenant.
+        ``NotFoundError`` when there is none."""
+        return await self._request("GET", f"/knowledge/packs/{ref}")
+
     # -- events ----------------------------------------------------------------
 
     async def list_events(
@@ -2498,6 +2510,32 @@ class ControlPlaneClient:
             params["cursor"] = cursor
         return await self._request(
             "GET", f"/process-definitions/{key}/versions", params=params or None
+        )
+
+    async def retire_process_definition(
+        self, key: str, reason: str, *, dry_run: bool = False
+    ) -> Json:
+        """Retire every version of a process: no new instances, open ones run to the end.
+
+        ``ProcessRetireOut`` with the open instances by version; ``dry_run``
+        makes the same checks and answer without writing.
+        """
+        return await self._request(
+            "POST",
+            f"/process-definitions/{key}:retire",
+            json_body={"reason": reason},
+            params={"dryRun": "true"} if dry_run else None,
+            idempotent=not dry_run,
+        )
+
+    async def retire_calendar(self, key: str, reason: str, *, dry_run: bool = False) -> Json:
+        """Retire every version of a calendar; ``calendar_in_use`` while a process needs it."""
+        return await self._request(
+            "POST",
+            f"/calendars/{key}:retire",
+            json_body={"reason": reason},
+            params={"dryRun": "true"} if dry_run else None,
+            idempotent=not dry_run,
         )
 
     async def get_process_instance(self, instance_id: str) -> Json:

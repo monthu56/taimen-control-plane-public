@@ -10,6 +10,9 @@ The locks come in one order: the trial of a plan takes the keys the way the
 apply does, and the rows a foreign key points at (task types, rules) are
 held ``FOR NO KEY UPDATE``, so the process engine inserting a task of the
 type while it holds an instance the apply waits for does not wait back.
+The processes and calendars of the plan are locked up front too; a ``call``
+shares the child's key without waiting, so a transaction holding other
+process keys never waits for an apply that waits for it.
 
 ``packages:record`` takes the tenant's apply lock before it writes a link: an
 apply holds the links of its plan and inserts the missing ones last, and a
@@ -25,7 +28,9 @@ import yaml
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
+from control_plane.config import Settings
 from control_plane.domain.work_item import SYSTEM_TASK_LIFECYCLE
+from control_plane.worker.main import Worker
 from tests.concurrency.test_principal_disable_races import (
     _blocked_backend,
     _wait_until_blocked_by,
@@ -324,6 +329,233 @@ async def test_the_engine_inserts_a_task_of_the_type_while_an_apply_waits_for_it
     assert response.status_code == 200, response.text
     applied = {(a["kind"], a["action"]) for a in response.json()["applied"]}
     assert applied == {("TaskType", "update"), ("Process", "update")}
+
+
+CHILD, PARENT = "sample-child", "sample-parent"
+
+
+def _parent_and_child(admin: str, *, version: int = 1) -> dict[str, Any]:
+    """A package of a parent calling a child; the child's key sorts first."""
+    child = process_plan._spec(admin, version=version)
+    parent = {
+        "version": version,
+        "displayName": "Sample parent",
+        "identity": {"agent": process_plan.AGENT},
+        "owner": [{"role": "lead"}],
+        "data": {"type": "object", "properties": {}},
+        "start": {"on": {"observation": "sample.parent"}, "key": "event.payload.data.id"},
+        "stages": [
+            {
+                "id": "run",
+                "steps": [
+                    {"id": "child", "call": {"process": CHILD}},
+                    {"id": "done", "complete": {"outcome": "done"}},
+                ],
+            }
+        ],
+    }
+    manifest = {
+        "apiVersion": API_VERSION,
+        "kind": "Package",
+        "key": "sample-family",
+        "spec": {"version": f"{version}.0.0", "displayName": "Sample family"},
+    }
+    files = [("package.yaml", manifest)] + [
+        (
+            f"processes/{key}.yaml",
+            {"apiVersion": API_VERSION, "kind": "Process", "key": key, "spec": spec},
+        )
+        for key, spec in ((CHILD, child), (PARENT, parent))
+    ]
+    return {
+        "files": [
+            {"path": path, "content": yaml.safe_dump(body, sort_keys=False)} for path, body in files
+        ]
+    }
+
+
+async def test_a_call_does_not_wait_for_a_child_an_apply_holds(
+    client: httpx.AsyncClient, sync_engine: Engine
+) -> None:
+    s = await _setup(client)
+    key, admin = s["key"], s["admin"]
+    await _plan_and_apply(client, key, _parent_and_child(admin))
+    package = _parent_and_child(admin, version=2)
+    plan = await _plan(client, key, package)
+    assert _errors(plan) == []
+    # A start locks the principals its processes name (the admin among them)
+    # before the key; the apply's caller is another one, or it would wait
+    # for the start at its first statement, holding nothing.
+    _, applier = await create_agent_with_key(
+        client,
+        key,
+        name="applier",
+        kind="service",
+        # The process's agent: a publication grants nothing the caller lacks.
+        permissions=["packages.plan", "processes.read", "processes.write", *AGENT_PERMISSIONS],
+    )
+
+    with sync_engine.connect() as conn:
+        # A start of the parent stops between the shared key of the parent
+        # and its first step, which calls the child.
+        tenant = conn.execute(
+            text("SELECT tenant_id FROM process_definitions WHERE key = :key LIMIT 1"),
+            {"key": PARENT},
+        ).scalar_one()
+        conn.execute(
+            text("SELECT pg_advisory_xact_lock(hashtextextended(:lock, 0))"),
+            {"lock": f"cp:process-instance:{tenant}:{PARENT}:p-1"},
+        )
+        holder = conn.execute(text("SELECT pg_backend_pid()")).scalar_one()
+        start = asyncio.create_task(
+            client.post(
+                "/api/v1/process-instances",
+                json={"process": PARENT, "key": "p-1"},
+                headers=auth(key),
+            )
+        )
+        await _wait_until_blocked_by(sync_engine, holder)
+        starter = _blocked_backend(sync_engine, holder)
+        # The apply takes the child's key, then waits for the parent's.
+        apply = asyncio.create_task(_apply(client, applier, package, plan["planHash"]))
+        await _wait_until_blocked_by(sync_engine, starter)
+        conn.commit()
+        started = await start
+        response = await apply
+
+    # The call finds the child's key held and gives the step up instead of
+    # closing a cycle with the apply; the apply goes through.
+    assert started.status_code == 503, started.text
+    assert started.json()["error"]["code"] == "catalog_key_busy"
+    assert response.status_code == 200, response.text
+    assert {(a["key"], a["version"]) for a in response.json()["applied"]} == {
+        (CHILD, 2),
+        (PARENT, 2),
+    }
+    again = await client.post(
+        "/api/v1/process-instances", json={"process": PARENT, "key": "p-1"}, headers=auth(key)
+    )
+    assert again.status_code == 201, again.text
+
+
+async def test_a_start_that_waited_for_an_apply_runs_on_the_version_it_published(
+    client: httpx.AsyncClient, sync_engine: Engine
+) -> None:
+    s = await _setup(client)
+    key, admin = s["key"], s["admin"]
+    await _plan_and_apply(client, key, _parent_and_child(admin))
+    package = _parent_and_child(admin, version=2)
+    plan = await _plan(client, key, package)
+    assert _errors(plan) == []
+    _, applier = await create_agent_with_key(
+        client,
+        key,
+        name="applier",
+        kind="service",
+        permissions=["packages.plan", "processes.read", "processes.write", *AGENT_PERMISSIONS],
+    )
+
+    with sync_engine.connect() as conn:
+        # The apply takes the child's key, then waits for the parent's.
+        tenant = conn.execute(
+            text("SELECT tenant_id FROM process_definitions WHERE key = :key LIMIT 1"),
+            {"key": PARENT},
+        ).scalar_one()
+        conn.execute(
+            text("SELECT pg_advisory_xact_lock(hashtextextended(:lock, 0))"),
+            {"lock": f"cp:process:{tenant}:{PARENT}"},
+        )
+        holder = conn.execute(text("SELECT pg_backend_pid()")).scalar_one()
+        apply = asyncio.create_task(_apply(client, applier, package, plan["planHash"]))
+        await _wait_until_blocked_by(sync_engine, holder)
+        applying = _blocked_backend(sync_engine, holder)
+        # A start of the child waits for the apply holding its key.
+        start = asyncio.create_task(
+            client.post(
+                "/api/v1/process-instances",
+                json={"process": CHILD, "key": "c-1"},
+                headers=auth(key),
+            )
+        )
+        await _wait_until_blocked_by(sync_engine, applying)
+        conn.commit()
+        response = await apply
+        started = await start
+
+    assert response.status_code == 200, response.text
+    assert started.status_code == 201, started.text
+    # The version is read after the wait, not before it.
+    assert started.json()["definitionVersion"] == 2
+
+
+async def test_a_worker_batch_whose_call_finds_the_key_busy_is_deferred_not_failed(
+    client: httpx.AsyncClient, settings: Settings, sync_engine: Engine
+) -> None:
+    s = await _setup(client)
+    key, admin = s["key"], s["admin"]
+    await _plan_and_apply(client, key, _parent_and_child(admin))
+    observed = await client.post(
+        "/api/v1/observations",
+        json={"kind": "sample.parent", "content": "seen", "data": {"id": "p-1"}},
+        headers=auth(key),
+    )
+    assert observed.status_code in (200, 201), observed.text
+
+    def cursor(conn: Any) -> Any:
+        return conn.execute(
+            text(
+                "SELECT tx_id, sequence, failure_count, parked_at, parked_reason,"
+                " next_attempt_at FROM event_consumer_cursors WHERE name = 'processes'"
+            )
+        ).one()
+
+    with sync_engine.connect() as conn:
+        before = cursor(conn)
+    worker = Worker(settings)
+    try:
+        with sync_engine.connect() as conn:
+            # An apply holds the child's key for its whole transaction.
+            tenant = conn.execute(
+                text("SELECT tenant_id FROM process_definitions WHERE key = :key LIMIT 1"),
+                {"key": CHILD},
+            ).scalar_one()
+            conn.execute(
+                text("SELECT pg_advisory_xact_lock(hashtextextended(:lock, 0))"),
+                {"lock": f"cp:process:{tenant}:{CHILD}"},
+            )
+            assert await worker.process_events() == 0
+            conn.rollback()
+
+        with sync_engine.connect() as conn:
+            after = cursor(conn)
+            instances = conn.execute(text("SELECT count(*) FROM process_instances")).scalar_one()
+            failed = conn.execute(
+                text("SELECT count(*) FROM process_instance_events WHERE kind = 'intent_failed'")
+            ).scalar_one()
+        # The batch is rolled back: the cursor stays, nothing started, no
+        # intent_failed; the tenant is deferred, not counted as failing.
+        assert (after.tx_id, after.sequence) == (before.tx_id, before.sequence)
+        assert instances == 0
+        assert failed == 0
+        assert after.failure_count == 0
+        assert after.parked_at is None and after.parked_reason is None
+        assert after.next_attempt_at is not None
+
+        # Once the key is free, the batch goes through.
+        with sync_engine.begin() as conn:
+            conn.execute(
+                text(
+                    "UPDATE event_consumer_cursors SET next_attempt_at = NULL"
+                    " WHERE name = 'processes'"
+                )
+            )
+        assert await worker.process_events() > 0
+    finally:
+        await worker.engine.dispose()
+
+    listed = await client.get("/api/v1/process-instances", headers=auth(key))
+    assert listed.status_code == 200, listed.text
+    assert {i["definitionKey"] for i in listed.json()["items"]} == {PARENT, CHILD}
 
 
 async def _record(

@@ -9,6 +9,8 @@ organizational eligibility (being the assigned principal, or holding the
 required role in the approval's workspace scope) — and not being one of the
 approval's excluded principals (separation of duties, CP-ADR-0074 §7), which
 is refused here, on the one decision path every entry point goes through.
+The same holds for cancelling such an approval, and for an agent acting under
+a delegation from an excluded principal.
 """
 
 import uuid
@@ -24,6 +26,7 @@ from control_plane.application.commands.approval_outcomes import (
     declared_actions,
 )
 from control_plane.application.commands.approval_preconditions import require_preconditions
+from control_plane.application.commands.delegations import find_delegation_from_any
 from control_plane.application.commands.org import get_tenant_role
 from control_plane.application.commands.principals import get_tenant_principal
 from control_plane.application.commands.relations import resolve_task
@@ -274,19 +277,44 @@ async def _get_locked_pending_approval(
     return approval
 
 
-async def _require_decision_eligibility(
+async def _require_not_excluded(
     session: AsyncSession, ctx: AuthContext, approval: Approval
 ) -> None:
-    """Organizational check: not excluded, and the assigned principal or a
-    holder of the required role."""
+    """Separation of duties (CP-ADR-0074 §7): an excluded principal, or an agent
+    an excluded principal delegated to, neither decides nor cancels the approval
+    — whoever the request comes through (engine, console, channel, MCP) and
+    whatever role is held."""
+    if not approval.excluded_principals:
+        return
     if str(ctx.principal_id) in approval.excluded_principals:
-        # Separation of duties (CP-ADR-0074 §7): whoever the request comes
-        # through — engine, console, channel, MCP — and whatever role is held.
         raise AuthorizationError(
             "This principal is excluded from deciding the approval (separation of duties)",
             code="separation_of_duties_violation",
             details={"approvalId": str(approval.id)},
         )
+    delegation = await find_delegation_from_any(
+        session,
+        tenant_id=ctx.tenant_id,
+        human_principal_ids=[uuid.UUID(p) for p in approval.excluded_principals],
+        agent_principal_id=ctx.principal_id,
+    )
+    if delegation is not None:
+        # The agent acts for whoever delegated to it: an excluded principal's
+        # agent is excluded too, whichever session it decides through.
+        raise AuthorizationError(
+            "This agent acts on behalf of a principal excluded from deciding the approval"
+            " (separation of duties)",
+            code="separation_of_duties_violation",
+            details={"approvalId": str(approval.id), "delegationId": str(delegation.id)},
+        )
+
+
+async def _require_decision_eligibility(
+    session: AsyncSession, ctx: AuthContext, approval: Approval
+) -> None:
+    """Organizational check: not excluded, and the assigned principal or a
+    holder of the required role."""
+    await _require_not_excluded(session, ctx, approval)
     if approval.assigned_principal_id is not None:
         if approval.assigned_principal_id != ctx.principal_id:
             raise AuthorizationError(
@@ -439,9 +467,19 @@ async def cancel_approval(
     # approvals.decide permission and organizational eligibility — otherwise
     # the very principal the gate is meant to hold could void it with only
     # approvals.manage. The requester may always cancel its own request.
-    if approval.gate and approval.requested_by_principal_id != ctx.principal_id:
-        await authorize(ctx, Permission.APPROVALS_DECIDE)
-        await _require_decision_eligibility(session, ctx, approval)
+    #
+    # An approval with excluded principals is the same kind of primitive: a
+    # process step counts a cancelled approval as one approver fewer
+    # (CP-ADR-0074 §7), so a foreign cancel is a decision too, and an
+    # excluded principal may not cancel it at all — its own request included
+    # (the process that asked for a step's approvals closes them itself).
+    if approval.requested_by_principal_id != ctx.principal_id:
+        await _require_not_excluded(session, ctx, approval)
+        if approval.gate or approval.excluded_principals:
+            await authorize(ctx, Permission.APPROVALS_DECIDE)
+            await _require_decision_eligibility(session, ctx, approval)
+    elif str(ctx.principal_id) in approval.excluded_principals:
+        await _require_not_excluded(session, ctx, approval)
 
     now = utcnow()
     approval.status = ApprovalStatus.CANCELLED

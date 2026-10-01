@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$comment": "Generated from $defs.processSpec of the superproject catalog schema (packages/schema/v1/object.schema.json): process_schema_from_catalog().",
+  "$comment": "Generated from $defs.processSpec of the package-sdk catalog schema (schema/v1/object.schema.json): process_schema_from_catalog().",
   "$ref": "#/$defs/processSpec",
   "$defs": {
     "assignChain": {
@@ -66,7 +66,8 @@
       "type": "string",
       "minLength": 1,
       "maxLength": 4000,
-      "description": "Выражение CEL в профиле taimen/1 (CP-ADR-0075): переменные data, event, step, task, instance; функции cal.*; без текущего времени. Типы и лимит стоимости проверяет ядро"
+      "description": "Выражение CEL в профиле taimen/1: переменные data, event, step, task, instance; функции cal.*; без текущего времени. Типы и лимит стоимости проверяет ядро",
+      "$comment": "CP-ADR-0075"
     },
     "celMap": {
       "type": "object",
@@ -275,7 +276,8 @@
     "governedBy": {
       "type": "array",
       "maxItems": 20,
-      "description": "Регламенты базы знаний, которым подчиняется элемент (TAI-ADR-0054 Р17): естественный ключ документа памяти и, при необходимости, пункт",
+      "description": "Регламенты базы знаний, которым подчиняется элемент: естественный ключ документа памяти и, при необходимости, пункт",
+      "$comment": "TAI-ADR-0054 Р17",
       "items": {
         "type": "object",
         "required": [
@@ -339,7 +341,8 @@
         "case"
       ],
       "additionalProperties": false,
-      "description": "Проекция дела в граф памяти (TAI-ADR-0054 Р15): доставляется событиями, в граф идут только объявленные поля",
+      "description": "Проекция дела в граф памяти: доставляется событиями, в граф идут только объявленные поля",
+      "$comment": "TAI-ADR-0054 Р15",
       "properties": {
         "case": {
           "type": "object",
@@ -420,7 +423,8 @@
     "memoryTraverse": {
       "type": "array",
       "maxItems": 10,
-      "description": "Шаги обхода от якорей — та же форма, что traverse в contextSchema (CP-ADR-0064)",
+      "description": "Шаги обхода от якорей — та же форма, что traverse в contextSchema",
+      "$comment": "CP-ADR-0064",
       "items": {
         "type": "object",
         "required": [
@@ -462,7 +466,8 @@
       "type": "array",
       "minItems": 1,
       "maxItems": 20,
-      "description": "Фильтры по атрибутам узлов (TAI-ADR-0056 Р7, MEM-ADR-020): применяются к узлам результата и к якорям-кандидатам смыслового добора; условия соединяются через И",
+      "description": "Фильтры по атрибутам узлов: применяются к узлам результата и к якорям-кандидатам смыслового добора; условия соединяются через И",
+      "$comment": "TAI-ADR-0056 Р7, MEM-ADR-020",
       "items": {
         "type": "object",
         "required": [
@@ -474,7 +479,8 @@
           "attr": {
             "type": "string",
             "pattern": "^[A-Za-z_][A-Za-z0-9_]{0,63}$",
-            "description": "Имя атрибута узла (плоское, как в MEM-ADR-020), например okpd2 или validUntil; атрибут-список выполняет условие, если его выполняет хоть один элемент"
+            "description": "Имя атрибута узла (плоское), например okpd2 или validUntil; атрибут-список выполняет условие, если его выполняет хоть один элемент",
+            "$comment": "MEM-ADR-020"
           },
           "op": {
             "enum": [
@@ -530,6 +536,55 @@
         ]
       }
     },
+    "processDue": {
+      "description": "Срок (SLA) шага или процесса: длительность ISO 8601, {at} — момент или длительность от данных, либо ровно одно из duration, workdays, workhours с необязательными calendar и warnBefore",
+      "$comment": "CP-ADR-0078 §1",
+      "oneOf": [
+        {
+          "$ref": "#/$defs/durationOrCel"
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "oneOf": [
+            {
+              "required": [
+                "duration"
+              ]
+            },
+            {
+              "required": [
+                "workdays"
+              ]
+            },
+            {
+              "required": [
+                "workhours"
+              ]
+            }
+          ],
+          "properties": {
+            "duration": {
+              "$ref": "#/$defs/duration"
+            },
+            "workdays": {
+              "$ref": "#/$defs/workdayCount"
+            },
+            "workhours": {
+              "$ref": "#/$defs/workhourCount"
+            },
+            "calendar": {
+              "$ref": "#/$defs/typeKey",
+              "description": "Календарь рабочих единиц; по умолчанию spec.calendar процесса"
+            },
+            "warnBefore": {
+              "$ref": "#/$defs/workingSpan",
+              "description": "Порог предупреждения до срока; без него предупреждения нет"
+            }
+          }
+        }
+      ]
+    },
     "processElementId": {
       "type": "string",
       "pattern": "^[a-z][a-z0-9-]{0,62}$",
@@ -575,7 +630,8 @@
     },
     "processSpec": {
       "type": "object",
-      "description": "Процесс (TAI-ADR-0054, CP-ADR-0074): кейс со стадиями и блоками исполнения, данные по схеме, выражения CEL, проекция в память. Исполняет ядро",
+      "description": "Процесс: кейс со стадиями и блоками исполнения, данные по схеме, выражения CEL, проекция в память. Исполняет ядро",
+      "$comment": "TAI-ADR-0054, CP-ADR-0074",
       "required": [
         "version",
         "displayName",
@@ -616,15 +672,21 @@
         },
         "owner": {
           "$ref": "#/$defs/assignChain",
-          "description": "Владелец процесса — ему адресуются задачи о процессе: расхождение с регламентом, ошибки экземпляров (TAI-ADR-0054 п.5, амендмент 2026-09-27). Не обязателен; проверка пакета предупреждает, если его нет"
+          "description": "Владелец процесса — ему адресуются задачи о процессе: расхождение с регламентом, ошибки экземпляров. Не обязателен; проверка пакета предупреждает, если его нет",
+          "$comment": "TAI-ADR-0054 п.5, амендмент 2026-09-27"
         },
         "calendar": {
           "$ref": "#/$defs/typeKey",
           "description": "Календарь по умолчанию для cal.*"
         },
+        "due": {
+          "$ref": "#/$defs/processDue",
+          "description": "Срок процесса целиком от старта экземпляра",
+          "$comment": "CP-ADR-0078 §1"
+        },
         "data": {
           "$ref": "#/$defs/jsonSchema",
-          "description": "JSON Schema данных экземпляра; {$ref: <файл пакета>} раскрывает cp_packages"
+          "description": "JSON Schema данных экземпляра; {$ref: <файл пакета>} раскрывает package-sdk"
         },
         "start": {
           "type": "object",
@@ -723,7 +785,8 @@
             "assign"
           ],
           "additionalProperties": false,
-          "description": "Разбор закрытого дела: агент предлагает уроки, человек подтверждает (TAI-ADR-0054 Р18)",
+          "description": "Разбор закрытого дела: агент предлагает уроки, человек подтверждает",
+          "$comment": "TAI-ADR-0054 Р18",
           "properties": {
             "skill": {
               "type": "string",
@@ -1015,7 +1078,7 @@
               "$ref": "#/$defs/assignChain"
             },
             "due": {
-              "$ref": "#/$defs/durationOrCel"
+              "$ref": "#/$defs/processDue"
             },
             "escalations": {
               "type": "array",
@@ -1097,7 +1160,7 @@
               "description": "CEL → список principal, которым голосовать нельзя; проверяет ядро при решении"
             },
             "due": {
-              "$ref": "#/$defs/durationOrCel"
+              "$ref": "#/$defs/processDue"
             },
             "onDue": {
               "enum": [
@@ -1154,6 +1217,9 @@
             },
             "timeout": {
               "$ref": "#/$defs/durationOrCel"
+            },
+            "due": {
+              "$ref": "#/$defs/processDue"
             },
             "context": {
               "$ref": "#/$defs/stepContext"
@@ -1216,6 +1282,9 @@
             },
             "timeout": {
               "$ref": "#/$defs/duration"
+            },
+            "due": {
+              "$ref": "#/$defs/processDue"
             },
             "onTimeout": {
               "$ref": "#/$defs/blocks"
@@ -1325,13 +1394,17 @@
             "timeout": {
               "$ref": "#/$defs/durationOrCel"
             },
+            "due": {
+              "$ref": "#/$defs/processDue"
+            },
             "onTimeout": {
               "$ref": "#/$defs/blocks"
             }
           }
         },
         "wait": {
-          "$ref": "#/$defs/durationOrCel"
+          "$ref": "#/$defs/durationOrCel",
+          "description": "Пауза: длительность или момент; срока (due) у wait нет — пауза сама задаёт время"
         },
         "set": {
           "$ref": "#/$defs/celMap"
@@ -1580,7 +1653,8 @@
       "required": [
         "anchors"
       ],
-      "description": "Профиль контекста исполнителя шага из памяти (TAI-ADR-0054 Р16): явные связи первыми, смысловой добор с пометкой inferred",
+      "description": "Профиль контекста исполнителя шага из памяти: явные связи первыми, смысловой добор с пометкой inferred",
+      "$comment": "TAI-ADR-0054 Р16",
       "properties": {
         "anchors": {
           "type": "array",
@@ -1610,6 +1684,50 @@
       "maxLength": 63,
       "pattern": "^[a-z0-9][a-z0-9_-]*$",
       "description": "Ключ типа: латиница в нижнем регистре, цифры, _ и -"
+    },
+    "workdayCount": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 1000,
+      "description": "Рабочие дни по календарю: то же время суток через n рабочих дней (cal.addWorkdays)"
+    },
+    "workhourCount": {
+      "type": "number",
+      "exclusiveMinimum": 0,
+      "maximum": 10000,
+      "description": "Часы рабочего времени по календарю с рабочими часами (cal.addWorkingTime)"
+    },
+    "workingSpan": {
+      "description": "Промежуток: длительность ISO 8601 (астрономическое время), {workdays} или {workhours} по календарю срока",
+      "oneOf": [
+        {
+          "$ref": "#/$defs/duration"
+        },
+        {
+          "type": "object",
+          "required": [
+            "workdays"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "workdays": {
+              "$ref": "#/$defs/workdayCount"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "workhours"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "workhours": {
+              "$ref": "#/$defs/workhourCount"
+            }
+          }
+        }
+      ]
     }
   }
 }

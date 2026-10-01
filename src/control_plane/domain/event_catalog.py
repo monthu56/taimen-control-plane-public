@@ -1619,6 +1619,36 @@ _register(
     ),
 )
 _register(
+    "process.definition_retired",
+    "process_definition",
+    "Every version of a process was retired: no new instances, open ones run to the end"
+    " (CP-ADR-0074, amendment Zh2).",
+    data(
+        {
+            "key": STR,
+            "latestVersion": INT,
+            "workspaceId": UUID_N,
+            "reason": STR,
+            "openInstances": described(INT, "Open instances of every workspace of the key"),
+            "byVersion": described(ARR, "{version, openInstances} of the versions with open ones"),
+        }
+    ),
+)
+_register(
+    "process.definition_restored",
+    "process_definition",
+    "A retired process is back in use: a package apply installed it as it is"
+    " (CP-ADR-0074, amendment Zh3).",
+    data(
+        {
+            "key": STR,
+            "latestVersion": INT,
+            "packageKey": STR_N,
+            "packageVersion": STR_N,
+        }
+    ),
+)
+_register(
     "process.started",
     "process_instance",
     "A process instance started from its start trigger.",
@@ -1695,24 +1725,71 @@ _register(
             "previousDueAt": TIME,
             "dueAt": TIME,
             "provisional": described(BOOL, "Computed on a provisional calendar year"),
-            "cause": described(STR, "data_changed, calendar_changed or resumed"),
+            "cause": described(
+                STR,
+                "data_changed, calendar_changed, resumed or migrated (deadlines"
+                " recomputed by the new version, CP-ADR-0074 amendment 2026-09-29 §11)",
+            ),
             "changedFields": ARR,
         }
     ),
 )
+# An addressee in the form of notification rules (CP-ADR-0078 §3): one of
+# principalId and roleId set.
+_ADDRESSEE: JsonSchema = {
+    "type": "object",
+    "required": ["principalId", "roleId", "workspaceId"],
+    "properties": {"principalId": UUID_N, "roleId": UUID_N, "workspaceId": UUID_N},
+    "anyOf": [
+        {"properties": {"principalId": UUID, "roleId": {"type": "null"}}},
+        {"properties": {"principalId": {"type": "null"}, "roleId": UUID}},
+    ],
+}
+_ESCALATED = {
+    **_PROCESS_INSTANCE,
+    "element": STR,
+    "level": described(INT, "1-based escalation level of the step"),
+    "action": described(STR, "remind, reassign, notify or raise"),
+    "taskId": UUID_N,
+    "to": described(ARR, "Resolved principals the action addresses"),
+}
 _register(
     "process.escalated",
     "process_instance",
     "An escalation level of a step fired.",
-    _instance_data(
-        {
-            **_PROCESS_INSTANCE,
-            "element": STR,
-            "level": described(INT, "1-based escalation level of the step"),
-            "action": described(STR, "remind, reassign, notify or raise"),
-            "taskId": UUID_N,
-            "to": described(ARR, "Resolved principals the action addresses"),
-        }
+    _instance_data(_ESCALATED),
+    (
+        # The core resolves the targets when it records the event; the
+        # engine's own intents (its replayed journal) do not carry them.
+        _instance_data(
+            _ESCALATED,
+            {
+                "addressees": described(
+                    {"type": "array", "items": nullable(_ADDRESSEE)},
+                    "One per item of to, in its order: the addressee {principalId, roleId,"
+                    " workspaceId} of the target (a role is the one of the instance's"
+                    " workspace); null when the target does not resolve",
+                ),
+                "unresolved": described(
+                    {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "required": ["index", "target", "reason"],
+                            "properties": {
+                                "index": described(INT, "0-based position in to"),
+                                "target": described(STR, "The target as to names it"),
+                                "reason": described(
+                                    STR, "unknown_role, unknown_agent or unknown_principal"
+                                ),
+                            },
+                        },
+                    },
+                    "Why the null addressees did not resolve; empty when all did",
+                ),
+            },
+        ),
+        "addressees, unresolved: addressees of the to targets (CP-ADR-0078, amendment 2026-09-30)",
     ),
 )
 _register(
@@ -1812,6 +1889,131 @@ _register(
     "An error reached the top of the instance without a handler.",
     _instance_data({**_PROCESS_INSTANCE, "error": _PROCESS_ERROR, "element": STR_N}),
 )
+
+# --- process steps and deadlines (CP-ADR-0074 amendment 2026-09-29 §13, CP-ADR-0078)
+#
+# Step events are a projection of the instance journal written by the
+# application; the SLA facts are emitted by the engine when a deadline timer
+# fires. Neither carries instance data: they are read with events.read on the
+# workspace of the process, not processes.read.
+
+_STEP = {
+    "element": described(STR, "Id of the waiting step"),
+    "stage": described(STR_N, "Stage the step belongs to; null outside stages"),
+    "stepKind": described(STR, "human, approve, call, recall, listen or wait"),
+    "attempt": described(INT, "1-based number of the entry into this element in the instance"),
+    "activityId": described(UUID, "Activity of this attempt"),
+    "enteredAt": TIME,
+}
+_STEP_DUE = described(nullable(TIME), "Declared deadline of the step; null without due")
+_SLA_OWNER = described(
+    nullable(_ADDRESSEE),
+    "Addressee {principalId, roleId, workspaceId}, one of principalId and roleId set:"
+    " the first resolvable candidate of spec.owner; null when none resolves",
+)
+_SLA_ASSIGNEE = described(
+    nullable(_ADDRESSEE),
+    "Addressee {principalId, roleId, workspaceId} the step is assigned to;"
+    " null for the process scope or an unassigned step",
+)
+_SLA = {
+    "scope": described(STR, "step or process"),
+    "element": described(STR_N, "Id of the step; null for the process scope"),
+    "attempt": described(INT_N, "Attempt of the step; null for the process scope"),
+    "activityId": described(UUID_N, "Activity of the attempt; null for the process scope"),
+}
+_SLA_DUE_AT = described(TIME, "Declared deadline: the due time of the deadline timer")
+_SLA_PROVISIONAL = described(BOOL, "Computed on a provisional calendar year")
+_register(
+    "process.step_entered",
+    "process_instance",
+    "A waiting step (activity) of the instance opened.",
+    _instance_data(
+        {
+            **_PROCESS_INSTANCE,
+            **_STEP,
+            "waitsFor": described(
+                STR, "task, approval, skill, agent, child, event, time or memory"
+            ),
+            "taskId": described(UUID_N, "Task the step waits for"),
+            "approvalIds": described(ARR, "Approvals the step waits for"),
+            "skillInvocationId": described(UUID_N, "Skill invocation the step waits for"),
+            "childInstanceId": described(UUID_N, "Child instance the step waits for"),
+            "due": _STEP_DUE,
+            "warnAt": described(nullable(TIME), "Warning threshold; null without warnBefore"),
+            "provisional": described(BOOL, "The deadline is computed on a provisional year"),
+        }
+    ),
+)
+_register(
+    "process.step_exited",
+    "process_instance",
+    "A waiting step (activity) of the instance closed.",
+    _instance_data(
+        {
+            **_PROCESS_INSTANCE,
+            **_STEP,
+            "exitedAt": TIME,
+            "outcome": described(
+                STR,
+                "completed, cancelled, withdrawn (a participant cancelled the step's task, or"
+                " the last approval of the step, outside the process; the event's actorId is"
+                " that participant), interrupted, failed, timed_out or migrated",
+            ),
+            "durationSeconds": described(INT, "exitedAt - enteredAt, wall-clock seconds"),
+            "due": _STEP_DUE,
+            "breached": described(BOOL, "The step closed after its deadline"),
+            "overdueSeconds": described(INT_N, "exitedAt - due when breached, else null"),
+        }
+    ),
+)
+_register(
+    "process.sla_warning",
+    "process_instance",
+    "The warning threshold of a deadline passed while the step (process) is open.",
+    _instance_data(
+        {
+            **_PROCESS_INSTANCE,
+            **_SLA,
+            "dueAt": _SLA_DUE_AT,
+            "warnAt": TIME,
+            "provisional": _SLA_PROVISIONAL,
+            "owner": _SLA_OWNER,
+            "assignee": _SLA_ASSIGNEE,
+        }
+    ),
+)
+_register(
+    "process.sla_breached",
+    "process_instance",
+    "A deadline passed while the step (process) is open; one per attempt.",
+    _instance_data(
+        {
+            **_PROCESS_INSTANCE,
+            **_SLA,
+            "dueAt": _SLA_DUE_AT,
+            "detectedAt": described(TIME, "When the core processed the breach"),
+            "overdueSeconds": described(INT, "detectedAt - dueAt, seconds, not negative"),
+            "detectedBy": described(STR, "timer or migration"),
+            "provisional": _SLA_PROVISIONAL,
+            "owner": _SLA_OWNER,
+            "assignee": _SLA_ASSIGNEE,
+        }
+    ),
+)
+_register(
+    "process.sla_failed",
+    "process_instance",
+    "A deadline could not be computed; the instance goes on, its SLA state is unknown.",
+    _instance_data(
+        {
+            **_PROCESS_INSTANCE,
+            **_SLA,
+            "error": described(_PROCESS_ERROR, "calendar_missing or an expression error"),
+            "owner": _SLA_OWNER,
+        }
+    ),
+)
 _register(
     "calendar.published",
     "calendar",
@@ -1826,6 +2028,20 @@ _register(
             "provisionalYears": ARR,
         }
     ),
+)
+_register(
+    "calendar.retired",
+    "calendar",
+    "Every version of a working-day calendar was retired: no process needs it any more"
+    " (CP-ADR-0074, amendment Zh3).",
+    data({"key": STR, "latestVersion": INT, "reason": STR}),
+)
+_register(
+    "calendar.restored",
+    "calendar",
+    "A retired working-day calendar is back in use: a package apply installed it as it is"
+    " (CP-ADR-0074, amendment Zh3).",
+    data({"key": STR, "latestVersion": INT, "packageKey": STR_N, "packageVersion": STR_N}),
 )
 
 # --- attention ---------------------------------------------------------------

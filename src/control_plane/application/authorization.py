@@ -24,6 +24,7 @@ from __future__ import annotations
 import logging
 import uuid
 from collections.abc import Sequence
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import Literal, Protocol
@@ -38,7 +39,7 @@ from platform_auth import (
     TrustedAuthContext,
 )
 
-from control_plane import observability
+from control_plane import observability, sandbox
 from control_plane.domain.enums import Permission
 from control_plane.domain.errors import AuthorizationError, DependencyUnavailableError
 
@@ -220,6 +221,7 @@ class Authorizer:
         if self.mode != "policy" or self._client is None or ctx.policy_subject is None:
             return None
         name = action.value if isinstance(action, Permission) else action
+        sandbox.refuse_outgoing("policy")
         try:
             page = await self._client.list_objects(
                 _policy_context(ctx),
@@ -242,6 +244,7 @@ class Authorizer:
         consistency: Literal["default", "strong"],
     ) -> PolicyDecision:
         assert self._client is not None
+        sandbox.refuse_outgoing("policy")
         last: PolicyDecision | None = None
         try:
             for permission in any_of:
@@ -321,6 +324,26 @@ def get_authorizer() -> Authorizer:
     return _authorizer
 
 
+_LOCAL = Authorizer(None, "local")
+
+
+def _current(ctx: AuthContext, actions: Sequence[str], resource: ResourceRef | None) -> Authorizer:
+    """The configured authorizer; inside a package test, the local one (CP-ADR-0074 Z2).
+
+    Except a read by the caller of the test of a resource the test did not
+    write, which the PDP still decides in ``policy`` mode (Z7): a test never
+    reads, in the caller's name, what the caller could not.
+    """
+    trial = sandbox.active()
+    if trial is None:
+        return _authorizer
+    if _authorizer.mode == "policy" and trial.asks_policy(
+        ctx.policy_subject, actions, resource.id if resource is not None else None
+    ):
+        return _authorizer
+    return _LOCAL
+
+
 async def authorize(
     ctx: AuthContext,
     *any_of: Permission,
@@ -333,15 +356,20 @@ async def authorize(
     Without ``resource`` the question is asked at tenant level; commands name
     the concrete resource wherever it is known so that scoped bindings work.
     """
-    await _authorizer.authorize(
-        ctx, *any_of, resource=resource, contextual=contextual, consistency=consistency
-    )
+    authorizer = _current(ctx, [p.value for p in any_of], resource)
+    with sandbox.permit("policy") if authorizer is not _LOCAL else nullcontext():
+        await authorizer.authorize(
+            ctx, *any_of, resource=resource, contextual=contextual, consistency=consistency
+        )
 
 
 async def visible_objects(
     ctx: AuthContext, action: Permission | str, resource_type: str
 ) -> set[str] | None:
-    return await _authorizer.visible_objects(ctx, action, resource_type)
+    name = action.value if isinstance(action, Permission) else action
+    authorizer = _current(ctx, [name], None)
+    with sandbox.permit("policy") if authorizer is not _LOCAL else nullcontext():
+        return await authorizer.visible_objects(ctx, action, resource_type)
 
 
 __all__ = [

@@ -18,6 +18,7 @@ from sqlalchemy import select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from control_plane import sandbox
 from control_plane.application.authorization import AuthContext, ResourceRef, authorize
 from control_plane.application.commands._claim_release import release_claim_on_locked_task
 from control_plane.application.commands.agent_assignees import agent_principal, resolve_assignee
@@ -118,8 +119,13 @@ async def next_public_id(session: AsyncSession, tenant_id: uuid.UUID) -> str:
 
     The upsert takes a row lock on the tenant's counter, serializing task
     creation per tenant; the unique constraint on (tenant_id, public_id) is
-    the safety net.
+    the safety net. Inside a package test the number comes from the test and
+    the counter is not touched (CP-ADR-0074 Z2): its row lock would stop the
+    tenant's task creation until the test rolls back.
     """
+    source = sandbox.public_id_source()
+    if source is not None:
+        return source()
     stmt = (
         pg_insert(TaskCounter)
         .values(tenant_id=tenant_id, last_value=1)

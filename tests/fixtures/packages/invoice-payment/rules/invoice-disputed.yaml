@@ -1,0 +1,25 @@
+# Претензия к счёту → разбор скиллом → работа «согласовать оплату» с родом претензии.
+# Внутренние счета (supplier: internal) не разбираются. Тесты: tests/invoice-disputed*.test.yaml.
+apiVersion: taimen.ai/v1
+kind: WorkRule
+key: invoice-disputed
+spec:
+  description: Претензия к счёту — согласование оплаты с разбором претензии
+  workspaceId: ${INVOICE_WORKSPACE_ID}
+  trigger: {kind: observation, type: invoice.disputed}
+  condition:
+    and:
+      - {exists: payload.data.invoice}
+      - {ne: [{var: payload.data.supplier}, internal]}
+  interpretation:
+    skill: invoice.classify_dispute@1
+    inputs: {text: "{{payload.content}}"}
+  action:
+    kind: ensure_work
+    taskType: payment-approval
+    dedupKeyTemplate: "dispute:{{payload.data.invoice}}"
+    fields:
+      title: "Согласовать оплату счёта {{payload.data.invoice}}"
+      customFields:
+        invoice: "{{payload.data.invoice}}"
+        dispute: "{{skill.output.category}}"

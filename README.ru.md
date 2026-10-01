@@ -408,8 +408,9 @@ Engine хранит то, что было узнано в процессе; на
   после своего контракта платформы в блок `instructions: {layers, hash}` контекста
   run и рабочего контекста и фиксирует хэш и версии слоёв в run и в `run.started`.
   Все три адаптера собирают prompt одним рендером
-  (`control_plane_agent/instructions.py`): заметка харнесса, слои, файл
-  соглашений репозитория (`CONTROL_PLANE_CLAUDE_PROMPT_FILE`,
+  (`control_plane_agent/instructions.py`): заметка харнесса, слои, соглашения
+  агента — слой «Agent conventions»: `executor.instructions` ревизии агента или
+  файл (`CONTROL_PLANE_CLAUDE_PROMPT_FILE`,
   `CONTROL_PLANE_CODEX_PROMPT_FILE`, `CONTROL_PLANE_OPENCODE_PROMPT_FILE`), задача,
   пакет памяти как данные. Сырой JSON `effectiveConfig` в prompt больше не
   вставляется. Подробности: [docs/api.md](docs/api.md#инструкции-исполнителю-cp-adr-0066).

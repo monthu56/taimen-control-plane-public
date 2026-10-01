@@ -76,8 +76,9 @@ To use another database, set `CP_TEST_DATABASE_URL` (this is what CI does);
 - `make test` holds `flock` on `.pytest.lock`: a second `make test` in the
   same working copy exits at once with a "tests already running" message
   (exit code 75).
-  Automated runners (see the repository conventions for agents) should run
-  tests through `make test`.
+  Automated runners (see the repository conventions for agents in
+  [`AGENTS.md`](AGENTS.md) and `.agents/runner.yaml`) should run tests through
+  `make test`.
 
 Lint and type checks (the same commands run in CI):
 

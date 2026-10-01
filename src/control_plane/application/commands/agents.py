@@ -1059,7 +1059,8 @@ async def link_agent_identity(
     requested = (issuer, iam_tenant_id, iam_principal_id)
     if agent.principal_id is not None:
         if (agent.iam_issuer, agent.iam_tenant_id, agent.iam_principal_id) == requested:
-            return AgentView(agent, revision)
+            touched = await _reopen_identity(session, ctx, agent, revision)
+            return AgentView(agent, revision, touched_identities=touched)
         raise ConflictError(
             "agent_identity_conflict",
             "The agent is linked to another IAM identity; retire it and publish a new key",
@@ -1124,15 +1125,27 @@ async def link_agent_identity(
     agent.updated_at = now
     await session.flush()
 
-    checked = CheckedSpec(
-        key=key,
+    await _apply_identity(
+        session, ctx, agent, await _revision_identity(session, ctx, agent, revision)
+    )
+    return AgentView(agent, revision, touched_identities=[(issuer, iam_principal_id)])
+
+
+async def _revision_identity(
+    session: AsyncSession, ctx: AuthContext, agent: Agent, revision: AgentRevision
+) -> CheckedSpec:
+    """The identity part of the current revision, in the shape ``_apply_identity`` takes."""
+    spec = revision.spec
+    identity = spec["identity"]
+    return CheckedSpec(
+        key=agent.key,
         spec=spec,
         spec_hash=revision.spec_hash,
         state=agent.state,
         replicas=agent.replicas,
         display_name=agent.display_name,
-        identity_kind=identity_kind,
-        permissions=binding.permissions,
+        identity_kind=identity.get("kind", "agent"),
+        permissions=sorted(set(identity["permissions"])),
         role_ids=await _resolve_roles(session, ctx, list(identity.get("roles", []))),
         capability_ids=await _resolve_capabilities(
             session, ctx, list(identity.get("capabilities", []))
@@ -1142,8 +1155,41 @@ async def link_agent_identity(
         executor_kind=None,
         placed=False,
     )
-    await _apply_identity(session, ctx, agent, checked)
-    return AgentView(agent, revision, touched_identities=[(issuer, iam_principal_id)])
+
+
+async def _reopen_identity(
+    session: AsyncSession, ctx: AuthContext, agent: Agent, revision: AgentRevision
+) -> list[tuple[str, uuid.UUID]]:
+    """The same identity linked again: its binding reopened if it was shut (§6).
+
+    Since ``iam-bindings`` refuses the registry's own identity (E4), this is
+    the way back for a binding revoked beside the registry: it comes back
+    with the rights of the current revision, the principal's roles,
+    capabilities and skills brought to it as by a publish. An active binding
+    changes nothing — the repeat stays idempotent.
+    """
+    assert agent.principal_id is not None
+    binding = await session.scalar(
+        select(IamPrincipalBinding)
+        .where(
+            IamPrincipalBinding.issuer == agent.iam_issuer,
+            IamPrincipalBinding.iam_principal_id == agent.iam_principal_id,
+            IamPrincipalBinding.principal_id == agent.principal_id,
+        )
+        .with_for_update()
+    )
+    if binding is None or binding.status == BINDING_STATUS_ACTIVE:
+        return []
+    principal = await session.get(Principal, agent.principal_id)
+    if principal is None or principal.status != PrincipalStatus.ACTIVE:
+        raise ValidationError(
+            "principal_not_active",
+            "Cannot reopen the binding of a non-active principal",
+            details={"status": principal.status if principal is not None else None},
+        )
+    return await _apply_identity(
+        session, ctx, agent, await _revision_identity(session, ctx, agent, revision)
+    )
 
 
 # --- identity replacement (amendment 2026-09-30) ------------------------------

@@ -1,0 +1,105 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Машиночитаемые соглашения репозитория (.agents/runner.yaml), версия 1",
+  "description": "Что демон исполнителя готовит для задачи в этом репозитории: соседей, установку, тестовые сервисы и проверки перед сдачей. Демон читает файл только с базовой ревизии задачи. Формат описан в runner_config.md рядом. Шаблоны имён кончаются на (?![\\s\\S]), а не на $: в Python $ пропускает завершающий перевод строки.",
+  "type": "object",
+  "required": ["version"],
+  "additionalProperties": false,
+  "properties": {
+    "version": {
+      "type": "integer",
+      "const": 1,
+      "description": "Версия формата"
+    },
+    "neighbours": {
+      "type": "array",
+      "maxItems": 50,
+      "uniqueItems": true,
+      "items": {"$ref": "#/$defs/repositoryKey"},
+      "description": "Соседние репозитории — ключи каталога workingCopy.repositories; URL берётся из каталога, ревизия — из суперпроекта на базовой ревизии"
+    },
+    "setup": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 2000,
+      "description": "Команда установки: sh -c в корне рабочей копии перед исполнителем"
+    },
+    "services": {
+      "type": "object",
+      "maxProperties": 10,
+      "propertyNames": {"$ref": "#/$defs/serviceName"},
+      "additionalProperties": {"$ref": "#/$defs/service"},
+      "description": "Тестовые сервисы прогона по именам; узел выдаёт их только из шаблонов своей конфигурации. Пустой объект — сервисы не запрашиваются"
+    },
+    "checks": {
+      "type": "array",
+      "maxItems": 50,
+      "items": {"$ref": "#/$defs/check"},
+      "description": "Проверки перед сдачей — те же цели, что вызывает CI, а не копии его команд"
+    }
+  },
+  "$defs": {
+    "repositoryKey": {
+      "description": "Ключ репозитория каталога workingCopy.repositories",
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9-]{0,62}(?![\\s\\S])"
+    },
+    "serviceName": {
+      "description": "Имя сервиса — как ServiceName узла fleet: входит в имя хоста, дефис не на краях",
+      "type": "string",
+      "pattern": "^[a-z0-9]([a-z0-9-]{0,29}[a-z0-9])?(?![\\s\\S])"
+    },
+    "templateName": {
+      "description": "Имя шаблона — как TemplateName узла fleet",
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9-]{0,62}(?![\\s\\S])"
+    },
+    "checkName": {
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9._-]{0,62}(?![\\s\\S])"
+    },
+    "envName": {
+      "type": "string",
+      "pattern": "^[A-Za-z_][A-Za-z0-9_]{0,127}(?![\\s\\S])",
+      "not": {"$ref": "#/$defs/reservedEnvName"}
+    },
+    "reservedEnvName": {
+      "description": "Имена, которые задают демон, узел и исполнитель, или которые меняют, что исполняется, куда идут запросы, кому верит TLS и чьи учётные данные берутся: PATH, HOME, SHELL, ENV, BASH_ENV, PYTHONPATH, PYTHONHOME, PYTHONSTARTUP, PYTHONUSERBASE, NODE_OPTIONS, NODE_PATH, NODE_EXTRA_CA_CERTS, NODE_TLS_REJECT_UNAUTHORIZED, PERL5OPT, RUBYOPT, JAVA_TOOL_OPTIONS, _JAVA_OPTIONS, SSL_CERT_FILE, SSL_CERT_DIR, REQUESTS_CA_BUNDLE, CURL_CA_BUNDLE, CURL_HOME, LD_*, DYLD_*, XDG_*, GIT_*, GH_*, SSH_*, UV_*, PIP_*, NPM_CONFIG_*, FLEET_*, CLAUDE_*, ANTHROPIC_*, OPENAI_*, CODEX_*, OPENCODE_*, IAM_*, CONTROL_PLANE_*, *_PROXY (NPM_CONFIG_* и суффикс _PROXY — в любом регистре)",
+      "type": "string",
+      "pattern": "^(?:(?:PATH|HOME|SHELL|ENV|BASH_ENV|PYTHONPATH|PYTHONHOME|PYTHONSTARTUP|PYTHONUSERBASE|NODE_OPTIONS|NODE_PATH|NODE_EXTRA_CA_CERTS|NODE_TLS_REJECT_UNAUTHORIZED|PERL5OPT|RUBYOPT|JAVA_TOOL_OPTIONS|_JAVA_OPTIONS|SSL_CERT_FILE|SSL_CERT_DIR|REQUESTS_CA_BUNDLE|CURL_CA_BUNDLE|CURL_HOME)(?![\\s\\S])|(?:LD|DYLD|XDG|GIT|GH|SSH|UV|PIP|[Nn][Pp][Mm]_[Cc][Oo][Nn][Ff][Ii][Gg]|FLEET|CLAUDE|ANTHROPIC|OPENAI|CODEX|OPENCODE|IAM|CONTROL_PLANE)_)|_[Pp][Rr][Oo][Xx][Yy](?![\\s\\S])"
+    },
+    "service": {
+      "type": "object",
+      "required": ["template"],
+      "additionalProperties": false,
+      "properties": {
+        "template": {
+          "$ref": "#/$defs/templateName",
+          "description": "Имя шаблона сервиса в node.yaml узла; образ, монтирования и привилегии в запросе не передаются"
+        },
+        "env": {
+          "type": "object",
+          "maxProperties": 50,
+          "propertyNames": {"$ref": "#/$defs/envName"},
+          "additionalProperties": {"type": "string", "maxLength": 2000},
+          "description": "Переменные окружения прогона; в значениях подставляются {user} {password} {host} {port} {database} выданного сервиса, {{ и }} — буквальные скобки"
+        }
+      }
+    },
+    "check": {
+      "type": "object",
+      "required": ["name", "run"],
+      "additionalProperties": false,
+      "properties": {
+        "name": {"$ref": "#/$defs/checkName", "description": "Имя проверки, уникально в файле"},
+        "run": {"type": "string", "minLength": 1, "maxLength": 2000, "description": "Команда — цель, которую вызывает CI; sh -c в корне рабочей копии"},
+        "services": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {"$ref": "#/$defs/serviceName"},
+          "description": "Имена сервисов из services, нужных проверке"
+        }
+      }
+    }
+  }
+}

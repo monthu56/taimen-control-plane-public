@@ -23,6 +23,20 @@ a task — artifacts of other tasks its type declares — are downloaded into
 working copy, and handed to an adapter whose ``execute`` takes ``inputs``
 (``inputs.py``). An adapter written before that keeps its four arguments.
 
+Test services (universal-runner U013, ``services.py``): the services the
+task's ``.agents/runner.yaml`` declares at its base are asked of the node
+before the adapter starts and released when the run ends; their address and
+credentials reach the adapter as ``env`` of this run only. No budget in time
+sends the task back to the queue (``test_services_unavailable``); a template
+the node does not have sends it to a person (``service_template_unavailable``).
+
+Checks before hand-in (universal-runner U014, ``checks.py``): with ``checks``
+on (``workingCopy.checks`` of the agent's description), the ``checks`` of the
+base's ``runner.yaml`` run after the adapter; a failed one gives the adapter
+one more turn with its output, then the checks run again and the result goes
+into ``metadata.checks`` of the ``commit`` artifact, failed or not. Off — the
+cycle is what it was.
+
 Acceptance (CP-ADR-0067): the daemon hands work in and nothing more — review
 and merge are checks the task type declares, run by the core. A task its
 verification returned is taken again with the failed attempt in the prompt
@@ -34,6 +48,19 @@ hands the task to a person instead of completing it.
 Restart recovery: on startup the agent consults /harness/context; a still-
 live claim+run is finished honestly (fail with reason=restart_recovery) so
 the task frees up deterministically — a reference policy, not the only one.
+
+Publishing and replicas (universal-runner U007, ``publish.py``): every push
+is checked first — the remote must be the configured repository, and the
+host's publish hook must allow it — and a refused target stops the task as
+``publish_target_rejected``. Uncommitted work of a run that stops ``blocked``
+or is closed by restart recovery is saved as a WIP commit on the task branch
+and published (``wip: true`` in the checkpoint, no ``commit`` artifact), so
+another replica continues from it. A push that failed, or a hook that could
+not check now (exit 75), is kept in the replica's unpublished list and
+retried at the start of every cycle. Replicas
+of one agent share its queue: candidates of one priority are shuffled, the
+ones this replica has a copy of first, and a claim lost to another replica
+moves on to the next candidate.
 
 Skills (ADR-0056 §3, §5, ``skills.py``): with a skill executor configured the
 same daemon runs skill invocations in its own workers, alongside Work
@@ -58,18 +85,34 @@ import inspect
 import logging
 import math
 import os
+import random
 import signal
 import time
-from collections.abc import Coroutine, Mapping
-from dataclasses import dataclass, field
+from collections.abc import Callable, Coroutine, Mapping, Sequence
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Protocol
 
 from control_plane_agent.blocked import (
     BLOCKED_CATEGORY,
-    BLOCKED_COMMENT_PREFIX,
     FAILURE_REASON,
     blocked_reason,
+    settle_blocked,
+)
+from control_plane_agent.catalog import RepositoryBlocked, RepositoryPools, previous_repository
+from control_plane_agent.checks import (
+    CHECK_ACTION,
+    CHECKS_MOVED_HEAD,
+    CHECKS_RESTORE_FAILED,
+    DEFAULT_BUDGET_SECONDS,
+    DEFAULT_TIMEOUT_SECONDS,
+    CheckResult,
+    ChecksBudget,
+    ChecksPlan,
+    ChecksReport,
+    checks_at_base,
+    not_run,
+    run_check,
 )
 from control_plane_agent.comments import own_principal_id, with_comments
 from control_plane_agent.inputs import (
@@ -77,6 +120,17 @@ from control_plane_agent.inputs import (
     discard_inputs,
     fetch_inputs,
     task_runtime_dir,
+)
+from control_plane_agent.publish import (
+    ENV_PUBLISH_HOOK,
+    PUBLISH_TARGET_REJECTED,
+    PublishHook,
+    PublishRejected,
+    PublishResult,
+    Unpublished,
+    UnpublishedLedger,
+    hook_from_environment,
+    publish_branch,
 )
 from control_plane_agent.revision import (
     ENV_CONFIG_MODE,
@@ -90,8 +144,15 @@ from control_plane_agent.revision import (
     skills_of,
     workspace_pool_of,
 )
+from control_plane_agent.services import (
+    RunServices,
+    RunServicesSource,
+    ServicesBlocked,
+    ServicesUnavailable,
+)
 from control_plane_agent.skills import SkillExecutor, executor_from_environment
 from control_plane_agent.supervision import (
+    DRAINED,
     ExecutionStopped,
     RunSupervisor,
     SupervisionSettings,
@@ -100,10 +161,13 @@ from control_plane_agent.supervision import (
 from control_plane_agent.workspace import (
     ARTIFACT_TYPE,
     CHECKPOINT_KIND,
+    NEIGHBOUR_MODIFIED,
     ExecutionWorkspacePool,
     Outcome,
     Workspace,
+    WorkspaceBlocked,
     WorkspaceBusyError,
+    WorkspaceError,
     assert_portable,
     base_branch_of,
     parse_neighbours,
@@ -113,6 +177,7 @@ from control_plane_client import (
     ControlPlaneClient,
     ControlPlaneError,
     HeartbeatRunner,
+    NotEligibleError,
     PermissionDeniedError,
     SessionExpiredError,
     StaleClaimError,
@@ -123,8 +188,15 @@ from control_plane_client import (
 logger = logging.getLogger("control_plane_agent")
 
 #: How many available Work items one cycle looks at: an item this daemon must
-#: not take (a skill it cannot run) should not hide the next one.
-WORK_SCAN = 10
+#: not take (a skill it cannot run), or one another replica claimed first,
+#: should not hide the next one.
+WORK_SCAN = 50
+#: What the message of a WIP commit carries: the work saved when a run
+#: stopped, not a result handed in (FR-022).
+WIP_TRAILER = "Control-Plane-WIP: true"
+#: How long an orphaned run whose copy is on another replica is left to that
+#: replica's own restart recovery (``Agent.orphan_grace``).
+ORPHAN_GRACE_SECONDS = 120.0
 #: How often an idle daemon asks whether its agent has a newer revision; after
 #: a run it asks right away.
 REVISION_CHECK_SECONDS = 30.0
@@ -137,6 +209,22 @@ RETRY_WINDOW_SECONDS = 300.0
 
 class _TypeUnreadable(Exception):
     """The task's type cannot be read, so whether a skill executes it is unknown."""
+
+
+def _refused_for_task(exc: PermissionDeniedError) -> bool:
+    """Whether a refused claim is about that one task rather than the agent.
+
+    The core asks about ``tasks.claim`` twice: at tenant level, then on the
+    task itself (a scoped binding may cover some tasks and not others); the
+    refusal names the resource it was asked about (``details.resource``).
+    ``not_eligible`` — the task's requirements — is about the task as well.
+    Anything else (a refusal at tenant level, one naming no resource, a
+    session of another principal) stops the cycle: every claim would fail.
+    """
+    if isinstance(exc, NotEligibleError) or exc.code == "not_eligible":
+        return True
+    resource = exc.details.get("resource") if isinstance(exc.details, dict) else None
+    return isinstance(resource, str) and resource.startswith("task:")
 
 
 @dataclass(frozen=True)
@@ -158,6 +246,12 @@ class Adapter(Protocol):
 
     An adapter may also take a keyword ``inputs`` — the task's inputs as local
     files (``inputs.py``); the daemon passes it only to an adapter that does.
+    The adapters of Claude Code and Codex also take a keyword ``env`` — the
+    environment of this run (``env`` of the run's services in
+    ``.agents/runner.yaml``, placeholders filled): it reaches the executor
+    process of this run only and is never kept for the next one. The daemon
+    passes it only to an adapter that takes it, and only when the run holds
+    services (``services.py``).
     """
 
     async def execute(
@@ -263,7 +357,7 @@ class Agent:
         include_subprojects: bool = False,
         heartbeat_interval: float = 60.0,
         max_cycles: int | None = None,
-        workspaces: ExecutionWorkspacePool | None = None,
+        workspaces: ExecutionWorkspacePool | RepositoryPools | None = None,
         only_assigned: bool = False,
         skills: SkillExecutor | None = None,
         supervision: SupervisionSettings | None = None,
@@ -271,6 +365,13 @@ class Agent:
         task_types: frozenset[str] = frozenset(),
         revision: AgentRevision | None = None,
         drain_seconds: float | None = None,
+        publish_hook: PublishHook | None = None,
+        rng: random.Random | None = None,
+        services: RunServicesSource | None = None,
+        clock: Callable[[], float] | None = None,
+        orphan_grace: float = ORPHAN_GRACE_SECONDS,
+        checks: bool = False,
+        checks_budget: float = DEFAULT_BUDGET_SECONDS,
     ) -> None:
         self.client = client
         # None: ordinary Work is not taken — an agent of kind ``skills`` runs
@@ -313,8 +414,34 @@ class Agent:
         self.heartbeat_interval = heartbeat_interval
         self.max_cycles = max_cycles
         # Execution workspaces are optional: an adapter that touches no files
-        # (protocol tests, echo) needs no working copy at all.
+        # (protocol tests, echo) needs no working copy at all. A catalog of
+        # repositories (``catalog.py``) picks the pool per task.
         self.workspaces = workspaces
+        # Asked before every push whether the target may take the branch
+        # (``publish.py``); None — only the remote is checked.
+        self.publish_hook = publish_hook
+        # Branches whose push failed, on the replica's volume beside its copies.
+        self.unpublished = UnpublishedLedger(workspaces.root) if workspaces is not None else None
+        # Orders candidates of one priority; replicas must not all reach for
+        # the same task first.
+        self.rng = rng or random.Random()
+        # Wall clock of the unpublished list's pauses (they outlive the process).
+        self.clock = clock or time.time
+        # How long an orphaned run whose copy is not here is left to its own
+        # replica before this one closes it; 0 — closed at once.
+        self.orphan_grace = orphan_grace
+        # run id -> (monotonic deadline, claim id, task id) of those orphaned
+        # runs; their tasks are not taken here until they are closed.
+        self._foreign_orphans: dict[str, tuple[float, str, str]] = {}
+        # Test services of a run (``services.py``): asked of the node before
+        # the adapter starts, released when the run ends. None: nothing is
+        # asked, whatever ``runner.yaml`` declares.
+        self.services = services
+        # Run the checks of runner.yaml before hand-in (``checks.py``). Off:
+        # the work is handed in as the adapter left it, as before.
+        self.checks = checks
+        # How long all checks of one hand-in may take together, both rounds.
+        self.checks_budget = checks_budget
         # Take only work addressed to this Principal. Off by default, because
         # the reference harness exists to prove the protocol and an unassigned
         # queue is the simplest way to do that — but any runner doing real work
@@ -334,6 +461,9 @@ class Agent:
 
     def _drain_deadline_of(self) -> float | None:
         return self._drain_deadline
+
+    def _drained(self) -> bool:
+        return self._drain_deadline is not None and time.monotonic() >= self._drain_deadline
 
     async def _revision_is_current(self, *, after_work: bool) -> bool:
         """Between runs: is this process still the one its agent describes?
@@ -434,11 +564,31 @@ class Agent:
         for run in context["activeRuns"]:
             if run["sessionId"] in live_sessions:
                 continue
+            # Its copy may be here, with work nobody committed: saved and
+            # published first, so whoever takes the task continues from it.
+            # Its claim died with its session, so the core takes no checkpoint
+            # of it any more: the WIP record goes with the failure instead.
+            elsewhere, wip = await self._save_orphaned_work(run)
+            if elsewhere and self.orphan_grace > 0:
+                # Its copy, if any, is on another replica, which may be
+                # restarting too: give it the time to save the WIP first.
+                self._foreign_orphans[run["id"]] = (
+                    time.monotonic() + self.orphan_grace,
+                    str(run.get("claimId") or ""),
+                    str(run["taskId"]),
+                )
+                logger.info("orphaned run %s left to its replica for now", run["id"])
+                continue
             with contextlib.suppress(ControlPlaneError):
-                await self.client.fail_run(run["id"], failure_reason="restart_recovery")
+                await self.client.fail_run(
+                    run["id"],
+                    failure_reason="restart_recovery",
+                    output={"workspace": wip} if wip is not None else None,
+                )
                 logger.info("recovered: failed orphaned run %s", run["id"])
+        waiting = {claim for _, claim, _ in self._foreign_orphans.values()}
         for claim in context["activeClaims"]:
-            if claim["sessionId"] in live_sessions:
+            if claim["sessionId"] in live_sessions or claim["id"] in waiting:
                 continue
             with contextlib.suppress(ControlPlaneError):
                 await self.client.release_claim(claim["id"], reason="restart_recovery")
@@ -552,6 +702,8 @@ class Agent:
         (``concurrency = 0``) takes one skill invocation instead.
         """
         session_id = await self._ensure_session()
+        await self._publish_pending()
+        await self._close_foreign_orphans()
         page = await self.client.list_available_work(
             limit=WORK_SCAN,
             workspace_id=self.workspace_id,
@@ -562,38 +714,53 @@ class Agent:
         )
         task: dict[str, Any] | None = None
         execution: dict[str, Any] | None = None
-        for item in page["items"]:
-            if self.task_types and item.get("typeKey") not in self.task_types:
-                continue
-            if item.get("systemStatusCategory") == BLOCKED_CATEGORY:
-                # Claimable, but waiting for a person (an executor stopped on
-                # it, or its verification failed too often): the status says
-                # so, and a runner takes it only once a person returns it.
-                continue
+        claim: dict[str, Any] = {}
+        for item in self._candidates(page["items"]):
             try:
                 execution = await self._execution_of(item)
             except _TypeUnreadable:
                 continue
-            if await self._takes(execution):
-                task = item
-                break
+            if not await self._takes(execution):
+                continue
+            # Autonomous policy: claim automatically (the human harness would ask).
+            try:
+                claim = await self.client.claim_task(
+                    item["id"], session_id, intent="autonomous-agent auto"
+                )
+            except SessionExpiredError:
+                # Our session died between the poll and the claim; drop it so
+                # the next cycle reopens, and treat this cycle as no-op.
+                await self._open_session()
+                return False
+            except PermissionDeniedError as exc:
+                if _refused_for_task(exc):
+                    # This task only: a scoped binding that does not cover
+                    # it, requirements this agent does not meet. The next
+                    # candidate may well be allowed.
+                    logger.info(
+                        "claim of %s forbidden for this task (%s); trying the next",
+                        item["publicId"],
+                        exc.code,
+                    )
+                    continue
+                # Not a race: this agent may not claim, and every next
+                # candidate would say the same. The cycle stops here.
+                logger.warning(
+                    "claim of %s forbidden (%s); no more claims this cycle",
+                    item["publicId"],
+                    exc.code,
+                )
+                return False
+            except ControlPlaneError as exc:
+                # Another replica of this agent took it since the listing: the
+                # next candidate, not an idle cycle.
+                logger.info("claim lost race for %s: %s", item["publicId"], exc.code)
+                continue
+            task = item
+            break
         if task is None:
             if self.skills is not None and self.skills.concurrency == 0:
                 return await self.skills.run_once(session_id)
-            return False
-
-        # Autonomous policy: claim automatically (the human harness would ask).
-        try:
-            claim = await self.client.claim_task(
-                task["id"], session_id, intent="autonomous-agent auto"
-            )
-        except SessionExpiredError:
-            # Our session died between the poll and the claim; drop it so the
-            # next cycle reopens, and treat this cycle as no-op.
-            await self._open_session()
-            return False
-        except ControlPlaneError as exc:
-            logger.info("claim lost race for %s: %s", task["publicId"], exc.code)
             return False
 
         heartbeats = HeartbeatRunner(
@@ -604,6 +771,7 @@ class Agent:
         )
         heartbeats.start()
         workspace: Workspace | None = None
+        run_services: RunServices | None = None
         # "suspended" is part of Outcome but never assigned here: today every
         # non-success path ends in fail_run, and the workspace is released the
         # same way ("failed") regardless. It's reserved for graceful
@@ -626,6 +794,15 @@ class Agent:
             try:
                 try:
                     workspace = await self._open_workspace(task, run)
+                except (RepositoryBlocked, WorkspaceBlocked) as exc:
+                    # No repository to work in (TAI-ADR-0063 §3), a neighbour
+                    # an earlier run changed, a runner.yaml of the base that
+                    # cannot be used: nothing ran, nothing to publish; a
+                    # person fixes the key, the copy or the base.
+                    await self._settle_blocked(
+                        task, run, claim, exc.reason, failure_reason=exc.code
+                    )
+                    return True
                 except WorkspaceBusyError as exc:
                     # Another process owns this copy. Honest failure for now;
                     # once AR-5 lands this becomes checkpoint → suspend.
@@ -633,6 +810,48 @@ class Agent:
                     with contextlib.suppress(ControlPlaneError):
                         await self.client.fail_run(str(run["id"]), failure_reason="workspace_busy")
                     return False
+                try:
+                    run_services = await self._open_services(workspace, run)
+                except ServicesBlocked as exc:
+                    # No template, over the quota, no way to ask: waiting
+                    # changes nothing, a person fixes runner.yaml or the node.
+                    await self._settle_blocked(
+                        task, run, claim, exc.reason, failure_reason=exc.code
+                    )
+                    return True
+                except ServicesUnavailable as exc:
+                    # No budget or readiness in time (FR-020): nothing ran;
+                    # the task goes back to the queue for a later cycle.
+                    await self._requeue(task, run, claim, exc)
+                    return False
+                if heartbeats.error is not None:
+                    # The claim died while the node readied the services: the
+                    # server would fence the run, so none of it starts.
+                    logger.warning(
+                        "lease lost before %s started (%s); aborting",
+                        task["publicId"],
+                        heartbeats.error.code,
+                    )
+                    with contextlib.suppress(ControlPlaneError):
+                        await self.client.fail_run(str(run["id"]), failure_reason="lease_lost")
+                    return False
+                if self._drained():
+                    # The drain time ran out during the wait: the executor
+                    # would be stopped at its first look.
+                    raise ExecutionStopped(DRAINED)
+                plan: ChecksPlan | None = None
+                if self.checks and workspace is not None:
+                    try:
+                        plan = await asyncio.to_thread(checks_at_base, workspace)
+                    except WorkspaceBlocked as exc:
+                        # Read before the executor starts: a runner.yaml the
+                        # checks cannot come from stops the run before work.
+                        await self._settle_blocked(
+                            task, run, claim, exc.reason, failure_reason=exc.code
+                        )
+                        return True
+                env = run_services.env if run_services is not None else None
+                secrets = run_services.secrets if run_services is not None else ()
                 inputs = await self._fetch_inputs(task, run)
                 task = await self._with_comments(await self._with_feedback(task))
                 supervisor = RunSupervisor(
@@ -641,29 +860,77 @@ class Agent:
                     self.supervision,
                     drain_deadline=self._drain_deadline_of,
                 )
-                artifacts = await supervisor.run(self._execute(task, run, workspace, inputs))
-                if heartbeats.error is not None:
-                    # The lease died while the adapter worked: the server would
-                    # fence us anyway, so stop before writing results.
-                    logger.warning(
-                        "lease lost during %s (%s); aborting",
-                        task["publicId"],
-                        heartbeats.error.code,
-                    )
-                    with contextlib.suppress(ControlPlaneError):
-                        await self.client.fail_run(str(run["id"]), failure_reason="lease_lost")
-                    return False
-                blocked = await blocked_reason(self.client, str(run["id"]))
-                if blocked is not None:
-                    # Stopped, not done: the report goes out, the working copy
-                    # stays as it is for whoever continues, nothing is committed.
-                    await self._publish(task, run, artifacts)
-                    await self._settle_blocked(task, run, claim, blocked)
-                    return True
+                artifacts = await supervisor.run(self._execute(task, run, workspace, inputs, env))
+                stopped = await self._after_execution(
+                    task, run, claim, workspace, heartbeats, artifacts
+                )
+                if stopped is not None:
+                    return stopped
+                report: ChecksReport | None = None
+                if plan is not None:
+                    assert workspace is not None  # a plan is read from a working copy
+                    budget = ChecksBudget(self.checks_budget)
+                    try:
+                        results = await supervisor.run(
+                            self._run_checks(run, workspace, plan, env, budget, secrets)
+                        )
+                        report = ChecksReport(plan.revision, results)
+                        if report.failed and not budget.spent:
+                            # One attempt to fix, with what the failed checks
+                            # said; then all of them again, and the work goes in
+                            # as it is. With the budget spent nothing could tell
+                            # the fix worked: the work goes in with the first
+                            # results.
+                            fix = {**task, "failedChecks": [r.feedback() for r in report.failed]}
+                            artifacts = [
+                                *artifacts,
+                                *await supervisor.run(
+                                    self._execute(fix, run, workspace, inputs, env)
+                                ),
+                            ]
+                            stopped = await self._after_execution(
+                                task, run, claim, workspace, heartbeats, artifacts
+                            )
+                            if stopped is not None:
+                                return stopped
+                            again = await supervisor.run(
+                                self._run_checks(run, workspace, plan, env, budget, secrets)
+                            )
+                            report = ChecksReport(plan.revision, again, first=results)
+                    except WorkspaceBlocked as exc:
+                        # The checks moved HEAD, or their leftovers could not
+                        # be taken away: what a commit would take now is not
+                        # the executor's work. Nothing is handed in; the copy
+                        # stays for a person.
+                        await self._publish(task, run, artifacts)
+                        await self._settle_blocked(
+                            task, run, claim, exc.reason, failure_reason=exc.code
+                        )
+                        return True
                 if workspace is not None:
-                    artifacts = [*artifacts, *await self._commit_evidence(task, run, workspace)]
+                    try:
+                        evidence = await self._commit_evidence(task, run, workspace, checks=report)
+                    except PublishRejected as rejected:
+                        # The branch may not go where it was to go: nothing was
+                        # pushed and nothing is handed in; a person fixes the
+                        # catalog or the forge, then returns the task.
+                        await self._publish(task, run, artifacts)
+                        await self._settle_blocked(
+                            task,
+                            run,
+                            claim,
+                            f"the branch was not published: {rejected.reason}",
+                            failure_reason=PUBLISH_TARGET_REJECTED,
+                        )
+                        return True
+                    artifacts = [*artifacts, *evidence]
                 await self._publish(task, run, artifacts)
-                await self.client.succeed_run(str(run["id"]))
+                if report is not None and report.status == "failed":
+                    await self._report_failed_checks(task, run, report)
+                await self.client.succeed_run(
+                    str(run["id"]),
+                    output={"checks": report.metadata()} if report is not None else None,
+                )
                 outcome = "succeeded"
                 if self.runtime_dir is not None:
                     await discard_inputs(task_runtime_dir(self.runtime_dir, task))
@@ -698,9 +965,24 @@ class Agent:
                     await self.client.fail_run(str(run["id"]), failure_reason=reason)
                 raise
         finally:
-            if workspace is not None and self.workspaces is not None:
-                await asyncio.to_thread(self.workspaces.release, workspace, outcome)
-            await heartbeats.stop()
+            try:
+                if run_services is not None:
+                    # The run is over whatever its outcome: the node counts the
+                    # idle time of the services from here.
+                    await run_services.close()
+            finally:
+                try:
+                    if workspace is not None:
+                        if outcome == "succeeded" and await self._unpublished(workspace):
+                            # The copy stays while its branch waits to be pushed
+                            # again: the unpublished list only pushes tasks with
+                            # a copy here.
+                            outcome = "failed"
+                        await asyncio.to_thread(
+                            self._pool_of(workspace).release, workspace, outcome
+                        )
+                finally:
+                    await heartbeats.stop()
 
     async def _run_skill_work(
         self,
@@ -793,63 +1075,239 @@ class Agent:
             )
 
     async def _settle_blocked(
-        self, task: dict[str, Any], run: dict[str, Any], claim: dict[str, Any], reason: str
+        self,
+        task: dict[str, Any],
+        run: dict[str, Any],
+        claim: dict[str, Any],
+        reason: str,
+        *,
+        failure_reason: str = FAILURE_REASON,
     ) -> None:
         """The executor stopped without doing the work (``blocked.py``).
 
-        The run fails ``executor_blocked`` and the task goes, under our claim,
-        to the first ``blocked`` status its lifecycle allows from where it is
-        — the verification stage's way to hand a task to a person (CP-ADR-0067
-        §5) — with the reason in a comment; then the claim is released, which
-        leaves a status the claim did not set alone. Each step is best-effort
-        after the run is failed: what could not be done is logged, and a task
-        its lifecycle cannot block goes back to the queue as after any failure.
+        Or the daemon did: before the executor started, the task names no
+        repository of the catalog, or moved away from a copy that holds work
+        (``catalog.py``); after it, the target check refused the branch
+        (``publish.py``) — ``failure_reason`` says which. How the task goes
+        to a person: :func:`settle_blocked`.
         """
-        run_id, task_id = str(run["id"]), str(task["id"])
-        logger.warning("%s stopped by the executor: %s", task["publicId"], reason)
-        await self.client.fail_run(run_id, failure_reason=FAILURE_REASON, output={"reason": reason})
-        status: str | None = None
-        try:
-            targets = (await self.client.get_task_transitions(task_id)).get("targets") or []
-            status = next(
-                (
-                    str(t["status"])
-                    for t in targets
-                    if t.get("systemStatusCategory") == BLOCKED_CATEGORY
-                    and t.get("route") == "update"
-                ),
-                None,
+        await settle_blocked(self.client, task, run, claim, reason, failure_reason=failure_reason)
+
+    async def _requeue(
+        self,
+        task: dict[str, Any],
+        run: dict[str, Any],
+        claim: dict[str, Any],
+        exc: ServicesUnavailable,
+    ) -> None:
+        """No services this time: the run fails, the claim goes, the task waits in the queue."""
+        logger.warning("%s: %s", task["publicId"], exc)
+        with contextlib.suppress(ControlPlaneError):
+            await self.client.fail_run(
+                str(run["id"]), failure_reason=exc.code, output={"reason": exc.reason}
             )
-            if status is None:
-                logger.warning("the lifecycle of %s has no blocked status", task["publicId"])
-            else:
-                fresh = await self.client.get_task(task_id)
-                await self.client.update_task(
-                    task_id,
-                    expected_version=int(fresh["version"]),
-                    status=status,
-                    claim_id=str(claim["id"]),
-                    fencing_token=int(claim["fencingToken"]),
+        with contextlib.suppress(ControlPlaneError):
+            await self.client.release_claim(str(claim["id"]), reason=exc.code)
+
+    async def _open_services(
+        self, workspace: Workspace | None, run: dict[str, Any]
+    ) -> RunServices | None:
+        """The services ``runner.yaml`` of the task's base declares, ready for the run.
+
+        The wait (up to ``waitSeconds`` and a poll more) is supervised like
+        the executor: a cancel request, a run ended elsewhere or the end of
+        the drain time stop it (:class:`ExecutionStopped`) and withdraw the
+        request. The watchdog is off: nothing records actions while the node
+        readies the services.
+        """
+        if self.services is None or workspace is None:
+            return None
+        assert self.adapter is not None  # only ordinary Work reaches here (_takes)
+        supervisor = RunSupervisor(
+            self.client,
+            str(run["id"]),
+            replace(self.supervision, stall_warn_seconds=0, stall_stop_seconds=0),
+            drain_deadline=self._drain_deadline_of,
+        )
+        return await supervisor.run(
+            self.services.open(workspace, takes_env=_takes(self.adapter, "env"))
+        )
+
+    async def _after_execution(
+        self,
+        task: dict[str, Any],
+        run: dict[str, Any],
+        claim: dict[str, Any],
+        workspace: Workspace | None,
+        heartbeats: HeartbeatRunner,
+        artifacts: list[ArtifactSpec],
+    ) -> bool | None:
+        """What stops the hand-in after an adapter turn; None — nothing does.
+
+        Asked after every turn, the fix attempt of the checks included: a
+        lease lost, a neighbour changed or an executor that says it is
+        blocked end the run the same way whichever turn it was.
+        """
+        if heartbeats.error is not None:
+            # The lease died while the adapter worked: the server would
+            # fence us anyway, so stop before writing results.
+            logger.warning(
+                "lease lost during %s (%s); aborting",
+                task["publicId"],
+                heartbeats.error.code,
+            )
+            with contextlib.suppress(ControlPlaneError):
+                await self.client.fail_run(str(run["id"]), failure_reason="lease_lost")
+            return False
+        changed = (
+            await asyncio.to_thread(workspace.neighbour_changes) if workspace is not None else {}
+        )
+        if changed:
+            # Neighbours are read-only (FR-007): the work was done
+            # against revisions no checkpoint names, and a change
+            # there belongs to a task of that repository. Nothing is
+            # committed or published; the copies stay for a person.
+            await self._publish(task, run, artifacts)
+            reason = "; ".join(f"neighbour {n} {what}" for n, what in changed.items())
+            await self._settle_blocked(
+                task,
+                run,
+                claim,
+                f"{reason}. Neighbours are read-only: move the change to a task of "
+                "that repository or drop it, then return the task",
+                failure_reason=NEIGHBOUR_MODIFIED,
+            )
+            return True
+        blocked = await blocked_reason(self.client, str(run["id"]))
+        if blocked is not None:
+            # Stopped, not done: the report goes out, the work so far
+            # is saved as WIP for whoever continues — on this replica
+            # or another — and nothing is handed in.
+            wip = await self._save_wip(workspace, FAILURE_REASON) if workspace is not None else None
+            if wip is not None:
+                with contextlib.suppress(ControlPlaneError):
+                    await self.client.create_checkpoint(
+                        str(run["id"]), kind=CHECKPOINT_KIND, data=wip
+                    )
+            await self._publish(task, run, artifacts)
+            await self._settle_blocked(task, run, claim, blocked)
+            return True
+        return None
+
+    async def _run_checks(
+        self,
+        run: dict[str, Any],
+        workspace: Workspace,
+        plan: ChecksPlan,
+        env: Mapping[str, str] | None,
+        budget: ChecksBudget,
+        secrets: Sequence[str] = (),
+    ) -> tuple[CheckResult, ...]:
+        """Every check of the plan, each an action of the run while it goes.
+
+        A running action is what keeps the watchdog from taking a long test
+        suite for a stuck run (``supervision.py``). The checks share
+        ``budget``; one it leaves no time for is not run. What they leave in
+        the copy is taken away after them: only the executor's work is
+        committed. A copy that cannot be put back, or whose HEAD the checks
+        moved, is ``WorkspaceBlocked`` (:data:`CHECKS_RESTORE_FAILED`,
+        :data:`CHECKS_MOVED_HEAD`); an error of the checks themselves is
+        raised as it is, whatever the putting back gives.
+        """
+        head = await asyncio.to_thread(workspace.head_state)
+        snapshot = await asyncio.to_thread(workspace.snapshot)
+        try:
+            results = await self._each_check(run, workspace, plan, env, budget, secrets)
+        except BaseException:
+            try:
+                await asyncio.to_thread(workspace.restore, snapshot)
+            except Exception:
+                logger.exception("could not put %s back after its checks", workspace.key)
+            raise
+        try:
+            await asyncio.to_thread(workspace.restore, snapshot)
+        except (WorkspaceError, OSError) as exc:
+            raise WorkspaceBlocked(
+                CHECKS_RESTORE_FAILED,
+                f"what the checks left in the copy could not be taken away ({exc}); "
+                "a commit would take it for the executor's work",
+            ) from exc
+        moved = await asyncio.to_thread(workspace.head_state)
+        if moved != head:
+            raise WorkspaceBlocked(
+                CHECKS_MOVED_HEAD,
+                f"the checks moved HEAD of the copy from {_where(head)} to {_where(moved)} "
+                "(a commit or a checkout in a check); a check must leave the branch "
+                "as it found it: fix the check at the base, then return the task",
+            )
+        return results
+
+    async def _each_check(
+        self,
+        run: dict[str, Any],
+        workspace: Workspace,
+        plan: ChecksPlan,
+        env: Mapping[str, str] | None,
+        budget: ChecksBudget,
+        secrets: Sequence[str] = (),
+    ) -> tuple[CheckResult, ...]:
+        run_id = str(run["id"])
+        results: list[CheckResult] = []
+        for check in plan.checks:
+            if budget.spent:
+                results.append(not_run(check, budget))
+                continue
+            action: dict[str, Any] | None = None
+            try:
+                action = await self.client.record_action(
+                    run_id, action=CHECK_ACTION, status="started", metadata={"check": check.name}
                 )
-        except ControlPlaneError as exc:
-            logger.warning("could not block %s: %s", task["publicId"], exc.code)
-            status = None
+            except ControlPlaneError as exc:
+                # The work is done by now: a core that does not answer for a
+                # moment must not throw it away. Anything else is not ours to
+                # swallow (a lost claim, a run no longer active).
+                if not record_failure_tolerated(exc):
+                    raise
+                logger.warning("could not record check %s: %s", check.name, exc)
+            result = await run_check(
+                check,
+                workspace,
+                env,
+                secrets=secrets,
+                time_limit=min(DEFAULT_TIMEOUT_SECONDS, budget.remaining),
+            )
+            budget.spend(result.duration_seconds)
+            logger.info(
+                "check %s of %s: %s in %.1fs",
+                check.name,
+                workspace.key,
+                result.status,
+                result.duration_seconds,
+            )
+            if action is not None:
+                with contextlib.suppress(ControlPlaneError):
+                    await self.client.finish_action(
+                        run_id, str(action["id"]), status="completed" if result.passed else "failed"
+                    )
+            results.append(result)
+        return tuple(results)
+
+    async def _report_failed_checks(
+        self, task: dict[str, Any], run: dict[str, Any], report: ChecksReport
+    ) -> None:
+        """Handed in red: said where a reviewer looks, not only in the metadata."""
+        logger.warning("%s handed in with failed checks: %s", task["publicId"], report.summary())
         with contextlib.suppress(ControlPlaneError):
             await self.client.add_task_comment(
-                task_id,
+                str(task["id"]),
                 body=(
-                    f"{BLOCKED_COMMENT_PREFIX} ({FAILURE_REASON}): {reason}\n"
-                    + (
-                        f"The task waits for a person in {status!r}; return it to work "
-                        "to have it taken again."
-                        if status is not None
-                        else "The task could not be moved to a blocked status."
-                    )
+                    "Checks before hand-in failed"
+                    + (" after one attempt to fix them" if report.first is not None else "")
+                    + f": {report.summary()}. The work is handed in with the failure recorded "
+                    "in metadata.checks of the commit artifact."
                 ),
-                run_id=run_id,
+                run_id=str(run["id"]),
             )
-        with contextlib.suppress(ControlPlaneError):
-            await self.client.release_claim(str(claim["id"]), reason=FAILURE_REASON)
 
     async def _with_feedback(self, task: dict[str, Any]) -> dict[str, Any]:
         """The task with ``lastVerification`` when its newest attempt failed.
@@ -895,25 +1353,47 @@ class Agent:
         run: dict[str, Any],
         workspace: Workspace | None,
         inputs: list[LocalInput] | None,
+        env: Mapping[str, str] | None = None,
     ) -> Coroutine[Any, Any, list[ArtifactSpec]]:
         assert self.adapter is not None  # only ordinary Work reaches here (_takes)
-        if inputs is not None and _takes_inputs(self.adapter):
-            return self.adapter.execute(  # type: ignore[call-arg]
-                task, run, self.client, workspace, inputs=inputs
+        extra: dict[str, Any] = {}
+        if inputs is not None and _takes(self.adapter, "inputs"):
+            extra["inputs"] = inputs
+        if env:
+            # Only a run holding services has one, and only an adapter that
+            # takes it gets services at all (RunServicesSource.open).
+            extra["env"] = env
+        return self.adapter.execute(task, run, self.client, workspace, **extra)
+
+    def _pool_of(self, workspace: Workspace) -> ExecutionWorkspacePool:
+        """The pool that handed out ``workspace``: the one, or its key's in a catalog."""
+        assert self.workspaces is not None  # a workspace comes from a pool
+        if isinstance(self.workspaces, RepositoryPools):
+            return self.workspaces.pool_for(
+                self.workspaces.catalog.entries[workspace.repository_key]
             )
-        return self.adapter.execute(task, run, self.client, workspace)
+        return self.workspaces
 
     async def _open_workspace(self, task: dict[str, Any], run: dict[str, Any]) -> Workspace | None:
         """Take this task's working copy and record it durably.
 
         The checkpoint is what makes the copy survive a restart: a later run of
         the same task finds the branch here instead of forking a second copy.
+        With a catalog it also carries the repository key, which is how the
+        next run tells that the task moved to another repository.
         """
         if self.workspaces is None:
             return None
-        workspace = await asyncio.to_thread(
-            self.workspaces.acquire, task["publicId"], base_branch_of(task)
-        )
+        if isinstance(self.workspaces, RepositoryPools):
+            pools = self.workspaces
+            entry = pools.catalog.entry_of(task)
+            context = await self.client.get_run_context(str(run["id"]))
+            previous = previous_repository(list(context.get("checkpoints") or []), CHECKPOINT_KIND)
+            await asyncio.to_thread(pools.settle_change, task["publicId"], previous, entry)
+            pool = await asyncio.to_thread(pools.pool_for, entry)
+        else:
+            pool = self.workspaces
+        workspace = await asyncio.to_thread(pool.acquire, task["publicId"], base_branch_of(task))
         await self.client.create_checkpoint(
             str(run["id"]), kind=CHECKPOINT_KIND, data=workspace.checkpoint_data
         )
@@ -926,30 +1406,58 @@ class Agent:
         return workspace
 
     async def _commit_evidence(
-        self, task: dict[str, Any], run: dict[str, Any], workspace: Workspace
+        self,
+        task: dict[str, Any],
+        run: dict[str, Any],
+        workspace: Workspace,
+        *,
+        checks: ChecksReport | None = None,
     ) -> list[ArtifactSpec]:
         """Turn the working copy into evidence: a commit, referenced not copied.
 
         The branch is then published, when the pool has a remote, so the work
-        can be reviewed where code is normally reviewed. Publishing is the
+        can be reviewed where code is normally reviewed. ``checks`` — what the
+        checks before hand-in gave, when they ran — goes into the metadata
+        beside the fields it always had. Publishing is the
         DAEMON's job and not the agent's for the same reason completion is: this
         process holds the claim and its fencing token, so what it publishes is
         attributable to the run that produced it.
         """
-        sha = await asyncio.to_thread(workspace.commit, f"{task['publicId']}: {task['title']}")
+        summary = f"{task['publicId']}: {task['title']}"
+        sha = await asyncio.to_thread(workspace.commit, summary)
+        if await asyncio.to_thread(_is_wip, workspace):
+            # A run that continued saved work and added nothing (a copy taken
+            # again starts at the WIP, so ``commit`` may even see no change).
+            # WIP is never the result (FR-022): the result is a commit of the
+            # task on top of it, which is what review and merge take.
+            sha = await asyncio.to_thread(workspace.commit, summary, allow_empty=True)
+            logger.info("%s: handing in the work saved before", workspace.key)
         if sha is None:
             logger.info("no changes in %s; nothing to commit", workspace.key)
             return []
 
-        remote = self.workspaces.push_remote if self.workspaces is not None else ""
+        pool = self._pool_of(workspace)
+        remote = pool.push_remote
         published = False
         # Where the branch lives and what it is meant to be merged into: the
         # acceptance of the task type hands both to a merge skill (CP-ADR-0067,
         # amendment 2026-09-27), which cannot guess them.
         location: dict[str, str] = {}
-        pool = self.workspaces
-        if remote and pool is not None:
-            published = await asyncio.to_thread(workspace.push, remote)
+        if remote:
+            result = await self._push(pool, workspace.branch, workspace.key)
+            if result.outcome == "rejected":
+                await self.client.create_checkpoint(
+                    str(run["id"]),
+                    kind=CHECKPOINT_KIND,
+                    data={
+                        **workspace.checkpoint_data,
+                        "head": sha,
+                        "published": False,
+                        "publishRejected": True,
+                    },
+                )
+                raise PublishRejected(result.reason)
+            published = result.published
             logger.info(
                 "%s %s", "published" if published else "could not publish", workspace.branch
             )
@@ -961,11 +1469,12 @@ class Agent:
                 lambda: pool.base_branch
             )
 
-        await self.client.create_checkpoint(
-            str(run["id"]),
-            kind=CHECKPOINT_KIND,
-            data={**workspace.checkpoint_data, "head": sha, "published": published},
-        )
+        data = {**workspace.checkpoint_data, "head": sha, "published": published}
+        if workspace.conventions is not None:
+            # The prose conventions the work was handed in with, beside the
+            # base's (FR-011): a reviewer sees whether the task changed them.
+            data["agentsMdHead"] = await asyncio.to_thread(workspace.agents_md_at, sha)
+        await self.client.create_checkpoint(str(run["id"]), kind=CHECKPOINT_KIND, data=data)
         return [
             ArtifactSpec(
                 type=ARTIFACT_TYPE,
@@ -980,20 +1489,386 @@ class Agent:
                     # be reviewed, and silence about that would waste their time.
                     "published": published,
                     **{k: v for k, v in location.items() if v},
+                    **({"checks": checks.metadata()} if checks is not None else {}),
                 },
             )
         ]
 
+    # -- publishing and replicas ----------------------------------------------
 
-def _takes_inputs(adapter: Adapter) -> bool:
+    async def _push(
+        self, pool: ExecutionWorkspacePool, branch: str, task_key: str
+    ) -> PublishResult:
+        """Publish ``branch`` through the target check; a failed push is kept to retry."""
+        result = await asyncio.to_thread(publish_branch, pool, branch, self.publish_hook)
+        ledger = self.unpublished
+        if ledger is None:
+            return result
+        if result.outcome == "failed":
+            head = await asyncio.to_thread(pool.branch_head, branch)
+            if head is not None:
+                entry = Unpublished(
+                    task_key, branch, head, pool.repository_key, reason=result.reason
+                )
+                await self._record_failure(ledger, entry)
+        else:
+            await asyncio.to_thread(ledger.discard, pool.repository_key, branch)
+        return result
+
+    async def _record_failure(self, ledger: UnpublishedLedger, entry: Unpublished) -> None:
+        """Keep a failed push to retry; give it up where a person sees it once exhausted.
+
+        A branch that failed :data:`publish.RETRY_MAX_FAILURES` times, or for
+        :data:`publish.RETRY_MAX_AGE_SECONDS`, is off the list (``ledger.add``
+        drops it) and the task gets a comment with the last reason: the
+        forge keeps refusing, and a person fixes it and returns the task. The
+        branch stays in the mirror.
+        """
+        now = self.clock()
+        recorded = await asyncio.to_thread(ledger.add, entry, now=now)
+        if not recorded.exhausted(now):
+            return
+        reason = recorded.reason or "unknown"
+        logger.warning(
+            "%s: %s not published after %d attempt(s), giving up: %s",
+            recorded.task,
+            recorded.branch,
+            recorded.failures,
+            reason,
+        )
+        try:
+            await self.client.add_task_comment(
+                recorded.task,
+                body=(
+                    f"The branch {recorded.branch} was not published after "
+                    f"{recorded.failures} attempt(s): {reason}. The runner no longer retries "
+                    f"it; commit {recorded.commit[:12]} stays on the runner. Fix the forge "
+                    "or the credentials and return the task."
+                ),
+            )
+        except ControlPlaneError as exc:
+            logger.warning(
+                "%s: could not comment on the given-up branch: %s", recorded.task, exc.code
+            )
+
+    async def _publish_pending(self) -> None:
+        """Push again what an earlier push could not publish (FR-023).
+
+        At the start of every cycle, before work is looked for; an entry is
+        tried once its pause is over (``publish.retry_delay``). The branch
+        goes as it is now — a later run may have added to it. The list is on
+        a volume an executor can write, so it only names what to push again:
+        an entry is pushed only to the task branch of its own task, and only
+        when that task has a copy on this replica. A branch that keeps
+        failing is given up (:meth:`_record_failure`). An entry
+        whose branch or repository is gone, whose target is refused, or whose
+        published branch is not an ancestor of the local one (a person
+        rewrote it; no push can succeed) is dropped: retrying cannot help it.
+        A failure of one entry never stops the cycle.
+        """
+        ledger = self.unpublished
+        if ledger is None:
+            return
+        now = self.clock()
+        for entry in await asyncio.to_thread(ledger.entries):
+            if not entry.due(now):
+                continue
+            try:
+                result = await self._publish_again(ledger, entry, now)
+            except Exception:
+                logger.exception("%s: could not publish %s again", entry.task, entry.branch)
+                continue
+            if result is None:
+                continue
+            if result.published:
+                logger.info("%s: %s published on retry", entry.task, entry.branch)
+            elif result.outcome == "rejected":
+                logger.warning("%s: %s may not be published; dropped", entry.task, entry.branch)
+            elif result.outcome == "local":
+                logger.info("%s: %s is no longer published anywhere", entry.task, entry.branch)
+                await asyncio.to_thread(ledger.discard, entry.repository_key, entry.branch)
+
+    async def _publish_again(
+        self, ledger: UnpublishedLedger, entry: Unpublished, now: float
+    ) -> PublishResult | None:
+        """One entry of the unpublished list; None when it was settled without a push."""
+
+        async def drop(why: str) -> None:
+            logger.warning(
+                "%s: %s %s; dropped from the unpublished list", entry.task, entry.branch, why
+            )
+            await asyncio.to_thread(ledger.discard, entry.repository_key, entry.branch)
+
+        pool = await asyncio.to_thread(self._pool_named, entry.repository_key)
+        if pool is None or not pool.is_task_branch(entry.branch):
+            await drop("is not a task branch here")
+            return None
+        if pool.branch_for(entry.task) != entry.branch:
+            await drop("is not the branch of the task")
+            return None
+        if not await asyncio.to_thread(pool.has_copy, entry.task):
+            # The list is on a volume the executor can write: only a task
+            # that ran on this replica — its copy is kept while the branch is
+            # unpublished — is pushed from here.
+            await drop("has no copy on this replica")
+            return None
+        if await asyncio.to_thread(pool.branch_head, entry.branch) is None:
+            await drop("is no longer here")
+            return None
+        state = await asyncio.to_thread(pool.published_state, entry.branch)
+        if state == "unreachable":
+            # The forge did not answer: the pause grows, nobody else is asked.
+            await self._record_failure(ledger, replace(entry, reason="the forge did not answer"))
+            return None
+        if state == "same":
+            await asyncio.to_thread(ledger.discard, entry.repository_key, entry.branch)
+            logger.info("%s: %s is already published", entry.task, entry.branch)
+            return None
+        if state == "diverged":
+            await drop("in the forge is not an ancestor of the local one (rewritten there?)")
+            return None
+        return await self._push(pool, entry.branch, entry.task)
+
+    async def _unpublished(self, workspace: Workspace) -> bool:
+        """Whether the branch of ``workspace`` is on the unpublished list."""
+        ledger = self.unpublished
+        if ledger is None:
+            return False
+        key = self._pool_of(workspace).repository_key
+        try:
+            entries = await asyncio.to_thread(ledger.entries)
+        except OSError:
+            return False
+        return any((e.repository_key, e.branch) == (key, workspace.branch) for e in entries)
+
+    def _pool_named(self, repository_key: str) -> ExecutionWorkspacePool | None:
+        """The pool of a catalog key ("" — the one-repository pool), if this host has it."""
+        pools = self.workspaces
+        if isinstance(pools, RepositoryPools):
+            entry = pools.catalog.entries.get(repository_key)
+            return pools.existing_pool(entry) if entry is not None else None
+        return pools if not repository_key else None
+
+    async def _save_wip(self, workspace: Workspace, why: str) -> dict[str, Any] | None:
+        """Commit what the copy holds as WIP and publish it (FR-022); the record, or None.
+
+        The commit is the work so far, not a result: its record says ``wip:
+        true`` — the ``execution.workspace`` checkpoint, or the output of a run
+        closed by restart recovery — and no ``commit`` artifact is made, so
+        neither a review nor a merge takes it. A moved submodule pointer is not
+        part of it (:meth:`Workspace.commit_wip`). A copy with nothing
+        uncommitted but commits of the executor's own is published without a
+        WIP commit, and its record has no ``wip``. None when there is nothing
+        to save. Best-effort: the run is being stopped anyway, and what could not
+        be saved stays in the copy.
+        """
+        try:
+            sha = await asyncio.to_thread(
+                workspace.commit_wip, f"{workspace.key}: work in progress ({why})\n\n{WIP_TRAILER}"
+            )
+            # Nothing uncommitted: commits the executor made itself are still
+            # published — they are the work so far — but they are its own, not
+            # a WIP commit, and the record does not say ``wip``.
+            head = sha if sha is not None else await asyncio.to_thread(workspace.head)
+            if head == workspace.base_commit:
+                return None
+            pool = self._pool_of(workspace)
+            result = await self._push(pool, workspace.branch, workspace.key)
+        except Exception as exc:
+            logger.warning(
+                "%s: could not save the work in progress: %s",
+                workspace.key,
+                redact_local_paths(f"{type(exc).__name__}: {exc}")[:300],
+            )
+            return None
+        logger.info(
+            "%s: work in progress saved as %s (%s)", workspace.key, head[:12], result.outcome
+        )
+        data: dict[str, Any] = {
+            **workspace.checkpoint_data,
+            "head": head,
+            "published": result.published,
+        }
+        if sha is not None:
+            data["wip"] = True
+        if result.outcome == "rejected":
+            data["publishRejected"] = True
+        return data
+
+    async def _save_orphaned_work(self, run: dict[str, Any]) -> tuple[bool, dict[str, Any] | None]:
+        """WIP of an orphaned run whose copy is on this replica.
+
+        ``(elsewhere, record)``: ``elsewhere`` — its copy may be on another
+        replica (this one has no copy of it, or not its repository), so that
+        replica should be the one to close it; ``record`` — the WIP record
+        when the copy was here and held work, else None.
+        """
+        if self.workspaces is None:
+            return False, None
+        try:
+            task = await self.client.get_task(str(run["taskId"]))
+            key = str(task["publicId"])
+            repository_key = ""
+            if isinstance(self.workspaces, RepositoryPools):
+                context = await self.client.get_run_context(str(run["id"]))
+                checkpoints = list(context.get("checkpoints") or [])
+                repository_key = previous_repository(checkpoints, CHECKPOINT_KIND) or ""
+                if not repository_key:
+                    return False, None  # no copy of it was ever recorded
+            pool = await asyncio.to_thread(self._pool_named, repository_key)
+            if pool is None:
+                return True, None
+            workspace = await asyncio.to_thread(pool.reopen, key)
+        except (ControlPlaneError, WorkspaceError) as exc:
+            logger.warning("could not look for the copy of run %s: %s", run["id"], exc)
+            return False, None
+        if workspace is None:
+            return True, None  # its copy is on another replica, or there is none
+        try:
+            return False, await self._save_wip(workspace, "restart_recovery")
+        finally:
+            await asyncio.to_thread(pool.release, workspace, "failed")
+
+    async def _close_foreign_orphans(self) -> None:
+        """Close orphaned runs left to their own replica once their pause is over.
+
+        Replicas restarted together each see the others' orphaned runs; the
+        one that has the copy saves its WIP, and the others wait
+        ``orphan_grace`` seconds for it (SC-007), not taking the task either:
+        a claim of a dead session does not hold it, and a new run would
+        supersede the orphaned one before its work is saved. A run still
+        orphaned after that is closed without a record, and its claim
+        released: its replica is gone.
+        """
+        now = time.monotonic()
+        due = {run: claim for run, (at, claim, _) in self._foreign_orphans.items() if at <= now}
+        if not due:
+            return
+        context = await self.client.get_context()
+        for run_id in due:
+            self._foreign_orphans.pop(run_id, None)
+        live_sessions = {s["id"] for s in context["activeSessions"]}
+        for run in context["activeRuns"]:
+            if run["id"] not in due or run["sessionId"] in live_sessions:
+                continue
+            with contextlib.suppress(ControlPlaneError):
+                await self.client.fail_run(run["id"], failure_reason="restart_recovery")
+                logger.info("recovered: failed orphaned run %s of another replica", run["id"])
+        claims = set(due.values())
+        for claim in context["activeClaims"]:
+            if claim["id"] not in claims or claim["sessionId"] in live_sessions:
+                continue
+            with contextlib.suppress(ControlPlaneError):
+                await self.client.release_claim(claim["id"], reason="restart_recovery")
+                logger.info("recovered: released orphaned claim %s", claim["id"])
+
+    def _candidates(self, items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """The listed Work this daemon may take, in the order to try it."""
+        allowed = [item for item in items if self._may_take(item)]
+        return order_candidates(allowed, own=self._has_copy, rng=self.rng)
+
+    def _may_take(self, item: dict[str, Any]) -> bool:
+        if self.task_types and item.get("typeKey") not in self.task_types:
+            return False
+        if any(item.get("id") == task for _, _, task in self._foreign_orphans.values()):
+            # Left to the replica that has its copy (``recover``): taking it
+            # now would supersede the run before its WIP is saved.
+            return False
+        if item.get("systemStatusCategory") == BLOCKED_CATEGORY:
+            # Claimable, but waiting for a person (an executor stopped on it,
+            # or its verification failed too often): the status says so, and
+            # a runner takes it only once a person returns it.
+            return False
+        # Unassigned work is not taken by a runner that takes its own queue,
+        # whatever the listing returned (TAI-ADR-0063, decision 7).
+        return not (self.only_assigned and not item.get("assigneeId"))
+
+    def _has_copy(self, item: dict[str, Any]) -> bool:
+        """Whether this replica holds a container of the task (work it may resume)."""
+        if self.workspaces is None:
+            return False
+        name = str(item.get("publicId") or "")
+        if not name or "/" in name or "\\" in name or name.startswith("."):
+            return False
+        return (self.workspaces.root / name).is_dir()
+
+
+def order_candidates(
+    items: list[dict[str, Any]],
+    *,
+    own: Callable[[dict[str, Any]], bool],
+    rng: random.Random,
+) -> list[dict[str, Any]]:
+    """Candidates in the order to try them: priority first, then soft preferences.
+
+    The listing is by priority; that order is kept. Within one priority the
+    candidates are shuffled, so replicas of one agent do not all reach for
+    the same task, and those ``own`` says this replica has a copy of come
+    first — a soft preference: it never outranks a higher priority.
+    """
+    groups: dict[Any, list[dict[str, Any]]] = {}
+    for item in items:
+        groups.setdefault(item.get("priority"), []).append(item)
+    ordered: list[dict[str, Any]] = []
+    for group in groups.values():
+        mine = [item for item in group if own(item)]
+        others = [item for item in group if not own(item)]
+        rng.shuffle(mine)
+        rng.shuffle(others)
+        ordered += mine + others
+    return ordered
+
+
+def warn_without_publish_hook(workspaces: Any, hook: PublishHook | None) -> bool:
+    """Warn when an agent with a catalog starts without the host's publish hook.
+
+    Without it only the push address is checked against the catalog, not
+    what the forge says about the repository (a public one, a renamed one);
+    a host that forgot the variable should hear of it at start, not after a
+    branch went where it should not. True when the warning was given.
+    """
+    if hook is not None or not isinstance(workspaces, RepositoryPools):
+        return False
+    logger.warning(
+        "%s is not set: branches of the catalog are checked only against its addresses",
+        ENV_PUBLISH_HOOK,
+    )
+    return True
+
+
+def _is_wip(workspace: Workspace) -> bool:
+    """Whether HEAD of the copy is a WIP commit saved by an earlier run."""
+    return WIP_TRAILER in workspace.head_message()
+
+
+def record_failure_tolerated(exc: ControlPlaneError) -> bool:
+    """Whether a failed record of a check may be let go: the core may answer later.
+
+    No answer at all (:func:`~control_plane_client.is_transient`), too many
+    requests, or a server error; a refusal — a lost claim, a run no longer
+    active, a denied permission — is not. Broader than ``is_transient`` on
+    purpose: the record is bookkeeping, and the work is done by then.
+    """
+    return is_transient(exc) or exc.status == 429 or exc.status >= 500
+
+
+def _where(head: tuple[str, str]) -> str:
+    ref, commit = head
+    return f"{ref.removeprefix('refs/heads/')}@{commit[:12]}"
+
+
+def _takes(adapter: Adapter, keyword: str) -> bool:
+    """Whether ``adapter.execute`` takes ``keyword`` (``inputs``, ``env``)."""
     try:
         parameters = inspect.signature(adapter.execute).parameters
     except (TypeError, ValueError):  # pragma: no cover - a builtin callable
         return False
-    return "inputs" in parameters
+    return keyword in parameters
 
 
-def _runtime_dir_from_env(pool: ExecutionWorkspacePool | None) -> Path:  # pragma: no cover
+def _runtime_dir_from_env(
+    pool: ExecutionWorkspacePool | RepositoryPools | None,
+) -> Path:  # pragma: no cover
     """Where inputs go: ``CONTROL_PLANE_AGENT_RUNTIME_DIR``, else beside the copies.
 
     ``.runtime`` under the pool root cannot be a task's container — a task key
@@ -1051,15 +1926,26 @@ def _agent_from_revision(
     if adapter is None and skills is None:
         raise RevisionError(f"{revision.label}: executor skills without a skills section")
     pool = workspace_pool_of(revision, environ)
+    try:
+        hook = hook_from_environment(environ)
+    except ValueError as exc:
+        raise RevisionError(f"publish hook: {exc}") from exc
+    warn_without_publish_hook(pool, hook)
+    try:
+        services = RunServicesSource.from_environment(environ, revision.key)
+    except ValueError as exc:
+        raise RevisionError(f"test services: {exc}") from exc
     return Agent(
         client,
         adapter,
         skills=skills,
         supervision=SupervisionSettings.from_environment(),
         workspaces=pool,
+        services=services,
         runtime_dir=_runtime_dir_from_env(pool),
         poll_interval=float(os.environ.get("CONTROL_PLANE_AGENT_POLL", "5")),
         revision=revision,
+        publish_hook=hook,
         **settings_of(revision).agent_kwargs(),
     )
 
@@ -1073,7 +1959,17 @@ def _agent_from_environment(
     except ValueError as exc:
         logger.error("skill executor misconfigured: %s", exc)
         raise SystemExit(EXIT_MISCONFIGURED) from exc
+    try:
+        services = RunServicesSource.from_environment(os.environ)
+    except ValueError as exc:
+        logger.error("test services misconfigured: %s", exc)
+        raise SystemExit(EXIT_MISCONFIGURED) from exc
     pool = _workspace_pool_from_env()
+    try:
+        hook = hook_from_environment()
+    except ValueError as exc:
+        logger.error("publish hook misconfigured: %s", exc)
+        raise SystemExit(EXIT_MISCONFIGURED) from exc
     drain = os.environ.get("CONTROL_PLANE_AGENT_DRAIN_SECONDS")
     return Agent(
         client,
@@ -1081,6 +1977,7 @@ def _agent_from_environment(
         skills=skills,
         supervision=SupervisionSettings.from_environment(),
         workspaces=pool,
+        services=services,
         runtime_dir=_runtime_dir_from_env(pool),
         workspace_id=os.environ.get("CONTROL_PLANE_AGENT_WORKSPACE") or None,
         project_id=os.environ.get("CONTROL_PLANE_AGENT_PROJECT") or None,
@@ -1088,6 +1985,8 @@ def _agent_from_environment(
         only_assigned=os.environ.get("CONTROL_PLANE_AGENT_ONLY_ASSIGNED") == "1",
         poll_interval=float(os.environ.get("CONTROL_PLANE_AGENT_POLL", "5")),
         drain_seconds=float(drain) if drain else None,
+        publish_hook=hook,
+        checks=os.environ.get("CONTROL_PLANE_AGENT_CHECKS") == "1",
     )
 
 

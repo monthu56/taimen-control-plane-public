@@ -215,9 +215,12 @@ async def test_the_registry_identity_itself_is_not_rebound_through_iam_bindings(
     assert after == before
     assert after["permissions"] == ["events.read", "tasks.read"]
     assert len(await _events(client, admin_key, "iam_binding.updated")) == 0
-    # The way that stays: the idempotent link of the same identity.
+    # The way that stays: the idempotent link of the same identity, which
+    # changes nothing while the binding is active.
     relinked = await _link(client, admin_key, agent=KEY, **first)
     assert relinked.status_code == 200, relinked.text
+    assert (await _bindings(client, admin_key, principal_id))[first["iamPrincipalId"]] == after
+    assert len(await _events(client, admin_key, "iam_binding.updated")) == 0
 
 
 async def test_a_revoked_registry_identity_is_not_reopened_by_an_admin(
@@ -234,6 +237,103 @@ async def test_a_revoked_registry_identity_is_not_reopened_by_an_admin(
     refused = await _upsert(client, admin_key, principal_id, first, ["events.read", "tasks.read"])
     assert refused.status_code == 409, refused.text
     assert refused.json()["error"]["code"] == "agent_identity_conflict"
+    assert (await _bindings(client, admin_key, principal_id))[first["iamPrincipalId"]][
+        "status"
+    ] == "revoked"
+
+
+async def _revoke_registry_binding(
+    client: httpx.AsyncClient, admin_key: str, principal_id: str, body: dict[str, Any]
+) -> str:
+    binding_id: str = (await _bindings(client, admin_key, principal_id))[body["iamPrincipalId"]][
+        "id"
+    ]
+    revoked = await client.post(
+        f"/api/v1/iam-bindings/{binding_id}:revoke", headers=auth(admin_key)
+    )
+    assert revoked.status_code == 200, revoked.text
+    return binding_id
+
+
+async def test_link_of_the_same_identity_reopens_a_revoked_registry_binding(
+    client: httpx.AsyncClient, sync_engine: Engine
+) -> None:
+    """The way back after E4 (TASK-001203): ``PUT …/identity`` with the same identity.
+
+    The binding comes back with the rights of the current revision, whatever
+    it held when it was shut, and the journal says so as ``iam-bindings``
+    would; a repeat changes nothing more.
+    """
+    admin_key, principal_id, first = await _service(client)
+    binding_id = await _revoke_registry_binding(client, admin_key, principal_id, first)
+    # Rights beside the revision, left on the shut row: they do not come back.
+    with sync_engine.begin() as conn:
+        conn.execute(
+            text(
+                "UPDATE iam_principal_bindings SET permissions = "
+                '\'["events.read", "principals.write", "tasks.read"]\' WHERE id = :id'
+            ),
+            {"id": binding_id},
+        )
+
+    reopened = await _link(client, admin_key, agent=KEY, **first)
+    assert reopened.status_code == 200, reopened.text
+    assert reopened.json()["principalId"] == principal_id
+
+    binding = (await _bindings(client, admin_key, principal_id))[first["iamPrincipalId"]]
+    assert binding["id"] == binding_id
+    assert binding["status"] == "active"
+    assert binding["revokedAt"] is None
+    assert binding["permissions"] == ["events.read", "tasks.read"]
+    updated = await _events(client, admin_key, "iam_binding.updated")
+    assert len(updated) == 1
+    assert updated[0]["entityId"] == binding_id
+    assert updated[0]["payload"] == {
+        "principalId": principal_id,
+        "issuer": first["issuer"],
+        "iamTenantId": first["iamTenantId"],
+        "iamPrincipalId": first["iamPrincipalId"],
+        "permissions": ["events.read", "tasks.read"],
+    }
+    # Only the binding: no second principal, no second binding.
+    assert len(await _events(client, admin_key, "principal.created")) == 1
+    assert len(await _bindings(client, admin_key, principal_id)) == 1
+
+    again = await _link(client, admin_key, agent=KEY, **first)
+    assert again.status_code == 200, again.text
+    assert len(await _events(client, admin_key, "iam_binding.updated")) == 1
+
+
+async def test_link_does_not_reopen_the_binding_of_a_non_active_principal(
+    client: httpx.AsyncClient, sync_engine: Engine
+) -> None:
+    admin_key, principal_id, first = await _service(client)
+    await _revoke_registry_binding(client, admin_key, principal_id, first)
+    with sync_engine.begin() as conn:
+        conn.execute(
+            text("UPDATE principals SET status = 'disabled' WHERE id = :id"),
+            {"id": principal_id},
+        )
+
+    refused = await _link(client, admin_key, agent=KEY, **first)
+    assert refused.status_code == 422, refused.text
+    assert refused.json()["error"]["code"] == "principal_not_active"
+    assert (await _bindings(client, admin_key, principal_id))[first["iamPrincipalId"]][
+        "status"
+    ] == "revoked"
+    assert await _events(client, admin_key, "iam_binding.updated") == []
+
+
+async def test_link_of_another_identity_does_not_reopen_the_revoked_one(
+    client: httpx.AsyncClient,
+) -> None:
+    admin_key, principal_id, first = await _service(client)
+    await _revoke_registry_binding(client, admin_key, principal_id, first)
+
+    for other in (identity(), {**first, "iamTenantId": str(uuid.uuid4())}):
+        refused = await _link(client, admin_key, agent=KEY, **other)
+        assert refused.status_code == 409, refused.text
+        assert refused.json()["error"]["code"] == "agent_identity_conflict"
     assert (await _bindings(client, admin_key, principal_id))[first["iamPrincipalId"]][
         "status"
     ] == "revoked"

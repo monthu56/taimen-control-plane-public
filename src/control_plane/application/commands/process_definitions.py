@@ -9,6 +9,9 @@ against the tenant's catalog (skills, task types, agents, calendars, the
 versions already published); any error refuses it with ``422
 invalid_process`` and every finding in ``details.problems``, warnings are kept
 with the version. Each new version leaves ``process.definition_published``.
+A new version runs under the latest engine revision
+(:data:`process_engine.ENGINE_REVISION`); versions published before keep the
+one they were published with (CP-ADR-0074, amendment 2026-09-29).
 
 A process of a workspace (``spec.workspaceId``) is written and read under the
 permissions on that workspace, one without it on the tenant.
@@ -18,7 +21,7 @@ import uuid
 from dataclasses import dataclass
 from typing import Any
 
-from sqlalchemy import Select, func, or_, select, tuple_, update
+from sqlalchemy import Select, func, or_, select, tuple_
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from control_plane.application.authorization import (
@@ -27,9 +30,21 @@ from control_plane.application.authorization import (
     authorize,
     visible_objects,
 )
+from control_plane.application.commands.catalog_retirements import (
+    CALENDAR,
+    PROCESS,
+    is_retired,
+    lock_key,
+    restore_key,
+    retire_key,
+    retired_keys,
+    retirement,
+    retirements,
+    share_keys,
+)
 from control_plane.application.commands.work_rules import check_identity, ensure_consumer_cursor
 from control_plane.application.common import new_uuid, utcnow
-from control_plane.application.events import record_event
+from control_plane.application.events import event_reason, record_event
 from control_plane.application.queries.package_links import in_package
 from control_plane.domain.enums import Permission
 from control_plane.domain.errors import ConflictError, NotFoundError, ValidationError
@@ -44,18 +59,22 @@ from control_plane.domain.process_definition import (
     normalized_spec,
     references,
 )
+from control_plane.domain.process_engine import ENGINE_REVISION
 from control_plane.infrastructure.db.models import (
     Agent,
     ArtifactType,
     CalendarVersion,
-    PackageObject,
+    CatalogRetirement,
     ProcessDefinition,
+    ProcessInstance,
     Skill,
     TaskType,
 )
 
 # The journal consumer of the process engine (event_consumer_cursors.name).
 PROCESSES_CONSUMER = "processes"
+# Instances that still run on their version (process_engine.RUNNING, SUSPENDED).
+OPEN_STATUSES = ("running", "suspended")
 
 
 @dataclass(frozen=True)
@@ -65,6 +84,7 @@ class ProcessDefinitionView:
     row: ProcessDefinition
     latest_version: int
     created: bool = False
+    retirement: CatalogRetirement | None = None
 
 
 def process_scope(workspace_id: uuid.UUID | None) -> ResourceRef | None:
@@ -95,11 +115,7 @@ def _workspace_of(spec: dict[str, Any]) -> uuid.UUID | None:
 
 async def _lock_key(session: AsyncSession, tenant_id: uuid.UUID, key: str) -> None:
     """Serialize publication for one (tenant, key): versions are compared in order."""
-    await session.execute(
-        select(
-            func.pg_advisory_xact_lock(func.hashtextextended(f"cp:process:{tenant_id}:{key}", 0))
-        )
-    )
+    await lock_key(session, tenant_id, PROCESS, key)
 
 
 async def _latest(
@@ -127,6 +143,24 @@ async def _version(
     return row
 
 
+async def engine_revision_for(
+    session: AsyncSession, tenant_id: uuid.UUID, key: str, spec: dict[str, Any]
+) -> int:
+    """The engine revision ``spec`` runs under once :func:`publish_process_definition` takes it.
+
+    A spec equal to the published ``key@version`` is not published again: the
+    publication returns that version, and it runs under the revision of its
+    record. Any other spec becomes a new version under the latest revision.
+    ``spec`` is in the stored form (:func:`normalized_spec`).
+    """
+    version = spec.get("version")
+    if isinstance(version, int):
+        row = await _version(session, tenant_id, key, version)
+        if row is not None and row.definition_hash == definition_hash(spec):
+            return row.engine_revision
+    return ENGINE_REVISION
+
+
 async def previous_version(
     session: AsyncSession, tenant_id: uuid.UUID, key: str, version: Any
 ) -> ProcessDefinition | None:
@@ -150,11 +184,14 @@ async def load_catalog(
     previous: ProcessDefinition | None,
     *,
     history_key: str | None = None,
+    retired: bool = True,
 ) -> Catalog:
     """What the tenant's catalog holds of the keys ``spec`` names.
 
     ``history_key`` — the key whose versions the ``from`` side of the
     migration maps names: the old key of a process a package renames.
+    ``retired=False`` — a version already published is compiled to run: the
+    keys it names that were retired since do not stop its open instances.
     """
     refs = references(spec)
     skills: dict[str, SkillEntry] = {}
@@ -196,6 +233,7 @@ async def load_catalog(
         ),
         refs.calendars,
     )
+    calendars_with_hours = await _calendars_with_hours(session, tenant_id, refs.calendars)
     artifact_types = await _keys(
         session,
         select(ArtifactType.key).where(
@@ -220,15 +258,23 @@ async def load_catalog(
             )
         ):
             versions[row.version] = row.spec
+    retired_calendars: frozenset[str] = frozenset()
+    retired_processes: frozenset[str] = frozenset()
+    if retired:
+        retired_calendars = await retired_keys(session, tenant_id, CALENDAR, refs.calendars)
+        retired_processes = await retired_keys(session, tenant_id, PROCESS, refs.processes)
     return Catalog(
         skills=skills,
         task_types=task_types,
         agents=agents,
         calendars=calendars,
+        calendars_with_hours=calendars_with_hours,
         artifact_types=artifact_types,
         processes=processes,
         previous=previous.spec if previous is not None else None,
         versions=versions,
+        retired_calendars=retired_calendars,
+        retired_processes=retired_processes - {key},
     )
 
 
@@ -236,6 +282,32 @@ async def _keys(session: AsyncSession, stmt: Select[Any], wanted: frozenset[str]
     if not wanted:
         return frozenset()
     return frozenset((await session.scalars(stmt.distinct())).all())
+
+
+async def _calendars_with_hours(
+    session: AsyncSession, tenant_id: uuid.UUID, wanted: frozenset[str]
+) -> frozenset[str]:
+    """Keys of ``wanted`` whose latest version declares ``workingHours`` (CP-ADR-0078 §2)."""
+    if not wanted:
+        return frozenset()
+    latest = (
+        select(CalendarVersion.key, func.max(CalendarVersion.version).label("version"))
+        .where(CalendarVersion.tenant_id == tenant_id, CalendarVersion.key.in_(wanted))
+        .group_by(CalendarVersion.key)
+        .subquery()
+    )
+    stmt = (
+        select(CalendarVersion.key)
+        .join(
+            latest,
+            (CalendarVersion.key == latest.c.key) & (CalendarVersion.version == latest.c.version),
+        )
+        .where(
+            CalendarVersion.tenant_id == tenant_id,
+            CalendarVersion.spec.has_key("workingHours"),
+        )
+    )
+    return frozenset((await session.scalars(stmt)).all())
 
 
 def _normalized(spec: Any) -> dict[str, Any]:
@@ -302,6 +374,8 @@ async def publish_process_definition(
     previous = latest
     if latest is None and renamed_from is not None:
         previous = await _latest(session, ctx.tenant_id, renamed_from)
+    # A calendar being retired is not named meanwhile (calendar_in_use, Zh3).
+    await share_keys(session, ctx.tenant_id, CALENDAR, references(body).calendars)
     catalog = await load_catalog(
         session,
         ctx.tenant_id,
@@ -331,21 +405,13 @@ async def publish_process_definition(
         spec=body,
         governed_by=list(checked.governed_by),
         warnings=[p.out() for p in checked.warnings],
+        engine_revision=ENGINE_REVISION,
         created_by=ctx.principal_id,
         created_at=utcnow(),
     )
     session.add(row)
-    # A new version brings back a key a package renamed away.
-    await session.execute(
-        update(PackageObject)
-        .where(
-            PackageObject.tenant_id == ctx.tenant_id,
-            PackageObject.kind == "Process",
-            PackageObject.key == key,
-            PackageObject.retired_at.is_not(None),
-        )
-        .values(retired_at=None)
-    )
+    # A new version brings a retired key back into use (Zh1).
+    await restore_key(session, ctx.tenant_id, PROCESS, key)
     await session.flush()
     # The engine reads the journal from the first published process on.
     await ensure_consumer_cursor(session, ctx.tenant_id, PROCESSES_CONSUMER)
@@ -402,7 +468,8 @@ async def resolve_process_definition(
     if row is None:
         raise not_found
     await _readable(ctx, row)
-    return ProcessDefinitionView(row, latest.version)
+    retired = await retirements(session, ctx.tenant_id, PROCESS, [key])
+    return ProcessDefinitionView(row, latest.version, retirement=retired.get(key))
 
 
 async def list_process_definitions(
@@ -415,10 +482,12 @@ async def list_process_definitions(
     workspace_id: uuid.UUID | None = None,
     governed_by: str | None = None,
     package: str | None = None,
+    status: str | None = None,
 ) -> tuple[list[ProcessDefinitionView], str | None]:
     """The latest version of every key the caller may read, by key.
 
-    ``governedBy`` keeps the processes whose latest version names the document.
+    ``governedBy`` keeps the processes whose latest version names the document;
+    ``status`` — only keys in use (``active``) or only retired ones (Zh1).
     """
     await authorize(ctx, Permission.PROCESSES_READ)
     latest = (
@@ -454,6 +523,12 @@ async def list_process_definitions(
         stmt = stmt.where(
             in_package("Process", ProcessDefinition.tenant_id, ProcessDefinition.key, package)
         )
+    if status is not None:
+        stmt = stmt.where(
+            is_retired(PROCESS, ProcessDefinition.tenant_id, ProcessDefinition.key)
+            if status == "retired"
+            else ~is_retired(PROCESS, ProcessDefinition.tenant_id, ProcessDefinition.key)
+        )
     if after_key is not None:
         stmt = stmt.where(ProcessDefinition.key > after_key)
     rows = list(
@@ -463,7 +538,11 @@ async def list_process_definitions(
     if len(rows) > limit:
         rows = rows[:limit]
         next_key = rows[-1].key
-    return [ProcessDefinitionView(row, row.version) for row in rows], next_key
+    retired = await retirements(session, ctx.tenant_id, PROCESS, [row.key for row in rows])
+    views = [
+        ProcessDefinitionView(row, row.version, retirement=retired.get(row.key)) for row in rows
+    ]
+    return views, next_key
 
 
 async def list_process_versions(
@@ -494,4 +573,94 @@ async def list_process_versions(
     if len(rows) > limit:
         rows = rows[:limit]
         next_version = rows[-1].version
-    return [ProcessDefinitionView(row, latest.version) for row in rows], next_version
+    retired = (await retirements(session, ctx.tenant_id, PROCESS, [key])).get(key)
+    views = [ProcessDefinitionView(row, latest.version, retirement=retired) for row in rows]
+    return views, next_version
+
+
+# --- retirement (CP-ADR-0074, amendment Zh2) ------------------------------------------------
+
+
+@dataclass(frozen=True)
+class ProcessRetirementView:
+    key: str
+    retirement: CatalogRetirement
+    by_version: list[tuple[int, int]]
+
+    @property
+    def open_instances(self) -> int:
+        return sum(count for _, count in self.by_version)
+
+
+async def open_instances_by_version(
+    session: AsyncSession, tenant_id: uuid.UUID, key: str
+) -> list[tuple[int, int]]:
+    """Open (running, suspended) instances of every workspace of the key, by version."""
+    rows = await session.execute(
+        select(ProcessInstance.definition_version, func.count())
+        .where(
+            ProcessInstance.tenant_id == tenant_id,
+            ProcessInstance.definition_key == key,
+            ProcessInstance.status.in_(OPEN_STATUSES),
+        )
+        .group_by(ProcessInstance.definition_version)
+        .order_by(ProcessInstance.definition_version)
+    )
+    return [(int(version), int(count)) for version, count in rows.all()]
+
+
+async def retire_process_definition(
+    session: AsyncSession, ctx: AuthContext, *, key: str, reason: str, dry_run: bool = False
+) -> ProcessRetirementView:
+    """Every version of the key is retired: no new instances, open ones run to the end.
+
+    A key already retired answers with its first retirement and writes nothing;
+    ``dry_run`` makes the same checks and the same answer without writing.
+    """
+    await authorize(ctx, Permission.PROCESSES_WRITE)
+    await _lock_key(session, ctx.tenant_id, key)
+    latest = await _latest(session, ctx.tenant_id, key)
+    if latest is None:
+        raise NotFoundError("Process definition not found", details={"process": key})
+    await authorize(ctx, Permission.PROCESSES_WRITE, resource=process_scope(latest.workspace_id))
+    by_version = await open_instances_by_version(session, ctx.tenant_id, key)
+    existing = await retirement(session, ctx.tenant_id, PROCESS, key)
+    if existing is not None:
+        return ProcessRetirementView(key, existing, by_version)
+    text = event_reason(reason)
+    if dry_run:
+        planned = CatalogRetirement(
+            tenant_id=ctx.tenant_id,
+            kind=PROCESS,
+            key=key,
+            retired_at=utcnow(),
+            retired_by=ctx.principal_id,
+            reason=text,
+        )
+        return ProcessRetirementView(key, planned, by_version)
+    row = await retire_key(
+        session, ctx.tenant_id, PROCESS, key, by=ctx.principal_id, reason=text, at=utcnow()
+    )
+    view = ProcessRetirementView(key, row, by_version)
+    await record_event(
+        session,
+        tenant_id=ctx.tenant_id,
+        event_type="process.definition_retired",
+        entity_type="process_definition",
+        entity_id=latest.id,
+        actor_id=ctx.principal_id,
+        request_id=ctx.request_id,
+        correlation_id=ctx.correlation_id,
+        trace_run_id=ctx.trace_run_id,
+        payload={
+            "key": key,
+            "latestVersion": latest.version,
+            "workspaceId": str(latest.workspace_id) if latest.workspace_id else None,
+            "reason": text,
+            "openInstances": view.open_instances,
+            "byVersion": [
+                {"version": version, "openInstances": count} for version, count in by_version
+            ],
+        },
+    )
+    return view

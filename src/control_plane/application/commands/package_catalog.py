@@ -47,6 +47,7 @@ from control_plane.application.commands import task_types as task_type_commands
 from control_plane.application.commands import work_rules as rule_commands
 from control_plane.domain.agent_instructions import validate_instructions
 from control_plane.domain.enums import AgentStatus, TaskTypeStatus
+from control_plane.domain.errors import DomainError
 from control_plane.domain.package_plan import PLANNED_KINDS, canonical_hash
 from control_plane.domain.package_source import PackageObject
 from control_plane.domain.process_definition import Problem
@@ -359,6 +360,19 @@ def static_problems(
                 )
             ]
     return []
+
+
+def finding(exc: DomainError, severity: str = "error") -> Problem:
+    """A refusal of a command as a finding of the object it was about."""
+    details = exc.details or {}
+    where = details.get("path") or details.get("field")
+    path = ""
+    if isinstance(where, str) and where:
+        where = where.removeprefix("$.").removeprefix("spec.").removeprefix("spec")
+        path = "/spec" + "".join(
+            "/" + part for part in where.replace("[", ".").replace("]", "").split(".") if part
+        )
+    return Problem(exc.code, severity, path, exc.message)
 
 
 # --- publication -----------------------------------------------------------------------------

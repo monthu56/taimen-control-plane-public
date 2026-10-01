@@ -34,14 +34,12 @@ jobs:
         with:
           enable-cache: true
           cache-dependency-glob: control-plane/uv.lock
-      - run: uv sync --frozen
+      # The same make targets the runner daemon calls (.agents/runner.yaml).
+      - run: make install
       - name: ruff
-        run: |
-          uv run ruff check .
-          uv run ruff format --check .
-      # No path: [tool.mypy] packages covers src/ and client/src.
+        run: make lint
       - name: mypy
-        run: uv run mypy
+        run: make typecheck
 
   checks:
     if: github.event_name == 'workflow_dispatch' || github.ref_type == 'tag'
@@ -78,13 +76,11 @@ jobs:
           enable-cache: true
           cache-dependency-glob: control-plane/uv.lock
       - name: Install dependencies
-        run: uv sync --frozen
+        run: make install
       - name: Lint
-        run: |
-          uv run ruff check .
-          uv run ruff format --check .
+        run: make lint
       - name: Type check
-        run: uv run mypy
+        run: make typecheck
       # S3-compatible store for the ContentStore contract test (CP-ADR-0072).
       # A step, not a service: the MinIO image needs a command line.
       # The upstream Docker Hub image is gone; the Chainguard image is pinned by digest
@@ -108,7 +104,7 @@ jobs:
           CP_TEST_S3_ENDPOINT_URL: http://localhost:9000
           CP_TEST_S3_ACCESS_KEY_ID: minioadmin
           CP_TEST_S3_SECRET_ACCESS_KEY: minioadmin
-        run: uv run pytest -q
+        run: make test PYTEST_ARGS=-q
 
   docker:
     if: github.event_name == 'workflow_dispatch' || github.ref_type == 'tag'

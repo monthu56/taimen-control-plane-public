@@ -12,7 +12,10 @@ started on; the engine (:mod:`control_plane.domain.process_engine`) owns its
    approvals, skill calls, events, timer rows — with the authority of the
    process's identity agent (CP-ADR-0074 §14), each in a savepoint;
 4. the journal entry (input, decisions, intents with what became of them) and
-   the new state are written in the same transaction: all of it or nothing.
+   the new state are written in the same transaction: all of it or nothing;
+5. the waiting steps the step opened and closed are ``process.step_entered``
+   and ``process.step_exited`` of the core journal, in the same transaction
+   (:mod:`control_plane.domain.process_steps`, CP-ADR-0074 §13 amendment).
 
 A command that refuses an intent opening work (a task, approvals, a skill
 call, a nested process) is the engine's next input ``intent_failed``: the
@@ -49,8 +52,8 @@ of memory are read from it, memory is never asked.
 import json
 import logging
 import uuid
-from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass
+from collections.abc import Callable, Iterable, Mapping, Sequence
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -69,6 +72,12 @@ from control_plane.application.commands.approval_outcomes import (
     require_active_credential,
 )
 from control_plane.application.commands.approvals import cancel_approval, request_approval
+from control_plane.application.commands.catalog_retirements import (
+    PROCESS,
+    retired_keys,
+    share_keys,
+    share_keys_now,
+)
 from control_plane.application.commands.eligibility import RequirementSpec
 from control_plane.application.commands.observations import record_observation
 from control_plane.application.commands.process_definitions import (
@@ -94,7 +103,7 @@ from control_plane.application.queries.recall import (
 )
 from control_plane.config import Settings
 from control_plane.domain import process_engine as engine
-from control_plane.domain import process_replay
+from control_plane.domain import process_replay, process_sla, process_steps
 from control_plane.domain.calendar import Calendar
 from control_plane.domain.enums import ApprovalStatus, Permission, SkillInvocationStatus
 from control_plane.domain.errors import (
@@ -114,7 +123,6 @@ from control_plane.infrastructure.db.models import (
     CalendarVersion,
     EventConsumerCursor,
     ExternalReference,
-    PackageObject,
     Principal,
     ProcessDefinition,
     ProcessInstance,
@@ -181,9 +189,14 @@ async def definition_of(session: AsyncSession, row: ProcessDefinition) -> engine
     cached = _definitions.get(row.id)
     if cached is not None:
         return cached
-    catalog = await load_catalog(session, row.tenant_id, row.key, row.spec, None)
+    catalog = await load_catalog(session, row.tenant_id, row.key, row.spec, None, retired=False)
+    # A calendar that dropped its working hours after publication fails the
+    # due it counts (process.sla_failed, CP-ADR-0078 §3), not the version.
+    catalog = replace(catalog, calendars_with_hours=None)
     try:
-        definition = engine.Definition.build(row.key, row.spec, catalog)
+        definition = engine.Definition.build(
+            row.key, row.spec, catalog, engine_revision=row.engine_revision
+        )
     except engine.DefinitionError as exc:
         # Published versions pass the check; one that no longer does lost a
         # skill, a task type or its agent from the catalog after publication.
@@ -195,22 +208,53 @@ async def definition_of(session: AsyncSession, row: ProcessDefinition) -> engine
                 "problems": [p.out() for p in exc.problems],
             },
         ) from exc
+    except engine.EngineError as exc:
+        # A revision this code does not know: the version was published by a
+        # newer release, and the code was rolled back since.
+        raise ConflictError(
+            "process_definition_unusable",
+            f"Process {row.key}@{row.version} cannot run: {exc}",
+            details={
+                "process": f"{row.key}@{row.version}",
+                "problems": [],
+                "engineRevision": row.engine_revision,
+            },
+        ) from exc
     if len(_definitions) >= _DEFINITION_CACHE_SIZE:
         _definitions.pop(next(iter(_definitions)))
     _definitions[row.id] = definition
     return definition
 
 
-async def _calendars_of(
-    session: AsyncSession, row: ProcessDefinition
+async def calendars_named(
+    session: AsyncSession,
+    tenant_id: uuid.UUID,
+    spec: Mapping[str, Any],
+    *,
+    own: Mapping[str, Calendar] | None = None,
 ) -> tuple[dict[str, Calendar], dict[str, int]]:
-    """The latest versions of the calendars the process names, and their numbers."""
-    keys = sorted(references(row.spec).calendars)
+    """The calendars a process spec names: their latest versions, and the numbers of those.
+
+    ``own`` stand for their keys instead of the latest versions and have no
+    number: calendars not published yet, as the apply of a package plan will
+    publish them.
+    """
+    own = own or {}
+    keys = set(references(spec).calendars)
+    calendars, versions = await latest_calendar_versions(session, tenant_id, keys - set(own))
+    calendars.update({key: calendar for key, calendar in own.items() if key in keys})
+    return calendars, versions
+
+
+async def latest_calendar_versions(
+    session: AsyncSession, tenant_id: uuid.UUID, keys: set[str]
+) -> tuple[dict[str, Calendar], dict[str, int]]:
+    """The latest published versions of the calendars ``keys``, and their numbers."""
     if not keys:
         return {}, {}
     latest = (
         select(CalendarVersion.key, func.max(CalendarVersion.version).label("version"))
-        .where(CalendarVersion.tenant_id == row.tenant_id, CalendarVersion.key.in_(keys))
+        .where(CalendarVersion.tenant_id == tenant_id, CalendarVersion.key.in_(sorted(keys)))
         .group_by(CalendarVersion.key)
         .subquery()
     )
@@ -220,7 +264,7 @@ async def _calendars_of(
             latest,
             (CalendarVersion.key == latest.c.key) & (CalendarVersion.version == latest.c.version),
         )
-        .where(CalendarVersion.tenant_id == row.tenant_id)
+        .where(CalendarVersion.tenant_id == tenant_id)
     )
     calendars: dict[str, Calendar] = {}
     versions: dict[str, int] = {}
@@ -301,6 +345,36 @@ def engine_time(instance: ProcessInstance | None, at: datetime) -> datetime:
     return max(at, clock) if clock is not None else at
 
 
+def _excluded_principals(body: Mapping[str, Any]) -> list[str]:
+    """``excludedPrincipals`` of a step as principal ids, in their canonical text.
+
+    A value that is not a principal id — an empty one (``null``, ``""``) too —
+    cannot be enforced by the core, and an exclusion is never dropped silently
+    (CP-ADR-0074 §7): the step is refused. Only a step without
+    ``separationOfDuties`` gives none.
+    """
+    if "excludedPrincipals" not in body:
+        return []
+    listed = body["excludedPrincipals"]
+    if not isinstance(listed, list):
+        raise ValidationError(
+            "invalid_approval", "separationOfDuties must give a list of principal ids"
+        )
+    excluded: list[str] = []
+    for value in listed:
+        try:
+            principal_id = uuid.UUID(str(value))
+        except ValueError:
+            raise ValidationError(
+                "invalid_approval",
+                "separationOfDuties names a value that is not a principal id",
+                details={"value": str(value)[:200]},
+            ) from None
+        if str(principal_id) not in excluded:
+            excluded.append(str(principal_id))
+    return excluded
+
+
 def _event_uuid(value: Any) -> uuid.UUID | None:
     try:
         return uuid.UUID(str(value)) if value else None
@@ -338,7 +412,7 @@ async def take(
     follow_ups = 0
     while pending:
         kind, body, ref = pending.pop(0)
-        calendars, versions = await _calendars_of(session, row)
+        calendars, versions = await calendars_named(session, row.tenant_id, row.spec)
         given = engine.Input(
             kind,
             engine_time(instance, at),
@@ -346,7 +420,8 @@ async def take(
             str(actor_id) if actor_id else None,
             calendars,
         )
-        state, decisions, intents = engine.step(definition, instance.state or None, given)
+        before = instance.state or None
+        state, decisions, intents = engine.step(definition, before, given)
         seq = int(state["seq"])
         record = ProcessInstanceEvent(
             instance_id=instance.id,
@@ -372,6 +447,7 @@ async def take(
         session.add(record)
         _store(instance, state)
         await session.flush()
+        await _record_steps(session, instance, definition, before, record, acting)
         for index, failure in enumerate(executor.failures):
             follow_ups += 1
             if follow_ups > MAX_FOLLOW_UPS:
@@ -384,6 +460,59 @@ async def take(
     return True
 
 
+async def _record_steps(
+    session: AsyncSession,
+    instance: ProcessInstance,
+    definition: engine.Definition,
+    before: Mapping[str, Any] | None,
+    record: ProcessInstanceEvent,
+    acting: _Acting,
+) -> None:
+    """``process.step_entered``/``step_exited`` of one step (CP-ADR-0074 §13, amendment).
+
+    A projection of the journal record just written, not a decision of the
+    engine: activities that appeared and disappeared in the step, with the
+    tasks, approvals and calls the executed intents opened. The attempt
+    counters are the application's (``step_attempts``), and so is the attempt
+    each open activity entered with (``refs["activity:<id>"]``). A redelivered input
+    never gets here — ``(instance, source_ref)`` was taken — so a step is
+    reported once. The events act as the process, except a ``withdrawn``
+    exit: its actor is the participant who cancelled the work, the actor of
+    the input (``record.actor_id``).
+    """
+    projection = process_steps.step_events(
+        definition,
+        instance_id=str(instance.id),
+        before=before,
+        after=instance.state,
+        decisions=record.decisions,
+        given=record.input,
+        at=record.at,
+        attempts=instance.step_attempts or {},
+        refs=instance.refs or {},
+    )
+    if projection.attempts != (instance.step_attempts or {}):
+        instance.step_attempts = projection.attempts
+    if projection.refs != (instance.refs or {}):
+        instance.refs = projection.refs
+    workspace = instance.workspace_id
+    correlation = f"{CORRELATION_PREFIX}{instance.id}"
+    process = acting.ctx.principal_id if acting.ctx else None
+    for event in projection.events:
+        await record_event(
+            session,
+            tenant_id=instance.tenant_id,
+            event_type=event.type,
+            entity_type="process_instance",
+            entity_id=instance.id,
+            actor_id=record.actor_id if process_steps.withdrawn(event) else process,
+            request_id=correlation,
+            correlation_id=correlation,
+            trace_run_id=acting.ctx.trace_run_id if acting.ctx else None,
+            payload={**event.payload, "workspaceId": str(workspace) if workspace else None},
+        )
+
+
 def _store(instance: ProcessInstance, state: dict[str, Any]) -> None:
     now = utcnow()
     instance.state = state
@@ -394,6 +523,19 @@ def _store(instance: ProcessInstance, state: dict[str, Any]) -> None:
     instance.updated_at = now
     if instance.status in engine.CLOSED and instance.completed_at is None:
         instance.completed_at = now
+    # The earliest running deadline and warning, for the slaState filter (CP-ADR-0078 §6):
+    # a deadline whose timer is frozen counts no more than a closed instance does.
+    due_at = warn_at = None
+    if instance.status not in engine.CLOSED:
+        due_at, warn_at = process_sla.open_moments(_deadlines(state), state.get("timers") or {})
+    instance.sla_due_at = due_at
+    instance.sla_warn_at = warn_at
+
+
+def _deadlines(state: Mapping[str, Any]) -> list[Any]:
+    """The deadline records of an instance: of the process and of its open steps."""
+    activities = state.get("activities") or {}
+    return [state.get("sla"), *(activity.get("sla") for activity in activities.values())]
 
 
 # --- memory ------------------------------------------------------------------------
@@ -597,18 +739,33 @@ class _Executor:
         return None, []
 
     async def link(self, item: Mapping[str, Any]) -> tuple[Any, list[str]]:
+        await self.resolve(item, field="assign")
+        if item.get("principal"):
+            return uuid.UUID(str(item["principal"])), []
+        if item.get("agent"):
+            return f"agent:{item['agent']}", []
+        return None, [str(item["role"])]
+
+    async def resolve(
+        self, item: Mapping[str, Any], *, field: str
+    ) -> tuple[uuid.UUID | None, uuid.UUID | None]:
+        """A candidate of a chain as ``(principal, role)`` ids; raises when it names none.
+
+        A principal of this tenant, the principal of an active agent, or a role
+        of the instance's workspace (a tenant-wide one without it).
+        """
         if item.get("principal"):
             principal_id = uuid.UUID(str(item["principal"]))
             found = await self.session.get(Principal, principal_id)
             if found is None or found.tenant_id != self.instance.tenant_id:
                 raise ValueError("unknown principal")
-            return principal_id, []
+            return principal_id, None
         if item.get("agent"):
             reference = f"agent:{item['agent']}"
-            await agent_principal(self.session, self.instance.tenant_id, reference, field="assign")
-            return reference, []
-        await self.role_id(str(item.get("role")))
-        return None, [str(item["role"])]
+            return await agent_principal(
+                self.session, self.instance.tenant_id, reference, field=field
+            ), None
+        return None, await self.role_id(str(item.get("role")))
 
     async def role_id(self, slug: str) -> uuid.UUID:
         candidates = (
@@ -640,6 +797,19 @@ class _Executor:
             **(body.get("payload") or {}),
             "workspaceId": str(workspace) if workspace else None,
         }
+        if str(body["type"]).startswith(process_sla.SLA_EVENT_PREFIX):
+            payload["attempt"] = process_steps.sla_attempt(
+                payload, refs=self.refs, attempts=self.instance.step_attempts or {}
+            )
+        if body["type"] == engine.ESCALATED:
+            payload.update(await self.escalation_addressees(payload.get("to")))
+        addressees = body.get("addressees")
+        if isinstance(addressees, Mapping):
+            payload["owner"] = await self.addressee(addressees.get("owner") or ())
+            if "assignee" in addressees:
+                payload["assignee"] = await self.step_assignee(
+                    payload.get("activityId"), addressees.get("assignee") or ()
+                )
         await record_event(
             self.session,
             tenant_id=self.instance.tenant_id,
@@ -653,6 +823,97 @@ class _Executor:
             payload=payload,
         )
         return {"ok": True}
+
+    def address(
+        self, *, principal_id: uuid.UUID | None = None, role_id: uuid.UUID | None = None
+    ) -> dict[str, Any]:
+        """An addressee in the form of notification rules (CP-ADR-0078 §3).
+
+        The workspace is the instance's: a workspace process's own, or the one
+        a tenant process was started in.
+        """
+        workspace = self.instance.workspace_id
+        return {
+            "principalId": str(principal_id) if principal_id else None,
+            "roleId": str(role_id) if role_id else None,
+            "workspaceId": str(workspace) if workspace else None,
+        }
+
+    async def addressee(self, chain: Sequence[Mapping[str, Any]]) -> dict[str, Any] | None:
+        """The first resolvable candidate of a chain; ``None`` when none resolves.
+
+        An unknown role, agent or principal is not an error of the event: its
+        candidate is skipped, and a chain of such ones leaves the field empty.
+        """
+        for item in chain:
+            try:
+                principal_id, role_id = await self.resolve(item, field="addressee")
+            except (DomainError, ValueError):
+                continue
+            return self.address(principal_id=principal_id, role_id=role_id)
+        return None
+
+    async def escalation_addressees(self, targets: Any) -> dict[str, Any]:
+        """``addressees`` of ``process.escalated``: one per ``to`` target, in its order.
+
+        A target is resolved on its own, as a candidate of a chain is: a
+        principal of this tenant, the principal of an active agent, a role of
+        the instance's workspace. One that does not resolve is ``null`` there,
+        and ``unresolved`` says why; the event is recorded all the same
+        (CP-ADR-0078, amendment 2026-09-30).
+        """
+        addressees: list[dict[str, Any] | None] = []
+        unresolved: list[dict[str, Any]] = []
+        for index, target in enumerate(targets if isinstance(targets, list) else ()):
+            text = str(target) if target is not None else ""
+            try:
+                principal_id, role_id = await self.resolve(
+                    engine.assignee_of_text(text), field="to"
+                )
+            except DomainError as exc:
+                reason = exc.code
+            except ValueError:
+                reason = "unknown_principal"
+            else:
+                addressees.append(self.address(principal_id=principal_id, role_id=role_id))
+                continue
+            addressees.append(None)
+            unresolved.append({"index": index, "target": text[:200], "reason": reason})
+        return {"addressees": addressees, "unresolved": unresolved}
+
+    async def step_assignee(
+        self, activity_id: Any, chain: Sequence[Mapping[str, Any]]
+    ) -> dict[str, Any] | None:
+        """Who a step waits for now: the assignee of its open task, else its chain, else
+        its pending approver.
+
+        The task may have been reassigned past the process, or its agent
+        retired since: the chain is resolved only when the task has no
+        assignee (a task for a role).
+        """
+        task = await self.open_task(str(activity_id)) if activity_id else None
+        if task is not None and task.assignee_id is not None:
+            return self.address(principal_id=task.assignee_id)
+        return await self.addressee(chain) or await self.approver(activity_id)
+
+    async def approver(self, activity_id: Any) -> dict[str, Any] | None:
+        """Who a pending approval of an ``approve`` step waits for: its assignee."""
+        if not activity_id:
+            return None
+        ids = self.activity_refs(str(activity_id), "approval:")
+        if not ids:
+            return None
+        pending = await self.session.scalar(
+            select(Approval)
+            .where(Approval.id.in_(ids), Approval.status == ApprovalStatus.PENDING)
+            .order_by(Approval.created_at, Approval.id)
+            .limit(1)
+        )
+        if pending is None:
+            return None
+        return self.address(
+            principal_id=pending.assigned_principal_id, role_id=pending.required_role_id
+        )
 
     async def do_set_timer(self, body: dict[str, Any]) -> dict[str, Any]:
         timer_id = uuid.UUID(str(body["timerId"]))
@@ -672,6 +933,7 @@ class _Executor:
         timer.due_at = _time(body.get("dueAt"))
         timer.state = str(body["state"])
         timer.remaining_seconds = body.get("remainingSeconds")
+        timer.remaining_unit = str(body.get("remainingUnit") or "wall")
         timer.reads = list(body.get("reads") or ())
         timer.provisional = bool(body.get("provisional"))
         timer.updated_at = now
@@ -844,46 +1106,88 @@ class _Executor:
         )
         return {"ok": True, "taskId": str(task.id)}
 
+    async def do_update_task_due(self, body: dict[str, Any]) -> dict[str, Any]:
+        """The due of a step's open task, counted again by a migration (CP-ADR-0074 §11)."""
+        task = await self.open_task(str(body["activityId"]))
+        if task is None:
+            return {"ok": True, "taskId": None}
+        due = _time(body.get("due"))
+        if task.due_date != due:
+            await update_task(
+                self.session,
+                self.ctx,
+                task_ref=str(task.id),
+                expected_version=task.version,
+                due_date=due,
+            )
+        return {"ok": True, "taskId": str(task.id)}
+
     # --- approvals -------------------------------------------------------------------
 
     async def do_request_approvals(self, body: dict[str, Any]) -> dict[str, Any]:
-        if body.get("excludedPrincipals"):
-            # The core refuses a decision of an excluded principal on every
-            # path (CP-ADR-0074 §7); until it can, the step is refused rather
-            # than the exclusion dropped.
-            raise DomainError(
-                "not_implemented",
-                "Separation of duties on an approval is enforced from process-packages P008",
-                details={"adr": "CP-ADR-0074", "implementedBy": "process-packages P008"},
-            )
         approvers = list(body.get("approvers") or ())
         if not approvers:
             raise ValidationError("invalid_approval", "The step names no approvers")
+        excluded = _excluded_principals(body)
+        excluded_ids = {uuid.UUID(p) for p in excluded}
+        for approver in approvers if excluded_ids else ():
+            # Checked for every approver before any approval is asked for: a
+            # sequential step would otherwise fail at a later vote.
+            try:
+                principal_id = await self.approver_principal(approver)
+            except ValueError:
+                continue  # not a principal id: refused when its approval is asked for
+            if principal_id in excluded_ids:
+                raise ValidationError(
+                    "invalid_approval",
+                    "An approver of the step is excluded from deciding: nobody could decide",
+                    details={
+                        key: str(approver[key]) for key in ("principal", "agent") if key in approver
+                    },
+                )
         activity_id = str(body["activityId"])
         sequential = body.get("mode") == "sequential"
         first, rest = (approvers[:1], approvers[1:]) if sequential else (approvers, [])
-        self.refs[f"activity:{activity_id}"] = {
+        record: dict[str, Any] = {
             "element": body.get("element"),
             "pending": rest,
             "total": len(approvers),
             "cancelled": 0,
         }
+        if excluded:
+            # The exclusion holds for every approver of the step, the next ones
+            # of a sequential step too; the owner is who hears when nobody may
+            # decide (CP-ADR-0074 §7).
+            record["excluded"] = excluded
+            record["owner"] = await self.owner()
+        self.refs[f"activity:{activity_id}"] = record
         ids = [await self.request_one(activity_id, body.get("element"), a) for a in first]
         return {"ok": True, "approvalIds": ids}
 
-    async def request_one(self, activity_id: str, element: Any, approver: Mapping[str, Any]) -> str:
-        role_id = principal_id = None
+    async def owner(self) -> dict[str, Any] | None:
+        """The process owner as an addressee: the first resolvable candidate of ``spec.owner``."""
+        definition = await definition_of(self.session, self.row)
+        return await self.addressee(engine.owner_chain(definition, self.state, self.at))
+
+    async def approver_principal(self, approver: Mapping[str, Any]) -> uuid.UUID | None:
+        """The principal an approver names (``principal`` or ``agent:<key>``); none for a role."""
         if approver.get("role"):
-            role_id = await self.role_id(str(approver["role"]))
-        elif approver.get("agent"):
-            principal_id = await agent_principal(
+            return None
+        if approver.get("agent"):
+            return await agent_principal(
                 self.session,
                 self.instance.tenant_id,
                 f"agent:{approver['agent']}",
                 field="approvers",
             )
-        else:
-            principal_id = uuid.UUID(str(approver.get("principal")))
+        return uuid.UUID(str(approver.get("principal")))
+
+    async def request_one(self, activity_id: str, element: Any, approver: Mapping[str, Any]) -> str:
+        role_id = None
+        if approver.get("role"):
+            role_id = await self.role_id(str(approver["role"]))
+        principal_id = await self.approver_principal(approver)
+        record = self.refs.get(f"activity:{activity_id}") or {}
         approval = await request_approval(
             self.session,
             self.ctx,
@@ -894,6 +1198,7 @@ class _Executor:
                 f"Step {element} of process {self.instance.definition_key}"
                 f" (instance {self.instance.instance_key})"
             ),
+            excluded_principals=[uuid.UUID(p) for p in record.get("excluded") or ()],
         )
         self.refs[f"approval:{approval.id}"] = {"activity": activity_id, "element": element}
         return str(approval.id)
@@ -970,6 +1275,7 @@ class _Executor:
             skill_ref=str(body["skill"]),
             inputs=process_replay.with_attachments(body, lambda: entries),
             idempotency_key=f"{CORRELATION_PREFIX}{self.instance.id}:{body['activityId']}",
+            process=(self.instance, str(body["activityId"])),
         )
         invocation = result.invocation
         self.refs[f"skill:{invocation.id}"] = {
@@ -1024,11 +1330,18 @@ class _Executor:
         }
 
     async def do_start_child(self, body: dict[str, Any]) -> dict[str, Any]:
-        row = await latest_definition(self.session, self.instance.tenant_id, str(body["process"]))
+        process = str(body["process"])
+        # A retired process starts no child either: the parent gets intent_failed.
+        # The key is shared without waiting: a batch of the worker holds the
+        # keys of the children it started until it commits, and an apply
+        # holding this key would wait for one of them (catalog_key_busy).
+        # The version is read under the key, not before it.
+        await share_keys_now(self.session, self.instance.tenant_id, PROCESS, [process])
+        row = await latest_definition(self.session, self.instance.tenant_id, process)
         if row is None:
-            raise NotFoundError(
-                "Process definition not found", details={"process": body["process"]}
-            )
+            raise NotFoundError("Process definition not found", details={"process": process})
+        if await retired_processes(self.session, self.instance.tenant_id, [row.key]):
+            raise process_retired(row.key)
         activity_id = str(body["activityId"])
         child = await start_instance(
             self.session,
@@ -1210,15 +1523,19 @@ async def start_process_instance(
 ) -> ProcessInstance:
     """``POST /process-instances``: an instance started by an operator (TAI-ADR-0055)."""
     await authorize(ctx, Permission.PROCESSES_OPERATE)
+    # The principals the step locks anyway come first, as in a journal batch
+    # (CP-ADR-0077 §3, rules 1 and 3). An apply holds principals only
+    # FOR KEY SHARE, so this is not what keeps the start out of a cycle with it.
+    await lock_process_identities(session, ctx.tenant_id)
+    # A retirement in flight has counted the open instances: this one waits for it.
+    await share_keys(session, ctx.tenant_id, PROCESS, [process])
+    # Read under the key: a start that waited for an apply or a publication
+    # runs on the version it committed, not on the one seen before the wait.
     row = await latest_definition(session, ctx.tenant_id, process)
     if row is None:
         raise NotFoundError("Process definition not found", details={"process": process})
-    if process in await retired_processes(session, ctx.tenant_id):
-        raise ConflictError(
-            "process_retired",
-            f"Process {process!r} was renamed away by a package: it starts no new instances",
-            details={"process": process},
-        )
+    if await retired_processes(session, ctx.tenant_id, [process]):
+        raise process_retired(process)
     if row.workspace_id is not None:
         if workspace_id is not None and workspace_id != row.workspace_id:
             raise ValidationError(
@@ -1341,11 +1658,40 @@ async def instance_view(session: AsyncSession, instance: ProcessInstance) -> Ins
     return InstanceView(instance, list(timers))
 
 
+def _sla_clock(instance: ProcessInstance) -> datetime:
+    """The moment deadlines are read at.
+
+    A closed instance is read at its close, so a step done in time stays in
+    time (CP-ADR-0078 §6).
+    """
+    if instance.status in engine.CLOSED and instance.completed_at is not None:
+        return instance.completed_at
+    return utcnow()
+
+
+def instance_sla(instance: ProcessInstance) -> tuple[dict[str, Any] | None, str]:
+    """``sla`` and ``slaState`` of an instance: the worst of the process and its open steps."""
+    now = _sla_clock(instance)
+    state = instance.state or {}
+    timers = state.get("timers") or {}
+    due, process, _ = process_sla.shown(state.get("sla"), now=now, timers=timers)
+    steps = [
+        process_sla.shown(record, now=now, timers=timers)[1] for record in _deadlines(state)[1:]
+    ]
+    return due, process_sla.worst([process, *steps])
+
+
 def open_elements(instance: ProcessInstance) -> list[dict[str, Any]]:
-    """The activities the instance waits on, with the tasks and approvals they opened."""
+    """The activities the instance waits on, with the tasks and approvals they opened.
+
+    Each carries its attempt and its deadline as of now (CP-ADR-0078 §6).
+    """
     refs = instance.refs or {}
+    now = _sla_clock(instance)
+    state = instance.state or {}
+    timers = state.get("timers") or {}
     out = []
-    activities = (instance.state or {}).get("activities") or {}
+    activities = state.get("activities") or {}
     for activity in sorted(activities.values(), key=lambda a: a["n"]):
         linked: dict[str, list[str]] = {"task": [], "approval": []}
         for ref, target in refs.items():
@@ -1353,6 +1699,9 @@ def open_elements(instance: ProcessInstance) -> list[dict[str, Any]]:
             if kind in linked and target.get("activity") == activity["id"]:
                 linked[kind].append(ident)
         tasks = sorted(linked["task"])
+        entered = refs.get(f"{process_steps.ACTIVITY_REF}{activity['id']}")
+        attempt = entered.get("attempt") if isinstance(entered, Mapping) else None
+        due, sla_state, overdue = process_sla.shown(activity.get("sla"), now=now, timers=timers)
         out.append(
             {
                 "id": activity.get("element") or activity["id"],
@@ -1360,6 +1709,10 @@ def open_elements(instance: ProcessInstance) -> list[dict[str, Any]]:
                 "since": activity.get("openedAt"),
                 "taskId": tasks[-1] if tasks else None,
                 "approvalIds": sorted(linked["approval"]),
+                "attempt": int(attempt) if attempt is not None else None,
+                "due": due,
+                "slaState": sla_state,
+                "overdueSeconds": overdue,
             }
         )
     return out
@@ -1375,6 +1728,7 @@ async def list_instances(
     instance_key: str | None = None,
     status: str | None = None,
     workspace_id: uuid.UUID | None = None,
+    sla_state: str | None = None,
 ) -> tuple[list[ProcessInstance], tuple[datetime, uuid.UUID] | None]:
     """Instances the caller may read, newest first."""
     await authorize(ctx, Permission.PROCESSES_READ)
@@ -1395,6 +1749,15 @@ async def list_instances(
         stmt = stmt.where(ProcessInstance.status == status)
     if workspace_id is not None:
         stmt = stmt.where(ProcessInstance.workspace_id == workspace_id)
+    if sla_state is not None:
+        # The columns _store keeps (CP-ADR-0078 §6): null once closed and for a
+        # deadline whose clock stands. Both predicates imply sla_due_at IS NOT NULL,
+        # the partial index ix_process_instances_sla_due.
+        now = utcnow()
+        if sla_state == "breached":
+            stmt = stmt.where(ProcessInstance.sla_due_at <= now)
+        else:
+            stmt = stmt.where(ProcessInstance.sla_due_at > now, ProcessInstance.sla_warn_at <= now)
     if after is not None:
         stmt = stmt.where(tuple_(ProcessInstance.started_at, ProcessInstance.id) < after)
     rows = list(
@@ -1523,16 +1886,19 @@ class _Process:
     retired: bool = False
 
 
-async def retired_processes(session: AsyncSession, tenant_id: uuid.UUID) -> frozenset[str]:
-    """Keys a package renamed away (CP-ADR-0074 §11): no new instances, open ones go on."""
-    rows = await session.scalars(
-        select(PackageObject.key).where(
-            PackageObject.tenant_id == tenant_id,
-            PackageObject.kind == "Process",
-            PackageObject.retired_at.is_not(None),
-        )
+async def retired_processes(
+    session: AsyncSession, tenant_id: uuid.UUID, keys: Iterable[str] | None = None
+) -> frozenset[str]:
+    """Retired keys (CP-ADR-0074 §11, Zh1): no new instances, open ones go on."""
+    return await retired_keys(session, tenant_id, PROCESS, keys)
+
+
+def process_retired(process: str) -> ConflictError:
+    return ConflictError(
+        "process_retired",
+        f"Process {process!r} is retired: it starts no new instances",
+        details={"process": process},
     )
-    return frozenset(rows.all())
 
 
 async def _published(session: AsyncSession, tenant_id: uuid.UUID) -> list[_Process]:
@@ -1864,7 +2230,8 @@ async def process_tenant_events(
     The cursor row is locked (``SKIP LOCKED``): two workers never feed one
     tenant side by side. Every event goes through its own savepoint; a
     domain refusal (a definition that no longer runs) is logged and passed,
-    anything else rolls the batch back and the tenant is retried with backoff.
+    anything else rolls the batch back and the tenant is retried with backoff
+    (``catalog_key_busy`` — soon and without it, :func:`defer_tenant`).
     """
     cursor: EventConsumerCursor | None = await session.scalar(
         select(EventConsumerCursor)
@@ -1951,6 +2318,27 @@ async def record_tenant_failure(
     cursor.updated_at = utcnow()
 
 
+async def defer_tenant(session: AsyncSession, *, tenant_id: uuid.UUID, seconds: float) -> None:
+    """Read the tenant's batch again shortly: a key it needs is held for a while.
+
+    Not a failure: the delay does not grow and ``failure_count`` and
+    ``parked_*`` stay as they are (``catalog_key_busy``, CP-ADR-0074, amendment
+    2026-09-29).
+    """
+    cursor: EventConsumerCursor | None = await session.scalar(
+        select(EventConsumerCursor)
+        .where(
+            EventConsumerCursor.name == PROCESSES_CONSUMER,
+            EventConsumerCursor.tenant_id == tenant_id,
+        )
+        .with_for_update()
+    )
+    if cursor is None:  # pragma: no cover - created with the first process
+        return
+    cursor.next_attempt_at = utcnow() + timedelta(seconds=seconds)
+    cursor.updated_at = utcnow()
+
+
 # --- the worker: timers --------------------------------------------------------------
 
 
@@ -1996,7 +2384,8 @@ async def fire_timer(session: AsyncSession, timer_id: uuid.UUID, *, trace_run_id
         instance,
         row,
         "timer",
-        {"timerId": str(timer.id)},
+        # When the core noticed the timer: a breached deadline says it (CP-ADR-0078 §3).
+        {"timerId": str(timer.id), "detectedAt": now.isoformat().replace("+00:00", "Z")},
         at=timer.due_at,
         source_ref=f"timer:{timer.id}",
         trace_run_id=trace_run_id,

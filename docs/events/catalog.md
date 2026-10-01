@@ -55,6 +55,8 @@ N+1 без изменений и игнорирует незнакомые по�
 | [`artifact_type.created`](#artifact_typecreated) | `artifact_type` | 1 | An artifact type version was created (CP-ADR-0072). |
 | [`attention.feedback_recorded`](#attentionfeedback_recorded) | `attention_feedback` | 1 | A principal judged an item of its attention list (CP-ADR-0071). |
 | [`calendar.published`](#calendarpublished) | `calendar` | 1 | A new version of a working-day calendar was published (CP-ADR-0074 §9). |
+| [`calendar.restored`](#calendarrestored) | `calendar` | 1 | A retired working-day calendar is back in use: a package apply installed it as it is (CP-ADR-0074, amendment Zh3). |
+| [`calendar.retired`](#calendarretired) | `calendar` | 1 | Every version of a working-day calendar was retired: no process needs it any more (CP-ADR-0074, amendment Zh3). |
 | [`capability.assigned`](#capabilityassigned) | `principal` | 1 | A capability was assigned to the principal. |
 | [`capability.created`](#capabilitycreated) | `capability` | 1 | A capability was created. |
 | [`capability.revoked`](#capabilityrevoked) | `principal` | 1 | A capability was revoked from the principal. |
@@ -86,7 +88,9 @@ N+1 без изменений и игнорирует незнакомые по�
 | [`process.correlated`](#processcorrelated) | `process_instance` | 1 | An event matched start.key or a correlate rule of a running instance. |
 | [`process.data_changed`](#processdata_changed) | `process_instance` | 1 | Instance data changed; timers depending on the fields were recomputed. |
 | [`process.definition_published`](#processdefinition_published) | `process_definition` | 1 | A new immutable version of a process was published (CP-ADR-0074 §3). |
-| [`process.escalated`](#processescalated) | `process_instance` | 1 | An escalation level of a step fired. |
+| [`process.definition_restored`](#processdefinition_restored) | `process_definition` | 1 | A retired process is back in use: a package apply installed it as it is (CP-ADR-0074, amendment Zh3). |
+| [`process.definition_retired`](#processdefinition_retired) | `process_definition` | 1 | Every version of a process was retired: no new instances, open ones run to the end (CP-ADR-0074, amendment Zh2). |
+| [`process.escalated`](#processescalated) | `process_instance` | 2 | An escalation level of a step fired. |
 | [`process.failed`](#processfailed) | `process_instance` | 1 | An error reached the top of the instance without a handler. |
 | [`process.migrated`](#processmigrated) | `process_instance` | 1 | The instance moved to another version by the process's migration map. |
 | [`process.milestone_lost`](#processmilestone_lost) | `process_instance` | 1 | A reached milestone stopped holding: its guard is false again (a standing goal is no longer met); it is reached again when the guard holds again. |
@@ -94,9 +98,14 @@ N+1 без изменений и игнорирует незнакомые по�
 | [`process.recall_completed`](#processrecall_completed) | `process_instance` | 1 | Memory answered a recall step; the answer is in the instance journal (CP-ADR-0076 §4). |
 | [`process.recall_timed_out`](#processrecall_timed_out) | `process_instance` | 1 | A recall step got no answer in time; the step's onTimeout runs. |
 | [`process.resumed`](#processresumed) | `process_instance` | 1 | The instance was resumed; frozen timers got their remaining time back. |
+| [`process.sla_breached`](#processsla_breached) | `process_instance` | 1 | A deadline passed while the step (process) is open; one per attempt. |
+| [`process.sla_failed`](#processsla_failed) | `process_instance` | 1 | A deadline could not be computed; the instance goes on, its SLA state is unknown. |
+| [`process.sla_warning`](#processsla_warning) | `process_instance` | 1 | The warning threshold of a deadline passed while the step (process) is open. |
 | [`process.stage_entered`](#processstage_entered) | `process_instance` | 1 | A stage of the case was entered. |
 | [`process.stage_exited`](#processstage_exited) | `process_instance` | 1 | A stage of the case was exited. |
 | [`process.started`](#processstarted) | `process_instance` | 1 | A process instance started from its start trigger. |
+| [`process.step_entered`](#processstep_entered) | `process_instance` | 1 | A waiting step (activity) of the instance opened. |
+| [`process.step_exited`](#processstep_exited) | `process_instance` | 1 | A waiting step (activity) of the instance closed. |
 | [`process.suspended`](#processsuspended) | `process_instance` | 1 | The instance was suspended; its timers froze. |
 | [`process.timer_fired`](#processtimer_fired) | `process_instance` | 1 | A timer of the instance fired; the engine takes it as its next event. |
 | [`process.timer_rescheduled`](#processtimer_rescheduled) | `process_instance` | 1 | A pending timer moved: data or a calendar it reads changed, or on resume. |
@@ -610,6 +619,35 @@ A new version of a working-day calendar was published (CP-ADR-0074 §9).
 | `previousVersion` | integer \| null | да |  |
 | `years` | array | да |  |
 | `provisionalYears` | array | да |  |
+
+### calendar.restored
+
+A retired working-day calendar is back in use: a package apply installed it as it is (CP-ADR-0074, amendment Zh3).
+
+Сущность: `calendar`.
+
+Версия 1:
+
+| Поле | Тип | Всегда | Описание |
+|---|---|---|---|
+| `key` | string | да |  |
+| `latestVersion` | integer | да |  |
+| `packageKey` | string \| null | да |  |
+| `packageVersion` | string \| null | да |  |
+
+### calendar.retired
+
+Every version of a working-day calendar was retired: no process needs it any more (CP-ADR-0074, amendment Zh3).
+
+Сущность: `calendar`.
+
+Версия 1:
+
+| Поле | Тип | Всегда | Описание |
+|---|---|---|---|
+| `key` | string | да |  |
+| `latestVersion` | integer | да |  |
+| `reason` | string | да |  |
 
 ### capability.assigned
 
@@ -1132,11 +1170,60 @@ A new immutable version of a process was published (CP-ADR-0074 §3).
 | `governedBy` | array | да | Regulations of the process as a whole: {document, section} |
 | `elements` | array | да | Stages, steps, milestones and decision tables: {id, kind, parent, displayName, governedBy} — what the memory projection of the version is built from (CP-ADR-0076 §3) |
 
+### process.definition_restored
+
+A retired process is back in use: a package apply installed it as it is (CP-ADR-0074, amendment Zh3).
+
+Сущность: `process_definition`.
+
+Версия 1:
+
+| Поле | Тип | Всегда | Описание |
+|---|---|---|---|
+| `key` | string | да |  |
+| `latestVersion` | integer | да |  |
+| `packageKey` | string \| null | да |  |
+| `packageVersion` | string \| null | да |  |
+
+### process.definition_retired
+
+Every version of a process was retired: no new instances, open ones run to the end (CP-ADR-0074, amendment Zh2).
+
+Сущность: `process_definition`.
+
+Версия 1:
+
+| Поле | Тип | Всегда | Описание |
+|---|---|---|---|
+| `key` | string | да |  |
+| `latestVersion` | integer | да |  |
+| `workspaceId` | string \| null (uuid) | да |  |
+| `reason` | string | да |  |
+| `openInstances` | integer | да | Open instances of every workspace of the key |
+| `byVersion` | array | да | {version, openInstances} of the versions with open ones |
+
 ### process.escalated
 
 An escalation level of a step fired.
 
 Сущность: `process_instance`.
+
+Версия 2 (добавлено: addressees, unresolved: addressees of the to targets (CP-ADR-0078, amendment 2026-09-30)):
+
+| Поле | Тип | Всегда | Описание |
+|---|---|---|---|
+| `instanceId` | string (uuid) | да |  |
+| `definitionKey` | string | да |  |
+| `version` | integer | да | Version of the process the instance is pinned to |
+| `instanceKey` | string | да | Value of start.key; unique per definition key |
+| `element` | string | да |  |
+| `level` | integer | да | 1-based escalation level of the step |
+| `action` | string | да | remind, reassign, notify or raise |
+| `taskId` | string \| null (uuid) | да |  |
+| `to` | array | да | Resolved principals the action addresses |
+| `workspaceId` | string \| null (uuid) | нет | Workspace of the instance: the scope of its case in memory |
+| `addressees` | array | нет | One per item of to, in its order: the addressee {principalId, roleId, workspaceId} of the target (a role is the one of the instance's workspace); null when the target does not resolve |
+| `unresolved` | array | нет | Why the null addressees did not resolve; empty when all did |
 
 Версия 1:
 
@@ -1285,6 +1372,80 @@ The instance was resumed; frozen timers got their remaining time back.
 | `cause` | string | да | event or operator |
 | `workspaceId` | string \| null (uuid) | нет | Workspace of the instance: the scope of its case in memory |
 
+### process.sla_breached
+
+A deadline passed while the step (process) is open; one per attempt.
+
+Сущность: `process_instance`.
+
+Версия 1:
+
+| Поле | Тип | Всегда | Описание |
+|---|---|---|---|
+| `instanceId` | string (uuid) | да |  |
+| `definitionKey` | string | да |  |
+| `version` | integer | да | Version of the process the instance is pinned to |
+| `instanceKey` | string | да | Value of start.key; unique per definition key |
+| `scope` | string | да | step or process |
+| `element` | string \| null | да | Id of the step; null for the process scope |
+| `attempt` | integer \| null | да | Attempt of the step; null for the process scope |
+| `activityId` | string \| null (uuid) | да | Activity of the attempt; null for the process scope |
+| `dueAt` | string (date-time) | да | Declared deadline: the due time of the deadline timer |
+| `detectedAt` | string (date-time) | да | When the core processed the breach |
+| `overdueSeconds` | integer | да | detectedAt - dueAt, seconds, not negative |
+| `detectedBy` | string | да | timer or migration |
+| `provisional` | boolean | да | Computed on a provisional calendar year |
+| `owner` | object \| null | да | Addressee {principalId, roleId, workspaceId}, one of principalId and roleId set: the first resolvable candidate of spec.owner; null when none resolves |
+| `assignee` | object \| null | да | Addressee {principalId, roleId, workspaceId} the step is assigned to; null for the process scope or an unassigned step |
+| `workspaceId` | string \| null (uuid) | нет | Workspace of the instance: the scope of its case in memory |
+
+### process.sla_failed
+
+A deadline could not be computed; the instance goes on, its SLA state is unknown.
+
+Сущность: `process_instance`.
+
+Версия 1:
+
+| Поле | Тип | Всегда | Описание |
+|---|---|---|---|
+| `instanceId` | string (uuid) | да |  |
+| `definitionKey` | string | да |  |
+| `version` | integer | да | Version of the process the instance is pinned to |
+| `instanceKey` | string | да | Value of start.key; unique per definition key |
+| `scope` | string | да | step or process |
+| `element` | string \| null | да | Id of the step; null for the process scope |
+| `attempt` | integer \| null | да | Attempt of the step; null for the process scope |
+| `activityId` | string \| null (uuid) | да | Activity of the attempt; null for the process scope |
+| `error` | object | да | calendar_missing or an expression error |
+| `owner` | object \| null | да | Addressee {principalId, roleId, workspaceId}, one of principalId and roleId set: the first resolvable candidate of spec.owner; null when none resolves |
+| `workspaceId` | string \| null (uuid) | нет | Workspace of the instance: the scope of its case in memory |
+
+### process.sla_warning
+
+The warning threshold of a deadline passed while the step (process) is open.
+
+Сущность: `process_instance`.
+
+Версия 1:
+
+| Поле | Тип | Всегда | Описание |
+|---|---|---|---|
+| `instanceId` | string (uuid) | да |  |
+| `definitionKey` | string | да |  |
+| `version` | integer | да | Version of the process the instance is pinned to |
+| `instanceKey` | string | да | Value of start.key; unique per definition key |
+| `scope` | string | да | step or process |
+| `element` | string \| null | да | Id of the step; null for the process scope |
+| `attempt` | integer \| null | да | Attempt of the step; null for the process scope |
+| `activityId` | string \| null (uuid) | да | Activity of the attempt; null for the process scope |
+| `dueAt` | string (date-time) | да | Declared deadline: the due time of the deadline timer |
+| `warnAt` | string (date-time) | да |  |
+| `provisional` | boolean | да | Computed on a provisional calendar year |
+| `owner` | object \| null | да | Addressee {principalId, roleId, workspaceId}, one of principalId and roleId set: the first resolvable candidate of spec.owner; null when none resolves |
+| `assignee` | object \| null | да | Addressee {principalId, roleId, workspaceId} the step is assigned to; null for the process scope or an unassigned step |
+| `workspaceId` | string \| null (uuid) | нет | Workspace of the instance: the scope of its case in memory |
+
 ### process.stage_entered
 
 A stage of the case was entered.
@@ -1336,6 +1497,64 @@ A process instance started from its start trigger.
 | `triggerEventId` | string \| null (uuid) | да | Journal event that started it |
 | `triggerType` | string | да |  |
 | `memory` | object \| null | да | Case projection {case, facts, entities, documents} evaluated from the process's memory section; null when the process declares none |
+| `workspaceId` | string \| null (uuid) | нет | Workspace of the instance: the scope of its case in memory |
+
+### process.step_entered
+
+A waiting step (activity) of the instance opened.
+
+Сущность: `process_instance`.
+
+Версия 1:
+
+| Поле | Тип | Всегда | Описание |
+|---|---|---|---|
+| `instanceId` | string (uuid) | да |  |
+| `definitionKey` | string | да |  |
+| `version` | integer | да | Version of the process the instance is pinned to |
+| `instanceKey` | string | да | Value of start.key; unique per definition key |
+| `element` | string | да | Id of the waiting step |
+| `stage` | string \| null | да | Stage the step belongs to; null outside stages |
+| `stepKind` | string | да | human, approve, call, recall, listen or wait |
+| `attempt` | integer | да | 1-based number of the entry into this element in the instance |
+| `activityId` | string (uuid) | да | Activity of this attempt |
+| `enteredAt` | string (date-time) | да |  |
+| `waitsFor` | string | да | task, approval, skill, agent, child, event, time or memory |
+| `taskId` | string \| null (uuid) | да | Task the step waits for |
+| `approvalIds` | array | да | Approvals the step waits for |
+| `skillInvocationId` | string \| null (uuid) | да | Skill invocation the step waits for |
+| `childInstanceId` | string \| null (uuid) | да | Child instance the step waits for |
+| `due` | string \| null (date-time) | да | Declared deadline of the step; null without due |
+| `warnAt` | string \| null (date-time) | да | Warning threshold; null without warnBefore |
+| `provisional` | boolean | да | The deadline is computed on a provisional year |
+| `workspaceId` | string \| null (uuid) | нет | Workspace of the instance: the scope of its case in memory |
+
+### process.step_exited
+
+A waiting step (activity) of the instance closed.
+
+Сущность: `process_instance`.
+
+Версия 1:
+
+| Поле | Тип | Всегда | Описание |
+|---|---|---|---|
+| `instanceId` | string (uuid) | да |  |
+| `definitionKey` | string | да |  |
+| `version` | integer | да | Version of the process the instance is pinned to |
+| `instanceKey` | string | да | Value of start.key; unique per definition key |
+| `element` | string | да | Id of the waiting step |
+| `stage` | string \| null | да | Stage the step belongs to; null outside stages |
+| `stepKind` | string | да | human, approve, call, recall, listen or wait |
+| `attempt` | integer | да | 1-based number of the entry into this element in the instance |
+| `activityId` | string (uuid) | да | Activity of this attempt |
+| `enteredAt` | string (date-time) | да |  |
+| `exitedAt` | string (date-time) | да |  |
+| `outcome` | string | да | completed, cancelled, withdrawn (a participant cancelled the step's task, or the last approval of the step, outside the process; the event's actorId is that participant), interrupted, failed, timed_out or migrated |
+| `durationSeconds` | integer | да | exitedAt - enteredAt, wall-clock seconds |
+| `due` | string \| null (date-time) | да | Declared deadline of the step; null without due |
+| `breached` | boolean | да | The step closed after its deadline |
+| `overdueSeconds` | integer \| null | да | exitedAt - due when breached, else null |
 | `workspaceId` | string \| null (uuid) | нет | Workspace of the instance: the scope of its case in memory |
 
 ### process.suspended
@@ -1394,7 +1613,7 @@ A pending timer moved: data or a calendar it reads changed, or on resume.
 | `previousDueAt` | string (date-time) | да |  |
 | `dueAt` | string (date-time) | да |  |
 | `provisional` | boolean | да | Computed on a provisional calendar year |
-| `cause` | string | да | data_changed, calendar_changed or resumed |
+| `cause` | string | да | data_changed, calendar_changed, resumed or migrated (deadlines recomputed by the new version, CP-ADR-0074 amendment 2026-09-29 §11) |
 | `changedFields` | array | да |  |
 | `workspaceId` | string \| null (uuid) | нет | Workspace of the instance: the scope of its case in memory |
 

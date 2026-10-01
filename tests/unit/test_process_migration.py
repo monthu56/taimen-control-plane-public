@@ -6,6 +6,7 @@ position in the stage.
 """
 
 import json
+from dataclasses import replace
 from datetime import timedelta
 from typing import Any
 
@@ -19,6 +20,7 @@ from control_plane.domain.process_migration import (
     MigrationError,
     migrate_state,
     migration_for,
+    migration_record,
     standing,
     uncovered,
 )
@@ -104,11 +106,16 @@ def test_a_renamed_step_carries_the_instance_on_from_the_same_place() -> None:
     [frame] = thread["stack"]
     assert frame["block"] == "stage:prepare/steps"
     assert frame["index"] == 3  # after check: draft, intro, check
-    [timer] = moved["timers"].values()
+    timers = {t["kind"]: t for t in moved["timers"].values()}
+    assert sorted(timers) == ["escalation", "sla"]
+    timer = timers["escalation"]
     assert timer["element"] == "check"
     # The escalation after the due: its expression moved with the step.
     assert timer["recipe"]["due"]["path"] == "/spec/stages/0/steps/2/human/due/at"
     assert timer["recipe"]["due"]["path"] in v2.programs
+    # So did the deadline of the step (revision 2): the same due.
+    assert timers["sla"]["element"] == "check"
+    assert timers["sla"]["recipe"] == timer["recipe"]["due"]
     assert moved["stages"]["archive"]["state"] == "available"
     # The state the engine keeps is JSON: the migrated one too.
     assert json.loads(json.dumps(moved)) == moved
@@ -251,3 +258,33 @@ def test_a_replay_starts_from_the_last_migration_of_the_journal() -> None:
     assert result.discrepancies == []
     assert result.steps == 1  # only what ran on version 2
     assert result.state == json.loads(json.dumps(after))
+
+
+def test_the_migration_record_carries_the_engine_revision_of_the_target_version() -> None:
+    run = _waiting()
+    assert run.state is not None
+    old = replace(run.definition, engine_revision=1)  # a version published before revisions
+    v2 = _definition(V2, 2)
+    assert v2.engine_revision == pe.ENGINE_REVISION == 2
+    moved = migrate_state(old, v2, run.state, {"review": "check"})
+    body, decision = migration_record(
+        from_key="test",
+        from_version=1,
+        target=v2,
+        mapping={"review": "check"},
+        plan_hash="sha256:plan",
+        state=moved,
+    )
+    assert body["engineRevision"] == decision["engineRevision"] == 2
+    assert body["toVersion"] == decision["toVersion"] == 2
+    assert decision == {
+        "kind": "migrated",
+        "element": None,
+        "fromKey": "test",
+        "fromVersion": 1,
+        "toVersion": 2,
+        "engineRevision": 2,
+        "policy": "migrate",
+        "map": {"review": "check"},
+    }
+    assert body["state"] == moved and body["planHash"] == "sha256:plan"

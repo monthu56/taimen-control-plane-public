@@ -104,7 +104,7 @@ async def _world(client: httpx.AsyncClient, domain: str) -> dict[str, Any]:
     other = await create_workspace(client, admin, "other")
     other_child = await create_workspace(client, admin, "other-child", parent_id=other["id"])
     installed = await install_package(
-        client, admin, domain, kinds={"ArtifactType", "Role", "TaskType"}
+        client, admin, domain, kinds={"ArtifactType", "Role", "Skill", "TaskType"}
     )
     role = installed[f"Role/{spec['role']}"]["id"]
     foreign_role = (await create_role(client, admin, "someone-elses"))["id"]
@@ -391,6 +391,7 @@ async def test_a_missing_permission_degrades_its_rules(client: httpx.AsyncClient
     assert {(d["rule"], d["reasonCode"]) for d in body["degraded"]} == {
         ("approval.review@1", "permission_missing"),
         ("approval.decide@1", "permission_missing"),
+        ("approval.undecidable@1", "permission_missing"),
     }
 
     _, nothing = await create_agent_with_key(

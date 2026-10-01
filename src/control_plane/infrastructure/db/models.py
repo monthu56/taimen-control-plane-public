@@ -20,6 +20,7 @@ from sqlalchemy import (
     Index,
     Integer,
     MetaData,
+    SmallInteger,
     Text,
     UniqueConstraint,
     text,
@@ -2417,6 +2418,8 @@ class ProcessDefinition(Base):
     ``sha256:<hex>`` of its canonical JSON. ``governed_by`` lists the documents
     its elements name, for ``GET /process-definitions?governedBy=``;
     ``warnings`` are the findings that did not refuse the version.
+    ``engine_revision`` — the semantics the version runs under (amendment
+    2026-09-29): ``1`` before SLA deadlines, ``2`` with them.
     """
 
     __tablename__ = "process_definitions"
@@ -2445,6 +2448,7 @@ class ProcessDefinition(Base):
     spec: Mapped[dict[str, Any]] = mapped_column(JSONB)
     governed_by: Mapped[list[str]] = mapped_column(JSONB)
     warnings: Mapped[list[dict[str, Any]]] = mapped_column(JSONB)
+    engine_revision: Mapped[int] = mapped_column(SmallInteger, server_default=text("1"))
     created_by: Mapped[uuid.UUID] = mapped_column(ForeignKey("principals.id"))
     created_at: Mapped[datetime]
 
@@ -2461,7 +2465,14 @@ class ProcessInstance(Base):
     journal entry of the step that produced them. ``(tenant, definition_key,
     instance_key)`` is unique: one instance per key. ``refs`` routes the
     journal's facts back to the instance — ``task:<id>``, ``approval:<id>``,
-    ``skill:<id>``, ``child:<id>`` — each to the activity that opened it.
+    ``skill:<id>``, ``child:<id>`` — each to the activity that opened it;
+    ``activity:<id>`` keeps what the core knows of an open activity (the
+    approvers still to ask, the attempt it entered with).
+    ``step_attempts`` — ``{element: n}``, the attempt of each step
+    (CP-ADR-0074 §13).
+    ``sla_due_at``/``sla_warn_at`` — the earliest running deadline and warning
+    (CP-ADR-0078 §6), not counting deadlines whose timers are frozen; they
+    back the ``slaState`` filter.
     """
 
     __tablename__ = "process_instances"
@@ -2479,6 +2490,12 @@ class ProcessInstance(Base):
         Index("ix_process_instances_tenant_status", "tenant_id", "status", "definition_key"),
         Index("ix_process_instances_refs", "refs", postgresql_using="gin"),
         Index("ix_process_instances_parent", "parent_instance_id"),
+        Index(
+            "ix_process_instances_sla_due",
+            "tenant_id",
+            "sla_due_at",
+            postgresql_where=text("sla_due_at IS NOT NULL"),
+        ),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(primary_key=True)
@@ -2494,6 +2511,11 @@ class ProcessInstance(Base):
     data: Mapped[dict[str, Any]] = mapped_column(JSONB)
     state: Mapped[dict[str, Any]] = mapped_column(JSONB)
     refs: Mapped[dict[str, Any]] = mapped_column(JSONB)
+    step_attempts: Mapped[dict[str, int]] = mapped_column(
+        JSONB, default=dict, server_default=text("'{}'::jsonb")
+    )
+    sla_due_at: Mapped[datetime | None]
+    sla_warn_at: Mapped[datetime | None]
     parent_instance_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("process_instances.id"))
     parent_activity_id: Mapped[str | None] = mapped_column(Text)
     started_by: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("principals.id"))
@@ -2507,7 +2529,8 @@ class ProcessTimer(Base):
 
     ``id`` is the engine's timer id. A ``pending`` row with ``due_at`` in the
     past is an input of the timer loop; ``frozen`` keeps ``remaining_seconds``
-    while the instance is suspended (``due_at`` null); ``fired`` never goes
+    while the instance is suspended (``due_at`` null), in ``remaining_unit``
+    (``wall | working_seconds | workdays``, CP-ADR-0078 §4); ``fired`` never goes
     back. ``reads`` — the data fields its expression reads, for recomputation.
     """
 
@@ -2530,6 +2553,7 @@ class ProcessTimer(Base):
     due_at: Mapped[datetime | None]
     state: Mapped[str] = mapped_column(Text)
     remaining_seconds: Mapped[float | None] = mapped_column(Float)
+    remaining_unit: Mapped[str] = mapped_column(Text, default="wall", server_default=text("'wall'"))
     reads: Mapped[list[str]] = mapped_column(JSONB)
     provisional: Mapped[bool] = mapped_column(Boolean)
     created_at: Mapped[datetime]
@@ -2554,10 +2578,8 @@ class PackageObject(Base):
     2026-09-29 — only when the core applied them, a record of the installer
     leaves them empty). A field of the latest version that differs from
     ``spec`` was changed by a person since, and the plan names its owner
-    ``console``; without ``spec`` every field is the package's. ``retired_at`` — the key
-    was renamed away by ``renames``: a retired process starts no new
-    instance, its open instances go on; a publication outside a package
-    brings the key back.
+    ``console``; without ``spec`` every field is the package's. Whether the key
+    is retired is not the link's business: :class:`CatalogRetirement`.
     """
 
     __tablename__ = "package_objects"
@@ -2588,7 +2610,28 @@ class PackageObject(Base):
     plan_hash: Mapped[str | None] = mapped_column(Text)
     applied_by: Mapped[uuid.UUID] = mapped_column(ForeignKey("principals.id"))
     applied_at: Mapped[datetime]
-    retired_at: Mapped[datetime | None]
+
+
+class CatalogRetirement(Base):
+    """A process or calendar key taken out of use (CP-ADR-0074, amendment 2026-09-29, Zh1).
+
+    Versions are immutable, so the mark belongs to the key: every version of
+    it is retired together. A retired process starts no new instance, its open
+    instances go on; a retired calendar is refused to new process versions.
+    ``POST /process-definitions/{key}:retire``, ``POST /calendars/{key}:retire``
+    and a package renaming the key away write the row; a new version of the
+    key deletes it and brings the key back.
+    """
+
+    __tablename__ = "catalog_retirements"
+    __table_args__ = (CheckConstraint("kind IN ('Process', 'Calendar')", name="kind_known"),)
+
+    tenant_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("tenants.id"), primary_key=True)
+    kind: Mapped[str] = mapped_column(Text, primary_key=True)
+    key: Mapped[str] = mapped_column(Text, primary_key=True)
+    retired_at: Mapped[datetime]
+    retired_by: Mapped[uuid.UUID] = mapped_column(ForeignKey("principals.id"))
+    reason: Mapped[str] = mapped_column(Text)
 
 
 class ProcessRecall(Base):

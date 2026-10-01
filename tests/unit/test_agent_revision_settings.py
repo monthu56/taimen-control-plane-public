@@ -169,7 +169,7 @@ def test_revision_instructions_replace_the_conventions_file(tmp_path: Path) -> N
 
     prompt = adapter._build_prompt({"id": "t", "publicId": "TASK-1", "title": "x"}, {})
 
-    assert "### Repository conventions" in prompt
+    assert "### Agent conventions" in prompt
     assert "Соглашения репозитория" in prompt
     assert "from the file" not in prompt
 
@@ -276,6 +276,28 @@ def test_a_repository_url_is_mirrored_once_and_checked(tmp_path: Path) -> None:
     assert mirror(str(source), mirrors) == source
 
 
+@pytest.mark.parametrize(
+    "working_copy",
+    [
+        # A catalog left with installation variables unresolved (U005 reads
+        # catalogs: tests/unit/test_agent_catalog.py).
+        yaml.safe_load((FIXTURES / "universal-coder.yaml").read_text(encoding="utf-8"))["spec"][
+            "workingCopy"
+        ],
+        {"directory": "service"},
+        {"repository": ""},
+        {"repository": ["https://git.example/org/service.git"]},
+    ],
+)
+def test_a_working_copy_this_runner_cannot_build_is_refused(
+    tmp_path: Path, working_copy: dict[str, Any]
+) -> None:
+    """The core no longer checks the shape (U002): the daemon refuses, not crashes."""
+    revision = _revision("reviewer.yaml", workingCopy=working_copy)
+    with pytest.raises(RevisionError, match="workingCopy"):
+        workspace_pool_of(revision, {"CONTROL_PLANE_AGENT_WORKTREE_ROOT": str(tmp_path)})
+
+
 def test_the_working_copy_of_a_revision(tmp_path: Path) -> None:
     source = _repository(tmp_path / "forge" / "service")
     revision = _revision(
@@ -312,3 +334,51 @@ def test_neighbours_without_a_superproject_are_refused(tmp_path: Path) -> None:
     )
     with pytest.raises(RevisionError, match="superproject"):
         workspace_pool_of(revision, {"CONTROL_PLANE_AGENT_WORKTREE_ROOT": str(tmp_path / "w")})
+
+
+@pytest.mark.parametrize(
+    ("fields", "message"),
+    [
+        # bool("false") is True: a string must not publish.
+        ({"publish": "false"}, "publish must be a boolean"),
+        ({"publish": 0}, "publish must be a boolean"),
+        ({"neighbours": ["sdk"]}, "neighbours must map"),
+        ({"neighbours": {"sdk": 1}}, "neighbours must map"),
+        ({"neighbours": {"../sdk": "SDK"}, "superproject": "SDK"}, "unsafe neighbour name"),
+        ({"superproject": ["x"]}, "superproject must be"),
+        ({"baseRef": 3}, "baseRef must be"),
+        ({"directory": {"a": 1}}, "directory must be"),
+    ],
+)
+def test_a_one_repository_section_the_schema_refuses_is_a_revision_error(
+    tmp_path: Path, fields: dict[str, Any], message: str
+) -> None:
+    """Every error of the section is exit 2 at start (RevisionError), never a traceback."""
+    source = _repository(tmp_path / "forge" / "service")
+    sdk = str(_repository(tmp_path / "forge" / "sdk"))
+    resolved = {
+        name: (
+            {k: sdk if v == "SDK" else v for k, v in value.items()}
+            if isinstance(value, dict)
+            else sdk
+            if value == "SDK"
+            else value
+        )
+        for name, value in fields.items()
+    }
+    revision = _revision("reviewer.yaml", workingCopy={"repository": str(source), **resolved})
+    with pytest.raises(RevisionError, match=message):
+        workspace_pool_of(revision, {"CONTROL_PLANE_AGENT_WORKTREE_ROOT": str(tmp_path / "w")})
+
+
+def test_a_budget_that_is_not_a_number_is_a_revision_error(tmp_path: Path) -> None:
+    source = _repository(tmp_path / "forge" / "service")
+    revision = _revision("reviewer.yaml", workingCopy={"repository": str(source)})
+    with pytest.raises(RevisionError, match="MAX_WORKSPACES"):
+        workspace_pool_of(
+            revision,
+            {
+                "CONTROL_PLANE_AGENT_WORKTREE_ROOT": str(tmp_path / "w"),
+                "CONTROL_PLANE_AGENT_MAX_WORKSPACES": "many",
+            },
+        )

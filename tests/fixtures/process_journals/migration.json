@@ -1,0 +1,2075 @@
+{
+ "calendars": [
+  {
+   "calendar_hash": "sha256:be2ffdd520b56216a5a08d848320025afcc758ee72a2968cbb6ebda4d898ce63",
+   "created_at": "2026-09-30T16:26:24.645367Z",
+   "key": "ru",
+   "spec": {
+    "displayName": "Production calendar (replay fixtures)",
+    "timezone": "Europe/Moscow",
+    "weekend": [
+     6,
+     7
+    ],
+    "years": [
+     {
+      "holidays": [
+       "2026-01-01",
+       "2026-01-02",
+       "2026-01-05",
+       "2026-01-06",
+       "2026-01-07",
+       "2026-01-08",
+       "2026-01-09",
+       "2026-02-23",
+       "2026-03-09",
+       "2026-05-01",
+       "2026-05-11",
+       "2026-06-12",
+       "2026-11-04",
+       "2026-12-31"
+      ],
+      "shortDays": [
+       "2026-11-03"
+      ],
+      "source": "test data of the replay fixtures",
+      "workdays": [],
+      "year": 2026
+     },
+     {
+      "holidays": [
+       "2027-01-01"
+      ],
+      "provisional": true,
+      "year": 2027
+     }
+    ]
+   },
+   "version": 1
+  }
+ ],
+ "catalog": {
+  "agents": [
+   "sample-process"
+  ],
+  "taskTypes": [
+   {
+    "display_name": "Review",
+    "field_schema": {
+     "properties": {
+      "decision": {
+       "type": "string"
+      }
+     },
+     "type": "object"
+    },
+    "key": "review",
+    "version": 1
+   },
+   {
+    "display_name": "Task",
+    "field_schema": {},
+    "key": "task",
+    "version": 1
+   }
+  ]
+ },
+ "definitions": [
+  {
+   "created_at": "2026-09-30T16:26:24.649877Z",
+   "definition_hash": "sha256:76532f98ef654645abf42a3573f991684fac13d0b3539263063e1519b51cc095",
+   "display_name": "Replay: migration",
+   "expression_profile": "cp/1",
+   "governed_by": [],
+   "id": "dbeaa2f9-7ad3-4947-b625-65b5f90157a3",
+   "identity_agent": "sample-process",
+   "key": "replay-migrate",
+   "spec": {
+    "calendar": "ru",
+    "data": {
+     "properties": {
+      "decision": {
+       "type": "string"
+      }
+     },
+     "type": "object"
+    },
+    "displayName": "Replay: migration",
+    "identity": {
+     "agent": "sample-process"
+    },
+    "owner": [
+     {
+      "role": "lead"
+     }
+    ],
+    "stages": [
+     {
+      "id": "work",
+      "steps": [
+       {
+        "human": {
+         "assign": [
+          {
+           "principal": "4a66a89c-cea9-4ffd-9420-c63ce79a8771"
+          }
+         ],
+         "due": "P3D",
+         "escalations": [
+          {
+           "action": "notify",
+           "after": "due",
+           "to": [
+            {
+             "principal": "4a66a89c-cea9-4ffd-9420-c63ce79a8771"
+            }
+           ]
+          }
+         ],
+         "taskType": "review"
+        },
+        "id": "review",
+        "output": {
+         "as": {
+          "decision": "step.result.decision"
+         }
+        }
+       },
+       {
+        "complete": {
+         "outcome": "reviewed"
+        },
+        "id": "done"
+       }
+      ]
+     }
+    ],
+    "start": {
+     "key": "event.payload.data.number",
+     "on": {
+      "observation": "sample.migrated"
+     }
+    },
+    "version": 1
+   },
+   "version": 1,
+   "warnings": []
+  },
+  {
+   "created_at": "2026-09-30T16:26:24.848456Z",
+   "definition_hash": "sha256:fa4e365633483709ef5d53f35eb5cb674e8b3dd2121f41bd51b2fcf15815b05b",
+   "display_name": "Replay: migration",
+   "expression_profile": "cp/1",
+   "governed_by": [],
+   "id": "ee0c1a86-66bd-4f1c-849e-8ad3c5fda4cd",
+   "identity_agent": "sample-process",
+   "key": "replay-migrate",
+   "spec": {
+    "calendar": "ru",
+    "data": {
+     "properties": {
+      "decision": {
+       "type": "string"
+      }
+     },
+     "type": "object"
+    },
+    "displayName": "Replay: migration",
+    "identity": {
+     "agent": "sample-process"
+    },
+    "migrations": [
+     {
+      "from": 1,
+      "map": {
+       "review": "check"
+      },
+      "policy": "migrate",
+      "to": 2
+     }
+    ],
+    "owner": [
+     {
+      "role": "lead"
+     }
+    ],
+    "stages": [
+     {
+      "id": "work",
+      "steps": [
+       {
+        "human": {
+         "assign": [
+          {
+           "principal": "4a66a89c-cea9-4ffd-9420-c63ce79a8771"
+          }
+         ],
+         "due": "P1D",
+         "escalations": [
+          {
+           "action": "notify",
+           "after": "due",
+           "to": [
+            {
+             "principal": "4a66a89c-cea9-4ffd-9420-c63ce79a8771"
+            }
+           ]
+          },
+          {
+           "action": "notify",
+           "after": "PT4H",
+           "to": [
+            {
+             "principal": "4a66a89c-cea9-4ffd-9420-c63ce79a8771"
+            }
+           ]
+          }
+         ],
+         "taskType": "review"
+        },
+        "id": "check",
+        "output": {
+         "as": {
+          "decision": "step.result.decision"
+         }
+        }
+       },
+       {
+        "complete": {
+         "outcome": "reviewed"
+        },
+        "id": "done"
+       }
+      ]
+     }
+    ],
+    "start": {
+     "key": "event.payload.data.number",
+     "on": {
+      "observation": "sample.migrated"
+     }
+    },
+    "version": 2
+   },
+   "version": 2,
+   "warnings": []
+  }
+ ],
+ "instances": [
+  {
+   "completed_at": "2026-09-30T16:26:24.913700Z",
+   "data": {
+    "decision": "yes"
+   },
+   "definition_id": "ee0c1a86-66bd-4f1c-849e-8ad3c5fda4cd",
+   "definition_key": "replay-migrate",
+   "definition_version": 2,
+   "error": null,
+   "id": "b4077b5a-3324-4334-bba1-ff43feff474a",
+   "instance_key": "M-done-after",
+   "journal": [
+    {
+     "actor_id": "4a66a89c-cea9-4ffd-9420-c63ce79a8771",
+     "at": "2026-09-30T16:26:24.659942Z",
+     "calendars": {
+      "ru": 1
+     },
+     "created_at": "2026-09-30T16:26:24.666742Z",
+     "decisions": [
+      {
+       "element": null,
+       "key": "M-done-after",
+       "kind": "started",
+       "trigger": {
+        "eventId": null,
+        "type": "command"
+       }
+      },
+      {
+       "element": "work",
+       "entry": null,
+       "kind": "stage_entered",
+       "run": 1
+      },
+      {
+       "activity": "daca042f-3987-554f-881f-f8ca20babcd1",
+       "activityKind": "task",
+       "element": "review",
+       "kind": "activity_opened"
+      },
+      {
+       "dueAt": "2026-10-03T16:26:24.659942Z",
+       "element": "review",
+       "kind": "timer_set",
+       "provisional": false,
+       "timerId": "52f92b54-7f54-509b-8116-60ec36fe5b3e",
+       "timerKind": "escalation"
+      }
+     ],
+     "event_id": null,
+     "input": {
+      "actorId": "4a66a89c-cea9-4ffd-9420-c63ce79a8771",
+      "at": "2026-09-30T16:26:24.659942Z",
+      "body": {
+       "data": {},
+       "instanceId": "b4077b5a-3324-4334-bba1-ff43feff474a",
+       "key": "M-done-after"
+      },
+      "kind": "start"
+     },
+     "intents": [
+      {
+       "executed": {
+        "ok": true
+       },
+       "kind": "emit_event",
+       "payload": {
+        "definitionKey": "replay-migrate",
+        "instanceId": "b4077b5a-3324-4334-bba1-ff43feff474a",
+        "instanceKey": "M-done-after",
+        "memory": null,
+        "triggerEventId": null,
+        "triggerType": "command",
+        "version": 1
+       },
+       "type": "process.started"
+      },
+      {
+       "executed": {
+        "ok": true
+       },
+       "kind": "emit_event",
+       "payload": {
+        "definitionKey": "replay-migrate",
+        "instanceId": "b4077b5a-3324-4334-bba1-ff43feff474a",
+        "instanceKey": "M-done-after",
+        "stage": "work",
+        "version": 1
+       },
+       "type": "process.stage_entered"
+      },
+      {
+       "activityId": "daca042f-3987-554f-881f-f8ca20babcd1",
+       "assign": [
+        {
+         "principal": "4a66a89c-cea9-4ffd-9420-c63ce79a8771"
+        }
+       ],
+       "context": null,
+       "due": "2026-10-03T16:26:24.659942Z",
+       "element": "review",
+       "escalations": [
+        {
+         "action": "notify",
+         "after": "due",
+         "level": 1,
+         "to": [
+          {
+           "principal": "4a66a89c-cea9-4ffd-9420-c63ce79a8771"
+          }
+         ]
+        }
+       ],
+       "executed": {
+        "ok": true,
+        "taskId": "5d9aba1d-6a20-4805-b350-5a8bf655f08e"
+       },
+       "externalRef": "process/b4077b5a-3324-4334-bba1-ff43feff474a/review",
+       "form": null,
+       "input": null,
+       "kind": "create_task",
+       "taskType": "review",
+       "title": "review"
+      },
+      {
+       "dueAt": "2026-10-03T16:26:24.659942Z",
+       "element": "review",
+       "executed": {
+        "ok": true
+       },
+       "kind": "set_timer",
+       "provisional": false,
+       "reads": [],
+       "remainingSeconds": null,
+       "state": "pending",
+       "timerId": "52f92b54-7f54-509b-8116-60ec36fe5b3e",
+       "timerKind": "escalation"
+      }
+     ],
+     "kind": "start",
+     "seq": 0,
+     "source_ref": "start"
+    },
+    {
+     "actor_id": null,
+     "at": "2026-09-30T16:26:24.659942Z",
+     "calendars": {
+      "ru": 1
+     },
+     "created_at": "2026-09-30T16:26:24.751482Z",
+     "decisions": [],
+     "event_id": "23c3dd6b-0171-44b9-b43d-eefc36b48f1f",
+     "input": {
+      "actorId": null,
+      "at": "2026-09-30T16:26:24.659942Z",
+      "body": {
+       "key": "ru"
+      },
+      "kind": "calendar"
+     },
+     "intents": [],
+     "kind": "calendar",
+     "seq": 1,
+     "source_ref": "event:23c3dd6b-0171-44b9-b43d-eefc36b48f1f"
+    },
+    {
+     "actor_id": "4a66a89c-cea9-4ffd-9420-c63ce79a8771",
+     "at": "2026-09-30T16:26:24.859071Z",
+     "calendars": {},
+     "created_at": "2026-09-30T16:26:24.859110Z",
+     "decisions": [
+      {
+       "element": null,
+       "fromKey": "replay-migrate",
+       "fromVersion": 1,
+       "kind": "migrated",
+       "map": {
+        "review": "check"
+       },
+       "policy": "migrate",
+       "toVersion": 2
+      }
+     ],
+     "event_id": null,
+     "input": {
+      "actorId": "4a66a89c-cea9-4ffd-9420-c63ce79a8771",
+      "at": "2026-09-30T16:26:24.859071Z",
+      "body": {
+       "fromKey": "replay-migrate",
+       "fromVersion": 1,
+       "map": {
+        "review": "check"
+       },
+       "planHash": "sha256:abc05d2dab0e25bc7c04d88a8067a007587d33f1f014225adbe5e1a15019cbc4",
+       "policy": "migrate",
+       "state": {
+        "activities": {
+         "daca042f-3987-554f-881f-f8ca20babcd1": {
+          "assign": [
+           {
+            "principal": "4a66a89c-cea9-4ffd-9420-c63ce79a8771"
+           }
+          ],
+          "due": "2026-10-03T16:26:24.659942Z",
+          "element": "check",
+          "id": "daca042f-3987-554f-881f-f8ca20babcd1",
+          "kind": "task",
+          "n": 1,
+          "openedAt": "2026-09-30T16:26:24.659942Z",
+          "thread": "t1",
+          "timers": [
+           "52f92b54-7f54-509b-8116-60ec36fe5b3e"
+          ]
+         }
+        },
+        "attention": null,
+        "clock": "2026-09-30T16:26:24.659942Z",
+        "closing": null,
+        "counters": {
+         "activity": 1,
+         "done": 0,
+         "thread": 1,
+         "timer": 1
+        },
+        "data": {},
+        "deferred": [],
+        "definitionKey": "replay-migrate",
+        "done": [],
+        "error": null,
+        "instanceId": "b4077b5a-3324-4334-bba1-ff43feff474a",
+        "key": "M-done-after",
+        "lastTask": null,
+        "milestones": {},
+        "outcome": null,
+        "retrospective": null,
+        "seq": 2,
+        "stages": {
+         "work": {
+          "closedSeq": null,
+          "enteredAt": "2026-09-30T16:26:24.659942Z",
+          "runs": 1,
+          "state": "active"
+         }
+        },
+        "startedAt": "2026-09-30T16:26:24.659942Z",
+        "status": "running",
+        "threads": {
+         "t1": {
+          "event": null,
+          "id": "t1",
+          "n": 1,
+          "parent": null,
+          "scope": "stage:work",
+          "stack": [
+           {
+            "block": "stage:work/steps",
+            "index": 1,
+            "kind": "seq"
+           }
+          ],
+          "step": null,
+          "task": null,
+          "wait": "daca042f-3987-554f-881f-f8ca20babcd1"
+         }
+        },
+        "timers": {
+         "52f92b54-7f54-509b-8116-60ec36fe5b3e": {
+          "activity": "daca042f-3987-554f-881f-f8ca20babcd1",
+          "base": "2026-09-30T16:26:24.659942Z",
+          "dueAt": "2026-10-03T16:26:24.659942Z",
+          "element": "check",
+          "escalation": "/spec/stages/0/steps/0/human/escalations/0",
+          "frozenFrom": null,
+          "id": "52f92b54-7f54-509b-8116-60ec36fe5b3e",
+          "kind": "escalation",
+          "level": 1,
+          "n": 1,
+          "provisional": false,
+          "reads": [],
+          "recipe": {
+           "after": null,
+           "due": {
+            "kind": "duration",
+            "value": "P3D"
+           },
+           "kind": "after"
+          },
+          "remaining": null,
+          "scope": "stage:work",
+          "state": "pending"
+         }
+        },
+        "version": 2
+       },
+       "toVersion": 2
+      },
+      "kind": "migrate"
+     },
+     "intents": [],
+     "kind": "migrate",
+     "seq": 2,
+     "source_ref": "migration:ee0c1a86-66bd-4f1c-849e-8ad3c5fda4cd"
+    },
+    {
+     "actor_id": "4a66a89c-cea9-4ffd-9420-c63ce79a8771",
+     "at": "2026-09-30T16:26:24.896708Z",
+     "calendars": {
+      "ru": 1
+     },
+     "created_at": "2026-09-30T16:26:24.909935Z",
+     "decisions": [
+      {
+       "activity": "daca042f-3987-554f-881f-f8ca20babcd1",
+       "actor": "4a66a89c-cea9-4ffd-9420-c63ce79a8771",
+       "element": "check",
+       "kind": "task_completed",
+       "taskId": "5d9aba1d-6a20-4805-b350-5a8bf655f08e"
+      },
+      {
+       "element": "check",
+       "fields": [
+        "decision"
+       ],
+       "kind": "data_set"
+      },
+      {
+       "element": "check",
+       "kind": "step_completed"
+      },
+      {
+       "cause": "completed",
+       "element": "work",
+       "exit": null,
+       "kind": "stage_exited"
+      },
+      {
+       "element": "done",
+       "kind": "completed",
+       "outcome": "reviewed"
+      }
+     ],
+     "event_id": "ab36e373-d049-46d2-bf2d-e5045bc47c19",
+     "input": {
+      "actorId": "4a66a89c-cea9-4ffd-9420-c63ce79a8771",
+      "at": "2026-09-30T16:26:24.896708Z",
+      "body": {
+       "activityId": "daca042f-3987-554f-881f-f8ca20babcd1",
+       "status": "completed",
+       "task": {
+        "assigneeId": "4a66a89c-cea9-4ffd-9420-c63ce79a8771",
+        "customFields": {
+         "decision": "yes"
+        },
+        "id": "5d9aba1d-6a20-4805-b350-5a8bf655f08e",
+        "publicId": "TASK-000001",
+        "status": "done"
+       }
+      },
+      "kind": "task"
+     },
+     "intents": [
+      {
+       "element": "check",
+       "executed": {
+        "ok": true
+       },
+       "kind": "cancel_timer",
+       "timerId": "52f92b54-7f54-509b-8116-60ec36fe5b3e"
+      },
+      {
+       "executed": {
+        "ok": true
+       },
+       "kind": "emit_event",
+       "payload": {
+        "changedFields": [
+         "decision"
+        ],
+        "definitionKey": "replay-migrate",
+        "element": "check",
+        "instanceId": "b4077b5a-3324-4334-bba1-ff43feff474a",
+        "instanceKey": "M-done-after",
+        "memory": null,
+        "version": 2
+       },
+       "type": "process.data_changed"
+      },
+      {
+       "executed": {
+        "ok": true
+       },
+       "kind": "emit_event",
+       "payload": {
+        "definitionKey": "replay-migrate",
+        "instanceId": "b4077b5a-3324-4334-bba1-ff43feff474a",
+        "instanceKey": "M-done-after",
+        "stage": "work",
+        "version": 2
+       },
+       "type": "process.stage_exited"
+      },
+      {
+       "executed": {
+        "ok": true
+       },
+       "kind": "emit_event",
+       "payload": {
+        "definitionKey": "replay-migrate",
+        "instanceId": "b4077b5a-3324-4334-bba1-ff43feff474a",
+        "instanceKey": "M-done-after",
+        "memory": null,
+        "outcome": "reviewed",
+        "version": 2
+       },
+       "type": "process.completed"
+      },
+      {
+       "error": null,
+       "executed": {
+        "ok": true
+       },
+       "kind": "complete",
+       "outcome": "reviewed",
+       "status": "completed"
+      }
+     ],
+     "kind": "task",
+     "seq": 3,
+     "source_ref": "event:ab36e373-d049-46d2-bf2d-e5045bc47c19"
+    }
+   ],
+   "outcome": "reviewed",
+   "refs": {
+    "task:5d9aba1d-6a20-4805-b350-5a8bf655f08e": {
+     "activity": "daca042f-3987-554f-881f-f8ca20babcd1",
+     "element": "check"
+    }
+   },
+   "started_at": "2026-09-30T16:26:24.659279Z",
+   "state": {
+    "activities": {},
+    "attention": null,
+    "clock": "2026-09-30T16:26:24.896708Z",
+    "closing": null,
+    "counters": {
+     "activity": 1,
+     "done": 0,
+     "thread": 1,
+     "timer": 1
+    },
+    "data": {
+     "decision": "yes"
+    },
+    "deferred": [],
+    "definitionKey": "replay-migrate",
+    "done": [],
+    "error": null,
+    "instanceId": "b4077b5a-3324-4334-bba1-ff43feff474a",
+    "key": "M-done-after",
+    "lastTask": {
+     "assigneeId": "4a66a89c-cea9-4ffd-9420-c63ce79a8771",
+     "customFields": {
+      "decision": "yes"
+     },
+     "id": "5d9aba1d-6a20-4805-b350-5a8bf655f08e",
+     "publicId": "TASK-000001",
+     "status": "done"
+    },
+    "milestones": {},
+    "outcome": "reviewed",
+    "retrospective": null,
+    "seq": 3,
+    "stages": {
+     "work": {
+      "closedSeq": 3,
+      "enteredAt": "2026-09-30T16:26:24.659942Z",
+      "runs": 1,
+      "state": "completed"
+     }
+    },
+    "startedAt": "2026-09-30T16:26:24.659942Z",
+    "status": "completed",
+    "threads": {},
+    "timers": {},
+    "version": 2
+   },
+   "status": "completed",
+   "story": "migrated onto the renamed step, then done on version 2",
+   "updated_at": "2026-09-30T16:26:24.913700Z"
+  },
+  {
+   "completed_at": "2026-09-30T16:26:24.809676Z",
+   "data": {
+    "decision": "yes"
+   },
+   "definition_id": "dbeaa2f9-7ad3-4947-b625-65b5f90157a3",
+   "definition_key": "replay-migrate",
+   "definition_version": 1,
+   "error": null,
+   "id": "f0786e9a-12d1-4ddb-b534-ff92f458e928",
+   "instance_key": "M-done-before",
+   "journal": [
+    {
+     "actor_id": "4a66a89c-cea9-4ffd-9420-c63ce79a8771",
+     "at": "2026-09-30T16:26:24.715922Z",
+     "calendars": {
+      "ru": 1
+     },
+     "created_at": "2026-09-30T16:26:24.718537Z",
+     "decisions": [
+      {
+       "element": null,
+       "key": "M-done-before",
+       "kind": "started",
+       "trigger": {
+        "eventId": null,
+        "type": "command"
+       }
+      },
+      {
+       "element": "work",
+       "entry": null,
+       "kind": "stage_entered",
+       "run": 1
+      },
+      {
+       "activity": "1997ad94-4b12-5f84-bc62-a30944b2fac5",
+       "activityKind": "task",
+       "element": "review",
+       "kind": "activity_opened"
+      },
+      {
+       "dueAt": "2026-10-03T16:26:24.715922Z",
+       "element": "review",
+       "kind": "timer_set",
+       "provisional": false,
+       "timerId": "8c47358e-2afc-55e4-8836-f706e142c979",
+       "timerKind": "escalation"
+      }
+     ],
+     "event_id": null,
+     "input": {
+      "actorId": "4a66a89c-cea9-4ffd-9420-c63ce79a8771",
+      "at": "2026-09-30T16:26:24.715922Z",
+      "body": {
+       "data": {},
+       "instanceId": "f0786e9a-12d1-4ddb-b534-ff92f458e928",
+       "key": "M-done-before"
+      },
+      "kind": "start"
+     },
+     "intents": [
+      {
+       "executed": {
+        "ok": true
+       },
+       "kind": "emit_event",
+       "payload": {
+        "definitionKey": "replay-migrate",
+        "instanceId": "f0786e9a-12d1-4ddb-b534-ff92f458e928",
+        "instanceKey": "M-done-before",
+        "memory": null,
+        "triggerEventId": null,
+        "triggerType": "command",
+        "version": 1
+       },
+       "type": "process.started"
+      },
+      {
+       "executed": {
+        "ok": true
+       },
+       "kind": "emit_event",
+       "payload": {
+        "definitionKey": "replay-migrate",
+        "instanceId": "f0786e9a-12d1-4ddb-b534-ff92f458e928",
+        "instanceKey": "M-done-before",
+        "stage": "work",
+        "version": 1
+       },
+       "type": "process.stage_entered"
+      },
+      {
+       "activityId": "1997ad94-4b12-5f84-bc62-a30944b2fac5",
+       "assign": [
+        {
+         "principal": "4a66a89c-cea9-4ffd-9420-c63ce79a8771"
+        }
+       ],
+       "context": null,
+       "due": "2026-10-03T16:26:24.715922Z",
+       "element": "review",
+       "escalations": [
+        {
+         "action": "notify",
+         "after": "due",
+         "level": 1,
+         "to": [
+          {
+           "principal": "4a66a89c-cea9-4ffd-9420-c63ce79a8771"
+          }
+         ]
+        }
+       ],
+       "executed": {
+        "ok": true,
+        "taskId": "2473b440-f19c-4c60-a2f0-cf717d941b4a"
+       },
+       "externalRef": "process/f0786e9a-12d1-4ddb-b534-ff92f458e928/review",
+       "form": null,
+       "input": null,
+       "kind": "create_task",
+       "taskType": "review",
+       "title": "review"
+      },
+      {
+       "dueAt": "2026-10-03T16:26:24.715922Z",
+       "element": "review",
+       "executed": {
+        "ok": true
+       },
+       "kind": "set_timer",
+       "provisional": false,
+       "reads": [],
+       "remainingSeconds": null,
+       "state": "pending",
+       "timerId": "8c47358e-2afc-55e4-8836-f706e142c979",
+       "timerKind": "escalation"
+      }
+     ],
+     "kind": "start",
+     "seq": 0,
+     "source_ref": "start"
+    },
+    {
+     "actor_id": null,
+     "at": "2026-09-30T16:26:24.715922Z",
+     "calendars": {
+      "ru": 1
+     },
+     "created_at": "2026-09-30T16:26:24.760038Z",
+     "decisions": [],
+     "event_id": "23c3dd6b-0171-44b9-b43d-eefc36b48f1f",
+     "input": {
+      "actorId": null,
+      "at": "2026-09-30T16:26:24.715922Z",
+      "body": {
+       "key": "ru"
+      },
+      "kind": "calendar"
+     },
+     "intents": [],
+     "kind": "calendar",
+     "seq": 1,
+     "source_ref": "event:23c3dd6b-0171-44b9-b43d-eefc36b48f1f"
+    },
+    {
+     "actor_id": "4a66a89c-cea9-4ffd-9420-c63ce79a8771",
+     "at": "2026-09-30T16:26:24.790803Z",
+     "calendars": {
+      "ru": 1
+     },
+     "created_at": "2026-09-30T16:26:24.804676Z",
+     "decisions": [
+      {
+       "activity": "1997ad94-4b12-5f84-bc62-a30944b2fac5",
+       "actor": "4a66a89c-cea9-4ffd-9420-c63ce79a8771",
+       "element": "review",
+       "kind": "task_completed",
+       "taskId": "2473b440-f19c-4c60-a2f0-cf717d941b4a"
+      },
+      {
+       "element": "review",
+       "fields": [
+        "decision"
+       ],
+       "kind": "data_set"
+      },
+      {
+       "element": "review",
+       "kind": "step_completed"
+      },
+      {
+       "cause": "completed",
+       "element": "work",
+       "exit": null,
+       "kind": "stage_exited"
+      },
+      {
+       "element": "done",
+       "kind": "completed",
+       "outcome": "reviewed"
+      }
+     ],
+     "event_id": "cd0aa07d-0063-4401-835b-a1e043b1e282",
+     "input": {
+      "actorId": "4a66a89c-cea9-4ffd-9420-c63ce79a8771",
+      "at": "2026-09-30T16:26:24.790803Z",
+      "body": {
+       "activityId": "1997ad94-4b12-5f84-bc62-a30944b2fac5",
+       "status": "completed",
+       "task": {
+        "assigneeId": "4a66a89c-cea9-4ffd-9420-c63ce79a8771",
+        "customFields": {
+         "decision": "yes"
+        },
+        "id": "2473b440-f19c-4c60-a2f0-cf717d941b4a",
+        "publicId": "TASK-000004",
+        "status": "done"
+       }
+      },
+      "kind": "task"
+     },
+     "intents": [
+      {
+       "element": "review",
+       "executed": {
+        "ok": true
+       },
+       "kind": "cancel_timer",
+       "timerId": "8c47358e-2afc-55e4-8836-f706e142c979"
+      },
+      {
+       "executed": {
+        "ok": true
+       },
+       "kind": "emit_event",
+       "payload": {
+        "changedFields": [
+         "decision"
+        ],
+        "definitionKey": "replay-migrate",
+        "element": "review",
+        "instanceId": "f0786e9a-12d1-4ddb-b534-ff92f458e928",
+        "instanceKey": "M-done-before",
+        "memory": null,
+        "version": 1
+       },
+       "type": "process.data_changed"
+      },
+      {
+       "executed": {
+        "ok": true
+       },
+       "kind": "emit_event",
+       "payload": {
+        "definitionKey": "replay-migrate",
+        "instanceId": "f0786e9a-12d1-4ddb-b534-ff92f458e928",
+        "instanceKey": "M-done-before",
+        "stage": "work",
+        "version": 1
+       },
+       "type": "process.stage_exited"
+      },
+      {
+       "executed": {
+        "ok": true
+       },
+       "kind": "emit_event",
+       "payload": {
+        "definitionKey": "replay-migrate",
+        "instanceId": "f0786e9a-12d1-4ddb-b534-ff92f458e928",
+        "instanceKey": "M-done-before",
+        "memory": null,
+        "outcome": "reviewed",
+        "version": 1
+       },
+       "type": "process.completed"
+      },
+      {
+       "error": null,
+       "executed": {
+        "ok": true
+       },
+       "kind": "complete",
+       "outcome": "reviewed",
+       "status": "completed"
+      }
+     ],
+     "kind": "task",
+     "seq": 2,
+     "source_ref": "event:cd0aa07d-0063-4401-835b-a1e043b1e282"
+    }
+   ],
+   "outcome": "reviewed",
+   "refs": {
+    "task:2473b440-f19c-4c60-a2f0-cf717d941b4a": {
+     "activity": "1997ad94-4b12-5f84-bc62-a30944b2fac5",
+     "element": "review"
+    }
+   },
+   "started_at": "2026-09-30T16:26:24.715619Z",
+   "state": {
+    "activities": {},
+    "attention": null,
+    "clock": "2026-09-30T16:26:24.790803Z",
+    "closing": null,
+    "counters": {
+     "activity": 1,
+     "done": 0,
+     "thread": 1,
+     "timer": 1
+    },
+    "data": {
+     "decision": "yes"
+    },
+    "deferred": [],
+    "definitionKey": "replay-migrate",
+    "done": [],
+    "error": null,
+    "instanceId": "f0786e9a-12d1-4ddb-b534-ff92f458e928",
+    "key": "M-done-before",
+    "lastTask": {
+     "assigneeId": "4a66a89c-cea9-4ffd-9420-c63ce79a8771",
+     "customFields": {
+      "decision": "yes"
+     },
+     "id": "2473b440-f19c-4c60-a2f0-cf717d941b4a",
+     "publicId": "TASK-000004",
+     "status": "done"
+    },
+    "milestones": {},
+    "outcome": "reviewed",
+    "retrospective": null,
+    "seq": 2,
+    "stages": {
+     "work": {
+      "closedSeq": 2,
+      "enteredAt": "2026-09-30T16:26:24.715922Z",
+      "runs": 1,
+      "state": "completed"
+     }
+    },
+    "startedAt": "2026-09-30T16:26:24.715922Z",
+    "status": "completed",
+    "threads": {},
+    "timers": {},
+    "version": 1
+   },
+   "status": "completed",
+   "story": "done on version 1 before the migration",
+   "updated_at": "2026-09-30T16:26:24.809676Z"
+  },
+  {
+   "completed_at": null,
+   "data": {},
+   "definition_id": "ee0c1a86-66bd-4f1c-849e-8ad3c5fda4cd",
+   "definition_key": "replay-migrate",
+   "definition_version": 2,
+   "error": null,
+   "id": "48287991-feb7-49d3-85ef-6e7491436da4",
+   "instance_key": "M-open",
+   "journal": [
+    {
+     "actor_id": "4a66a89c-cea9-4ffd-9420-c63ce79a8771",
+     "at": "2026-09-30T16:26:24.682922Z",
+     "calendars": {
+      "ru": 1
+     },
+     "created_at": "2026-09-30T16:26:24.685981Z",
+     "decisions": [
+      {
+       "element": null,
+       "key": "M-open",
+       "kind": "started",
+       "trigger": {
+        "eventId": null,
+        "type": "command"
+       }
+      },
+      {
+       "element": "work",
+       "entry": null,
+       "kind": "stage_entered",
+       "run": 1
+      },
+      {
+       "activity": "b7e707e6-d787-56b1-a040-f234d8d6a7d2",
+       "activityKind": "task",
+       "element": "review",
+       "kind": "activity_opened"
+      },
+      {
+       "dueAt": "2026-10-03T16:26:24.682922Z",
+       "element": "review",
+       "kind": "timer_set",
+       "provisional": false,
+       "timerId": "f180ea0b-9fd0-5b76-962e-541142fac5f7",
+       "timerKind": "escalation"
+      }
+     ],
+     "event_id": null,
+     "input": {
+      "actorId": "4a66a89c-cea9-4ffd-9420-c63ce79a8771",
+      "at": "2026-09-30T16:26:24.682922Z",
+      "body": {
+       "data": {},
+       "instanceId": "48287991-feb7-49d3-85ef-6e7491436da4",
+       "key": "M-open"
+      },
+      "kind": "start"
+     },
+     "intents": [
+      {
+       "executed": {
+        "ok": true
+       },
+       "kind": "emit_event",
+       "payload": {
+        "definitionKey": "replay-migrate",
+        "instanceId": "48287991-feb7-49d3-85ef-6e7491436da4",
+        "instanceKey": "M-open",
+        "memory": null,
+        "triggerEventId": null,
+        "triggerType": "command",
+        "version": 1
+       },
+       "type": "process.started"
+      },
+      {
+       "executed": {
+        "ok": true
+       },
+       "kind": "emit_event",
+       "payload": {
+        "definitionKey": "replay-migrate",
+        "instanceId": "48287991-feb7-49d3-85ef-6e7491436da4",
+        "instanceKey": "M-open",
+        "stage": "work",
+        "version": 1
+       },
+       "type": "process.stage_entered"
+      },
+      {
+       "activityId": "b7e707e6-d787-56b1-a040-f234d8d6a7d2",
+       "assign": [
+        {
+         "principal": "4a66a89c-cea9-4ffd-9420-c63ce79a8771"
+        }
+       ],
+       "context": null,
+       "due": "2026-10-03T16:26:24.682922Z",
+       "element": "review",
+       "escalations": [
+        {
+         "action": "notify",
+         "after": "due",
+         "level": 1,
+         "to": [
+          {
+           "principal": "4a66a89c-cea9-4ffd-9420-c63ce79a8771"
+          }
+         ]
+        }
+       ],
+       "executed": {
+        "ok": true,
+        "taskId": "4c5823d9-7ac3-4d53-a837-2b9e50207152"
+       },
+       "externalRef": "process/48287991-feb7-49d3-85ef-6e7491436da4/review",
+       "form": null,
+       "input": null,
+       "kind": "create_task",
+       "taskType": "review",
+       "title": "review"
+      },
+      {
+       "dueAt": "2026-10-03T16:26:24.682922Z",
+       "element": "review",
+       "executed": {
+        "ok": true
+       },
+       "kind": "set_timer",
+       "provisional": false,
+       "reads": [],
+       "remainingSeconds": null,
+       "state": "pending",
+       "timerId": "f180ea0b-9fd0-5b76-962e-541142fac5f7",
+       "timerKind": "escalation"
+      }
+     ],
+     "kind": "start",
+     "seq": 0,
+     "source_ref": "start"
+    },
+    {
+     "actor_id": null,
+     "at": "2026-09-30T16:26:24.682922Z",
+     "calendars": {
+      "ru": 1
+     },
+     "created_at": "2026-09-30T16:26:24.754804Z",
+     "decisions": [],
+     "event_id": "23c3dd6b-0171-44b9-b43d-eefc36b48f1f",
+     "input": {
+      "actorId": null,
+      "at": "2026-09-30T16:26:24.682922Z",
+      "body": {
+       "key": "ru"
+      },
+      "kind": "calendar"
+     },
+     "intents": [],
+     "kind": "calendar",
+     "seq": 1,
+     "source_ref": "event:23c3dd6b-0171-44b9-b43d-eefc36b48f1f"
+    },
+    {
+     "actor_id": "4a66a89c-cea9-4ffd-9420-c63ce79a8771",
+     "at": "2026-09-30T16:26:24.856999Z",
+     "calendars": {},
+     "created_at": "2026-09-30T16:26:24.857044Z",
+     "decisions": [
+      {
+       "element": null,
+       "fromKey": "replay-migrate",
+       "fromVersion": 1,
+       "kind": "migrated",
+       "map": {
+        "review": "check"
+       },
+       "policy": "migrate",
+       "toVersion": 2
+      }
+     ],
+     "event_id": null,
+     "input": {
+      "actorId": "4a66a89c-cea9-4ffd-9420-c63ce79a8771",
+      "at": "2026-09-30T16:26:24.856999Z",
+      "body": {
+       "fromKey": "replay-migrate",
+       "fromVersion": 1,
+       "map": {
+        "review": "check"
+       },
+       "planHash": "sha256:abc05d2dab0e25bc7c04d88a8067a007587d33f1f014225adbe5e1a15019cbc4",
+       "policy": "migrate",
+       "state": {
+        "activities": {
+         "b7e707e6-d787-56b1-a040-f234d8d6a7d2": {
+          "assign": [
+           {
+            "principal": "4a66a89c-cea9-4ffd-9420-c63ce79a8771"
+           }
+          ],
+          "due": "2026-10-03T16:26:24.682922Z",
+          "element": "check",
+          "id": "b7e707e6-d787-56b1-a040-f234d8d6a7d2",
+          "kind": "task",
+          "n": 1,
+          "openedAt": "2026-09-30T16:26:24.682922Z",
+          "thread": "t1",
+          "timers": [
+           "f180ea0b-9fd0-5b76-962e-541142fac5f7"
+          ]
+         }
+        },
+        "attention": null,
+        "clock": "2026-09-30T16:26:24.682922Z",
+        "closing": null,
+        "counters": {
+         "activity": 1,
+         "done": 0,
+         "thread": 1,
+         "timer": 1
+        },
+        "data": {},
+        "deferred": [],
+        "definitionKey": "replay-migrate",
+        "done": [],
+        "error": null,
+        "instanceId": "48287991-feb7-49d3-85ef-6e7491436da4",
+        "key": "M-open",
+        "lastTask": null,
+        "milestones": {},
+        "outcome": null,
+        "retrospective": null,
+        "seq": 2,
+        "stages": {
+         "work": {
+          "closedSeq": null,
+          "enteredAt": "2026-09-30T16:26:24.682922Z",
+          "runs": 1,
+          "state": "active"
+         }
+        },
+        "startedAt": "2026-09-30T16:26:24.682922Z",
+        "status": "running",
+        "threads": {
+         "t1": {
+          "event": null,
+          "id": "t1",
+          "n": 1,
+          "parent": null,
+          "scope": "stage:work",
+          "stack": [
+           {
+            "block": "stage:work/steps",
+            "index": 1,
+            "kind": "seq"
+           }
+          ],
+          "step": null,
+          "task": null,
+          "wait": "b7e707e6-d787-56b1-a040-f234d8d6a7d2"
+         }
+        },
+        "timers": {
+         "f180ea0b-9fd0-5b76-962e-541142fac5f7": {
+          "activity": "b7e707e6-d787-56b1-a040-f234d8d6a7d2",
+          "base": "2026-09-30T16:26:24.682922Z",
+          "dueAt": "2026-10-03T16:26:24.682922Z",
+          "element": "check",
+          "escalation": "/spec/stages/0/steps/0/human/escalations/0",
+          "frozenFrom": null,
+          "id": "f180ea0b-9fd0-5b76-962e-541142fac5f7",
+          "kind": "escalation",
+          "level": 1,
+          "n": 1,
+          "provisional": false,
+          "reads": [],
+          "recipe": {
+           "after": null,
+           "due": {
+            "kind": "duration",
+            "value": "P3D"
+           },
+           "kind": "after"
+          },
+          "remaining": null,
+          "scope": "stage:work",
+          "state": "pending"
+         }
+        },
+        "version": 2
+       },
+       "toVersion": 2
+      },
+      "kind": "migrate"
+     },
+     "intents": [],
+     "kind": "migrate",
+     "seq": 2,
+     "source_ref": "migration:ee0c1a86-66bd-4f1c-849e-8ad3c5fda4cd"
+    }
+   ],
+   "outcome": null,
+   "refs": {
+    "task:4c5823d9-7ac3-4d53-a837-2b9e50207152": {
+     "activity": "b7e707e6-d787-56b1-a040-f234d8d6a7d2",
+     "element": "check"
+    }
+   },
+   "started_at": "2026-09-30T16:26:24.682557Z",
+   "state": {
+    "activities": {
+     "b7e707e6-d787-56b1-a040-f234d8d6a7d2": {
+      "assign": [
+       {
+        "principal": "4a66a89c-cea9-4ffd-9420-c63ce79a8771"
+       }
+      ],
+      "due": "2026-10-03T16:26:24.682922Z",
+      "element": "check",
+      "id": "b7e707e6-d787-56b1-a040-f234d8d6a7d2",
+      "kind": "task",
+      "n": 1,
+      "openedAt": "2026-09-30T16:26:24.682922Z",
+      "thread": "t1",
+      "timers": [
+       "f180ea0b-9fd0-5b76-962e-541142fac5f7"
+      ]
+     }
+    },
+    "attention": null,
+    "clock": "2026-09-30T16:26:24.682922Z",
+    "closing": null,
+    "counters": {
+     "activity": 1,
+     "done": 0,
+     "thread": 1,
+     "timer": 1
+    },
+    "data": {},
+    "deferred": [],
+    "definitionKey": "replay-migrate",
+    "done": [],
+    "error": null,
+    "instanceId": "48287991-feb7-49d3-85ef-6e7491436da4",
+    "key": "M-open",
+    "lastTask": null,
+    "milestones": {},
+    "outcome": null,
+    "retrospective": null,
+    "seq": 2,
+    "stages": {
+     "work": {
+      "closedSeq": null,
+      "enteredAt": "2026-09-30T16:26:24.682922Z",
+      "runs": 1,
+      "state": "active"
+     }
+    },
+    "startedAt": "2026-09-30T16:26:24.682922Z",
+    "status": "running",
+    "threads": {
+     "t1": {
+      "event": null,
+      "id": "t1",
+      "n": 1,
+      "parent": null,
+      "scope": "stage:work",
+      "stack": [
+       {
+        "block": "stage:work/steps",
+        "index": 1,
+        "kind": "seq"
+       }
+      ],
+      "step": null,
+      "task": null,
+      "wait": "b7e707e6-d787-56b1-a040-f234d8d6a7d2"
+     }
+    },
+    "timers": {
+     "f180ea0b-9fd0-5b76-962e-541142fac5f7": {
+      "activity": "b7e707e6-d787-56b1-a040-f234d8d6a7d2",
+      "base": "2026-09-30T16:26:24.682922Z",
+      "dueAt": "2026-10-03T16:26:24.682922Z",
+      "element": "check",
+      "escalation": "/spec/stages/0/steps/0/human/escalations/0",
+      "frozenFrom": null,
+      "id": "f180ea0b-9fd0-5b76-962e-541142fac5f7",
+      "kind": "escalation",
+      "level": 1,
+      "n": 1,
+      "provisional": false,
+      "reads": [],
+      "recipe": {
+       "after": null,
+       "due": {
+        "kind": "duration",
+        "value": "P3D"
+       },
+       "kind": "after"
+      },
+      "remaining": null,
+      "scope": "stage:work",
+      "state": "pending"
+     }
+    },
+    "version": 2
+   },
+   "status": "running",
+   "story": "migrated and left waiting on the renamed step",
+   "updated_at": "2026-09-30T16:26:24.857074Z"
+  },
+  {
+   "completed_at": null,
+   "data": {},
+   "definition_id": "ee0c1a86-66bd-4f1c-849e-8ad3c5fda4cd",
+   "definition_key": "replay-migrate",
+   "definition_version": 2,
+   "error": null,
+   "id": "05db50da-fd5d-4cd7-8564-0ed9931cbfba",
+   "instance_key": "M-suspended",
+   "journal": [
+    {
+     "actor_id": "4a66a89c-cea9-4ffd-9420-c63ce79a8771",
+     "at": "2026-09-30T16:26:24.700869Z",
+     "calendars": {
+      "ru": 1
+     },
+     "created_at": "2026-09-30T16:26:24.703694Z",
+     "decisions": [
+      {
+       "element": null,
+       "key": "M-suspended",
+       "kind": "started",
+       "trigger": {
+        "eventId": null,
+        "type": "command"
+       }
+      },
+      {
+       "element": "work",
+       "entry": null,
+       "kind": "stage_entered",
+       "run": 1
+      },
+      {
+       "activity": "df920bcb-e0ef-51eb-9e5e-750c35081285",
+       "activityKind": "task",
+       "element": "review",
+       "kind": "activity_opened"
+      },
+      {
+       "dueAt": "2026-10-03T16:26:24.700869Z",
+       "element": "review",
+       "kind": "timer_set",
+       "provisional": false,
+       "timerId": "4b9bd563-7773-561b-905e-460c44a5336b",
+       "timerKind": "escalation"
+      }
+     ],
+     "event_id": null,
+     "input": {
+      "actorId": "4a66a89c-cea9-4ffd-9420-c63ce79a8771",
+      "at": "2026-09-30T16:26:24.700869Z",
+      "body": {
+       "data": {},
+       "instanceId": "05db50da-fd5d-4cd7-8564-0ed9931cbfba",
+       "key": "M-suspended"
+      },
+      "kind": "start"
+     },
+     "intents": [
+      {
+       "executed": {
+        "ok": true
+       },
+       "kind": "emit_event",
+       "payload": {
+        "definitionKey": "replay-migrate",
+        "instanceId": "05db50da-fd5d-4cd7-8564-0ed9931cbfba",
+        "instanceKey": "M-suspended",
+        "memory": null,
+        "triggerEventId": null,
+        "triggerType": "command",
+        "version": 1
+       },
+       "type": "process.started"
+      },
+      {
+       "executed": {
+        "ok": true
+       },
+       "kind": "emit_event",
+       "payload": {
+        "definitionKey": "replay-migrate",
+        "instanceId": "05db50da-fd5d-4cd7-8564-0ed9931cbfba",
+        "instanceKey": "M-suspended",
+        "stage": "work",
+        "version": 1
+       },
+       "type": "process.stage_entered"
+      },
+      {
+       "activityId": "df920bcb-e0ef-51eb-9e5e-750c35081285",
+       "assign": [
+        {
+         "principal": "4a66a89c-cea9-4ffd-9420-c63ce79a8771"
+        }
+       ],
+       "context": null,
+       "due": "2026-10-03T16:26:24.700869Z",
+       "element": "review",
+       "escalations": [
+        {
+         "action": "notify",
+         "after": "due",
+         "level": 1,
+         "to": [
+          {
+           "principal": "4a66a89c-cea9-4ffd-9420-c63ce79a8771"
+          }
+         ]
+        }
+       ],
+       "executed": {
+        "ok": true,
+        "taskId": "3b208f3a-4676-4128-af04-463bf038c0de"
+       },
+       "externalRef": "process/05db50da-fd5d-4cd7-8564-0ed9931cbfba/review",
+       "form": null,
+       "input": null,
+       "kind": "create_task",
+       "taskType": "review",
+       "title": "review"
+      },
+      {
+       "dueAt": "2026-10-03T16:26:24.700869Z",
+       "element": "review",
+       "executed": {
+        "ok": true
+       },
+       "kind": "set_timer",
+       "provisional": false,
+       "reads": [],
+       "remainingSeconds": null,
+       "state": "pending",
+       "timerId": "4b9bd563-7773-561b-905e-460c44a5336b",
+       "timerKind": "escalation"
+      }
+     ],
+     "kind": "start",
+     "seq": 0,
+     "source_ref": "start"
+    },
+    {
+     "actor_id": null,
+     "at": "2026-09-30T16:26:24.700869Z",
+     "calendars": {
+      "ru": 1
+     },
+     "created_at": "2026-09-30T16:26:24.757522Z",
+     "decisions": [],
+     "event_id": "23c3dd6b-0171-44b9-b43d-eefc36b48f1f",
+     "input": {
+      "actorId": null,
+      "at": "2026-09-30T16:26:24.700869Z",
+      "body": {
+       "key": "ru"
+      },
+      "kind": "calendar"
+     },
+     "intents": [],
+     "kind": "calendar",
+     "seq": 1,
+     "source_ref": "event:23c3dd6b-0171-44b9-b43d-eefc36b48f1f"
+    },
+    {
+     "actor_id": "4a66a89c-cea9-4ffd-9420-c63ce79a8771",
+     "at": "2026-09-30T16:26:24.852890Z",
+     "calendars": {},
+     "created_at": "2026-09-30T16:26:24.852933Z",
+     "decisions": [
+      {
+       "element": null,
+       "fromKey": "replay-migrate",
+       "fromVersion": 1,
+       "kind": "migrated",
+       "map": {
+        "review": "check"
+       },
+       "policy": "migrate",
+       "toVersion": 2
+      }
+     ],
+     "event_id": null,
+     "input": {
+      "actorId": "4a66a89c-cea9-4ffd-9420-c63ce79a8771",
+      "at": "2026-09-30T16:26:24.852890Z",
+      "body": {
+       "fromKey": "replay-migrate",
+       "fromVersion": 1,
+       "map": {
+        "review": "check"
+       },
+       "planHash": "sha256:abc05d2dab0e25bc7c04d88a8067a007587d33f1f014225adbe5e1a15019cbc4",
+       "policy": "migrate",
+       "state": {
+        "activities": {
+         "df920bcb-e0ef-51eb-9e5e-750c35081285": {
+          "assign": [
+           {
+            "principal": "4a66a89c-cea9-4ffd-9420-c63ce79a8771"
+           }
+          ],
+          "due": "2026-10-03T16:26:24.700869Z",
+          "element": "check",
+          "id": "df920bcb-e0ef-51eb-9e5e-750c35081285",
+          "kind": "task",
+          "n": 1,
+          "openedAt": "2026-09-30T16:26:24.700869Z",
+          "thread": "t1",
+          "timers": [
+           "4b9bd563-7773-561b-905e-460c44a5336b"
+          ]
+         }
+        },
+        "attention": null,
+        "clock": "2026-09-30T16:26:24.700869Z",
+        "closing": null,
+        "counters": {
+         "activity": 1,
+         "done": 0,
+         "thread": 1,
+         "timer": 1
+        },
+        "data": {},
+        "deferred": [],
+        "definitionKey": "replay-migrate",
+        "done": [],
+        "error": null,
+        "instanceId": "05db50da-fd5d-4cd7-8564-0ed9931cbfba",
+        "key": "M-suspended",
+        "lastTask": null,
+        "milestones": {},
+        "outcome": null,
+        "retrospective": null,
+        "seq": 2,
+        "stages": {
+         "work": {
+          "closedSeq": null,
+          "enteredAt": "2026-09-30T16:26:24.700869Z",
+          "runs": 1,
+          "state": "active"
+         }
+        },
+        "startedAt": "2026-09-30T16:26:24.700869Z",
+        "status": "running",
+        "threads": {
+         "t1": {
+          "event": null,
+          "id": "t1",
+          "n": 1,
+          "parent": null,
+          "scope": "stage:work",
+          "stack": [
+           {
+            "block": "stage:work/steps",
+            "index": 1,
+            "kind": "seq"
+           }
+          ],
+          "step": null,
+          "task": null,
+          "wait": "df920bcb-e0ef-51eb-9e5e-750c35081285"
+         }
+        },
+        "timers": {
+         "4b9bd563-7773-561b-905e-460c44a5336b": {
+          "activity": "df920bcb-e0ef-51eb-9e5e-750c35081285",
+          "base": "2026-09-30T16:26:24.700869Z",
+          "dueAt": "2026-10-03T16:26:24.700869Z",
+          "element": "check",
+          "escalation": "/spec/stages/0/steps/0/human/escalations/0",
+          "frozenFrom": null,
+          "id": "4b9bd563-7773-561b-905e-460c44a5336b",
+          "kind": "escalation",
+          "level": 1,
+          "n": 1,
+          "provisional": false,
+          "reads": [],
+          "recipe": {
+           "after": null,
+           "due": {
+            "kind": "duration",
+            "value": "P3D"
+           },
+           "kind": "after"
+          },
+          "remaining": null,
+          "scope": "stage:work",
+          "state": "pending"
+         }
+        },
+        "version": 2
+       },
+       "toVersion": 2
+      },
+      "kind": "migrate"
+     },
+     "intents": [],
+     "kind": "migrate",
+     "seq": 2,
+     "source_ref": "migration:ee0c1a86-66bd-4f1c-849e-8ad3c5fda4cd"
+    },
+    {
+     "actor_id": "4a66a89c-cea9-4ffd-9420-c63ce79a8771",
+     "at": "2026-09-30T16:26:24.923520Z",
+     "calendars": {
+      "ru": 1
+     },
+     "created_at": "2026-09-30T16:26:24.926528Z",
+     "decisions": [
+      {
+       "cause": "operator",
+       "element": null,
+       "kind": "suspended",
+       "reason": "hold"
+      }
+     ],
+     "event_id": null,
+     "input": {
+      "actorId": "4a66a89c-cea9-4ffd-9420-c63ce79a8771",
+      "at": "2026-09-30T16:26:24.923520Z",
+      "body": {
+       "action": "suspend",
+       "reason": "hold"
+      },
+      "kind": "command"
+     },
+     "intents": [
+      {
+       "dueAt": null,
+       "element": "check",
+       "executed": {
+        "ok": true
+       },
+       "kind": "set_timer",
+       "provisional": false,
+       "reads": [],
+       "remainingSeconds": 259199.777349,
+       "state": "frozen",
+       "timerId": "4b9bd563-7773-561b-905e-460c44a5336b",
+       "timerKind": "escalation"
+      },
+      {
+       "executed": {
+        "ok": true
+       },
+       "kind": "emit_event",
+       "payload": {
+        "cause": "operator",
+        "definitionKey": "replay-migrate",
+        "instanceId": "05db50da-fd5d-4cd7-8564-0ed9931cbfba",
+        "instanceKey": "M-suspended",
+        "reason": "hold",
+        "version": 2
+       },
+       "type": "process.suspended"
+      }
+     ],
+     "kind": "command",
+     "seq": 3,
+     "source_ref": "command:d20d39c3-f93d-4166-8ddc-480c25241423"
+    },
+    {
+     "actor_id": "4a66a89c-cea9-4ffd-9420-c63ce79a8771",
+     "at": "2026-09-30T16:26:24.932497Z",
+     "calendars": {
+      "ru": 1
+     },
+     "created_at": "2026-09-30T16:26:24.935152Z",
+     "decisions": [
+      {
+       "cause": "operator",
+       "element": null,
+       "kind": "resumed"
+      }
+     ],
+     "event_id": null,
+     "input": {
+      "actorId": "4a66a89c-cea9-4ffd-9420-c63ce79a8771",
+      "at": "2026-09-30T16:26:24.932497Z",
+      "body": {
+       "action": "resume",
+       "reason": ""
+      },
+      "kind": "command"
+     },
+     "intents": [
+      {
+       "dueAt": "2026-10-03T16:26:24.709846Z",
+       "element": "check",
+       "executed": {
+        "ok": true
+       },
+       "kind": "set_timer",
+       "provisional": false,
+       "reads": [],
+       "remainingSeconds": null,
+       "state": "pending",
+       "timerId": "4b9bd563-7773-561b-905e-460c44a5336b",
+       "timerKind": "escalation"
+      },
+      {
+       "executed": {
+        "ok": true
+       },
+       "kind": "emit_event",
+       "payload": {
+        "cause": "resumed",
+        "changedFields": [],
+        "definitionKey": "replay-migrate",
+        "dueAt": "2026-10-03T16:26:24.709846Z",
+        "element": "check",
+        "instanceId": "05db50da-fd5d-4cd7-8564-0ed9931cbfba",
+        "instanceKey": "M-suspended",
+        "previousDueAt": "2026-10-03T16:26:24.700869Z",
+        "provisional": false,
+        "timerId": "4b9bd563-7773-561b-905e-460c44a5336b",
+        "version": 2
+       },
+       "type": "process.timer_rescheduled"
+      },
+      {
+       "executed": {
+        "ok": true
+       },
+       "kind": "emit_event",
+       "payload": {
+        "cause": "operator",
+        "definitionKey": "replay-migrate",
+        "instanceId": "05db50da-fd5d-4cd7-8564-0ed9931cbfba",
+        "instanceKey": "M-suspended",
+        "version": 2
+       },
+       "type": "process.resumed"
+      }
+     ],
+     "kind": "command",
+     "seq": 4,
+     "source_ref": "command:1d362b4d-c16d-469f-bcdc-2b0487359301"
+    }
+   ],
+   "outcome": null,
+   "refs": {
+    "task:3b208f3a-4676-4128-af04-463bf038c0de": {
+     "activity": "df920bcb-e0ef-51eb-9e5e-750c35081285",
+     "element": "check"
+    }
+   },
+   "started_at": "2026-09-30T16:26:24.700465Z",
+   "state": {
+    "activities": {
+     "df920bcb-e0ef-51eb-9e5e-750c35081285": {
+      "assign": [
+       {
+        "principal": "4a66a89c-cea9-4ffd-9420-c63ce79a8771"
+       }
+      ],
+      "due": "2026-10-03T16:26:24.700869Z",
+      "element": "check",
+      "id": "df920bcb-e0ef-51eb-9e5e-750c35081285",
+      "kind": "task",
+      "n": 1,
+      "openedAt": "2026-09-30T16:26:24.700869Z",
+      "thread": "t1",
+      "timers": [
+       "4b9bd563-7773-561b-905e-460c44a5336b"
+      ]
+     }
+    },
+    "attention": null,
+    "clock": "2026-09-30T16:26:24.932497Z",
+    "closing": null,
+    "counters": {
+     "activity": 1,
+     "done": 0,
+     "thread": 1,
+     "timer": 1
+    },
+    "data": {},
+    "deferred": [],
+    "definitionKey": "replay-migrate",
+    "done": [],
+    "error": null,
+    "instanceId": "05db50da-fd5d-4cd7-8564-0ed9931cbfba",
+    "key": "M-suspended",
+    "lastTask": null,
+    "milestones": {},
+    "outcome": null,
+    "retrospective": null,
+    "seq": 4,
+    "stages": {
+     "work": {
+      "closedSeq": null,
+      "enteredAt": "2026-09-30T16:26:24.700869Z",
+      "runs": 1,
+      "state": "active"
+     }
+    },
+    "startedAt": "2026-09-30T16:26:24.700869Z",
+    "status": "running",
+    "threads": {
+     "t1": {
+      "event": null,
+      "id": "t1",
+      "n": 1,
+      "parent": null,
+      "scope": "stage:work",
+      "stack": [
+       {
+        "block": "stage:work/steps",
+        "index": 1,
+        "kind": "seq"
+       }
+      ],
+      "step": null,
+      "task": null,
+      "wait": "df920bcb-e0ef-51eb-9e5e-750c35081285"
+     }
+    },
+    "timers": {
+     "4b9bd563-7773-561b-905e-460c44a5336b": {
+      "activity": "df920bcb-e0ef-51eb-9e5e-750c35081285",
+      "base": "2026-09-30T16:26:24.700869Z",
+      "dueAt": "2026-10-03T16:26:24.709846Z",
+      "element": "check",
+      "escalation": "/spec/stages/0/steps/0/human/escalations/0",
+      "frozenFrom": "2026-10-03T16:26:24.700869Z",
+      "id": "4b9bd563-7773-561b-905e-460c44a5336b",
+      "kind": "escalation",
+      "level": 1,
+      "n": 1,
+      "provisional": false,
+      "reads": [],
+      "recipe": {
+       "after": null,
+       "due": {
+        "kind": "duration",
+        "value": "P3D"
+       },
+       "kind": "after"
+      },
+      "remaining": null,
+      "scope": "stage:work",
+      "state": "pending"
+     }
+    },
+    "version": 2
+   },
+   "status": "running",
+   "story": "migrated, suspended and resumed on version 2",
+   "updated_at": "2026-09-30T16:26:24.937822Z"
+  }
+ ],
+ "process": "replay-migrate",
+ "recordedWith": {
+  "commit": "5f352a3867952e8e157bcf7628d4ebc35938d018",
+  "ref": "main"
+ }
+}

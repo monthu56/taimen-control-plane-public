@@ -1,0 +1,595 @@
+{
+  "components": {
+    "schemas": {
+      "ServiceEndpoint": {
+        "additionalProperties": false,
+        "description": "Where a ready service is and how to log in; substituted into ``env`` of ``runner.yaml``.",
+        "properties": {
+          "database": {
+            "pattern": "^[a-z_][a-z0-9_]{0,62}$",
+            "title": "Database",
+            "type": "string"
+          },
+          "host": {
+            "pattern": "^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$",
+            "title": "Host",
+            "type": "string"
+          },
+          "password": {
+            "pattern": "^[A-Za-z0-9_-]{24,128}$",
+            "title": "Password",
+            "type": "string"
+          },
+          "port": {
+            "maximum": 65535,
+            "minimum": 1,
+            "title": "Port",
+            "type": "integer"
+          },
+          "user": {
+            "pattern": "^[a-z_][a-z0-9_]{0,62}$",
+            "title": "User",
+            "type": "string"
+          }
+        },
+        "required": [
+          "host",
+          "port",
+          "user",
+          "password",
+          "database"
+        ],
+        "title": "ServiceEndpoint",
+        "type": "object"
+      },
+      "ServiceRequest": {
+        "additionalProperties": false,
+        "description": "One service a run asks for: a template name and nothing else — no image, mounts or privileges.",
+        "properties": {
+          "template": {
+            "pattern": "^[a-z0-9][a-z0-9-]{0,62}$",
+            "title": "Template",
+            "type": "string"
+          }
+        },
+        "required": [
+          "template"
+        ],
+        "title": "ServiceRequest",
+        "type": "object"
+      },
+      "ServicesAnswer": {
+        "additionalProperties": false,
+        "description": "State of a request. ``ready`` carries every requested service; the other final states a reason.\nThe pair the request was made for travels with it: a listener that restarted hands an answer found in\nthe queue to its owner only.",
+        "properties": {
+          "agentKey": {
+            "maxLength": 63,
+            "minLength": 2,
+            "pattern": "^[a-z0-9][a-z0-9-]*$",
+            "title": "Agentkey",
+            "type": "string"
+          },
+          "message": {
+            "default": "",
+            "maxLength": 500,
+            "title": "Message",
+            "type": "string"
+          },
+          "reason": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ServicesReason"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          },
+          "replica": {
+            "maximum": 99,
+            "minimum": 0,
+            "title": "Replica",
+            "type": "integer"
+          },
+          "requestId": {
+            "format": "uuid",
+            "title": "Requestid",
+            "type": "string"
+          },
+          "services": {
+            "patternProperties": {
+              "^[a-z0-9]([a-z0-9-]{0,29}[a-z0-9])?$": {
+                "$ref": "#/components/schemas/ServiceEndpoint"
+              }
+            },
+            "title": "Services",
+            "type": "object"
+          },
+          "status": {
+            "$ref": "#/components/schemas/ServicesStatus"
+          }
+        },
+        "required": [
+          "requestId",
+          "agentKey",
+          "replica",
+          "status"
+        ],
+        "title": "ServicesAnswer",
+        "type": "object"
+      },
+      "ServicesError": {
+        "additionalProperties": false,
+        "properties": {
+          "detail": {
+            "$ref": "#/components/schemas/ServicesErrorDetail"
+          }
+        },
+        "required": [
+          "detail"
+        ],
+        "title": "ServicesError",
+        "type": "object"
+      },
+      "ServicesErrorCode": {
+        "enum": [
+          "invalid_request",
+          "invalid_token",
+          "replica_mismatch",
+          "service_template_unavailable",
+          "service_quota_exceeded",
+          "request_not_found",
+          "too_many_requests",
+          "node_unavailable"
+        ],
+        "title": "ServicesErrorCode",
+        "type": "string"
+      },
+      "ServicesErrorDetail": {
+        "additionalProperties": false,
+        "properties": {
+          "code": {
+            "$ref": "#/components/schemas/ServicesErrorCode"
+          },
+          "message": {
+            "default": "",
+            "maxLength": 500,
+            "title": "Message",
+            "type": "string"
+          }
+        },
+        "required": [
+          "code"
+        ],
+        "title": "ServicesErrorDetail",
+        "type": "object"
+      },
+      "ServicesReason": {
+        "enum": [
+          "service_template_unavailable",
+          "service_quota_exceeded",
+          "test_services_unavailable"
+        ],
+        "title": "ServicesReason",
+        "type": "string"
+      },
+      "ServicesRequest": {
+        "additionalProperties": false,
+        "description": "``POST /api/v1/service-requests`` — the executor asks for the services of ``runner.yaml``.",
+        "properties": {
+          "agentKey": {
+            "maxLength": 63,
+            "minLength": 2,
+            "pattern": "^[a-z0-9][a-z0-9-]*$",
+            "title": "Agentkey",
+            "type": "string"
+          },
+          "replica": {
+            "maximum": 99,
+            "minimum": 0,
+            "title": "Replica",
+            "type": "integer"
+          },
+          "services": {
+            "maxProperties": 10,
+            "minProperties": 1,
+            "patternProperties": {
+              "^[a-z0-9]([a-z0-9-]{0,29}[a-z0-9])?$": {
+                "$ref": "#/components/schemas/ServiceRequest"
+              }
+            },
+            "title": "Services",
+            "type": "object"
+          },
+          "waitSeconds": {
+            "default": 600,
+            "description": "How long to wait for budget and readiness before unavailable",
+            "maximum": 1800,
+            "minimum": 30,
+            "title": "Waitseconds",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "agentKey",
+          "replica",
+          "services"
+        ],
+        "title": "ServicesRequest",
+        "type": "object"
+      },
+      "ServicesStatus": {
+        "enum": [
+          "pending",
+          "ready",
+          "unavailable",
+          "rejected"
+        ],
+        "title": "ServicesStatus",
+        "type": "string"
+      }
+    },
+    "securitySchemes": {
+      "ContainerToken": {
+        "description": "Token of the agent container, read from FLEET_SERVICES_TOKEN_FILE; bound to one agent and one replica, replaced when the container is recreated",
+        "scheme": "bearer",
+        "type": "http"
+      }
+    }
+  },
+  "info": {
+    "description": "Test services on request. Served by the fleet-services listener inside the network of the agents; the listener writes requests to a queue directory and the node answers.",
+    "title": "fleet-services",
+    "version": "1"
+  },
+  "openapi": "3.1.0",
+  "paths": {
+    "/api/v1/service-requests": {
+      "post": {
+        "operationId": "requestServices",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ServicesRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "202": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ServicesAnswer"
+                }
+              }
+            },
+            "description": "Accepted: status pending"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ServicesError"
+                }
+              }
+            },
+            "description": "Error codes: invalid_token"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ServicesError"
+                }
+              }
+            },
+            "description": "Error codes: replica_mismatch"
+          },
+          "408": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ServicesError"
+                }
+              }
+            },
+            "description": "Error codes: invalid_request"
+          },
+          "413": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ServicesError"
+                }
+              }
+            },
+            "description": "Error codes: invalid_request"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ServicesError"
+                }
+              }
+            },
+            "description": "Error codes: invalid_request, service_template_unavailable, service_quota_exceeded"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ServicesError"
+                }
+              }
+            },
+            "description": "Error codes: too_many_requests"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ServicesError"
+                }
+              }
+            },
+            "description": "Error codes: node_unavailable"
+          }
+        },
+        "security": [
+          {
+            "ContainerToken": []
+          }
+        ],
+        "summary": "Ask for the services of a run; answers at once with a pending request"
+      }
+    },
+    "/api/v1/service-requests/{requestId}": {
+      "get": {
+        "operationId": "getServices",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "requestId",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Seconds to wait for a final state",
+            "in": "query",
+            "name": "wait",
+            "required": false,
+            "schema": {
+              "default": 0,
+              "maximum": 60,
+              "minimum": 0,
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ServicesAnswer"
+                }
+              }
+            },
+            "description": "State of the request"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ServicesError"
+                }
+              }
+            },
+            "description": "Error codes: invalid_token"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ServicesError"
+                }
+              }
+            },
+            "description": "Error codes: request_not_found"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ServicesError"
+                }
+              }
+            },
+            "description": "Error codes: invalid_request"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ServicesError"
+                }
+              }
+            },
+            "description": "Error codes: too_many_requests"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ServicesError"
+                }
+              }
+            },
+            "description": "Error codes: node_unavailable"
+          }
+        },
+        "security": [
+          {
+            "ContainerToken": []
+          }
+        ],
+        "summary": "Long-poll a request until it is ready, unavailable or rejected"
+      }
+    },
+    "/api/v1/service-requests/{requestId}/heartbeat": {
+      "post": {
+        "description": "Holds the services of the replica for 300 seconds more; send one every 60 seconds while the run lives, at most one a second per replica",
+        "operationId": "heartbeatServices",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "requestId",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "202": {
+            "description": "Accepted: the node applies it within a second"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ServicesError"
+                }
+              }
+            },
+            "description": "Error codes: invalid_token"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ServicesError"
+                }
+              }
+            },
+            "description": "Error codes: request_not_found"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ServicesError"
+                }
+              }
+            },
+            "description": "Error codes: too_many_requests"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ServicesError"
+                }
+              }
+            },
+            "description": "Error codes: node_unavailable"
+          }
+        },
+        "security": [
+          {
+            "ContainerToken": []
+          }
+        ],
+        "summary": "The run the request served still lives"
+      }
+    },
+    "/api/v1/service-requests/{requestId}/release": {
+      "post": {
+        "description": "idleSeconds of the node count from now; a request not yet ready is withdrawn; at most one a second per replica",
+        "operationId": "releaseServices",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "requestId",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "202": {
+            "description": "Accepted: the node applies it within a second"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ServicesError"
+                }
+              }
+            },
+            "description": "Error codes: invalid_token"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ServicesError"
+                }
+              }
+            },
+            "description": "Error codes: request_not_found"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ServicesError"
+                }
+              }
+            },
+            "description": "Error codes: too_many_requests"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ServicesError"
+                }
+              }
+            },
+            "description": "Error codes: node_unavailable"
+          }
+        },
+        "security": [
+          {
+            "ContainerToken": []
+          }
+        ],
+        "summary": "The run the request served ended"
+      }
+    },
+    "/healthz": {
+      "get": {
+        "operationId": "healthz",
+        "responses": {
+          "200": {
+            "description": "Alive"
+          }
+        },
+        "summary": "Liveness of the listener"
+      }
+    }
+  }
+}

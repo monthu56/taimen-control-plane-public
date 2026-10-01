@@ -476,6 +476,94 @@ async def test_no_file_no_signal(tmp_path: Path) -> None:
     assert [item for item in client.written if item["kind"] == "blocked"] == []
 
 
+# -- the environment of a run (universal-runner U009, FR-018) -------------------
+
+ENV_PROBES = ("CP_TEST_DATABASE_URL", "OPENAI_BASE_URL", "PYTHONPATH", "CONTROL_PLANE_BLOCKED_FILE")
+
+
+def env_probe_cli(tmp_path: Path) -> Path:
+    """The fake `codex`, writing first what it sees of ENV_PROBES as `NAME=value` lines."""
+    script = fake_cli(tmp_path)
+    shebang, rest = script.read_text().split("\n", 1)
+    probes = "".join(
+        f'printf "%s\\n" "{name}=${{{name}-<unset>}}" >> "{tmp_path}/env.txt"\n'
+        for name in ENV_PROBES
+    )
+    script.write_text(f'{shebang}\nrm -f "{tmp_path}/env.txt"\n{probes}{rest}')
+    return script
+
+
+def seen_env(tmp_path: Path) -> dict[str, str]:
+    lines = (tmp_path / "env.txt").read_text().splitlines()
+    return dict(line.split("=", 1) for line in lines)
+
+
+@pytest.mark.asyncio
+async def test_run_environment_reaches_the_process_and_not_the_next_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    for name in ENV_PROBES:
+        monkeypatch.delenv(name, raising=False)
+    adapter = adapter_for(env_probe_cli(tmp_path), tmp_path)
+    url = "postgresql+psycopg://u:p@db:5432/t"
+
+    await adapter.execute(TASK, RUN, FakeClient(), None, env={"CP_TEST_DATABASE_URL": url})
+
+    assert seen_env(tmp_path)["CP_TEST_DATABASE_URL"] == url
+    assert "CP_TEST_DATABASE_URL" not in os.environ
+
+    await adapter.execute(TASK, {"id": "run-2", "attempt": 1}, FakeClient(), None)
+
+    assert seen_env(tmp_path)["CP_TEST_DATABASE_URL"] == "<unset>"
+
+
+@pytest.mark.asyncio
+async def test_run_environment_cannot_set_reserved_names_or_the_blocked_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Defence in depth: the parser refuses these, and the adapter drops them again."""
+    for name in ENV_PROBES:
+        monkeypatch.delenv(name, raising=False)
+    adapter = adapter_for(env_probe_cli(tmp_path), tmp_path)
+
+    await adapter.execute(
+        TASK,
+        RUN,
+        FakeClient(),
+        None,
+        env={
+            "OPENAI_BASE_URL": "https://elsewhere.example",
+            "PYTHONPATH": str(tmp_path),
+            "CONTROL_PLANE_BLOCKED_FILE": str(tmp_path / "in-the-copy"),
+            "CP_TEST_DATABASE_URL": "kept",
+        },
+    )
+
+    seen = seen_env(tmp_path)
+    assert seen["OPENAI_BASE_URL"] == "<unset>"
+    assert seen["PYTHONPATH"] == "<unset>"
+    assert seen["CONTROL_PLANE_BLOCKED_FILE"] not in ("<unset>", str(tmp_path / "in-the-copy"))
+    assert seen["CP_TEST_DATABASE_URL"] == "kept"
+
+
+@pytest.mark.asyncio
+async def test_blocked_file_is_merged_over_the_run_environment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The order of the merge holds even for an environment the filter let through."""
+    for name in ENV_PROBES:
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setattr("control_plane_codex.adapter.run_environment", dict)
+    adapter = adapter_for(env_probe_cli(tmp_path), tmp_path)
+    planted = str(tmp_path / "in-the-copy")
+
+    await adapter.execute(
+        TASK, RUN, FakeClient(), None, env={"CONTROL_PLANE_BLOCKED_FILE": planted}
+    )
+
+    assert seen_env(tmp_path)["CONTROL_PLANE_BLOCKED_FILE"] not in ("<unset>", planted)
+
+
 class FakeClientBehindARestart(FakeClient):
     """The core restarts just as the turn ends: the proxy answers 502."""
 

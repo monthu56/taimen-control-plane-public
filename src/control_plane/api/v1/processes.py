@@ -29,6 +29,9 @@ from control_plane.api.dependencies import AuthDep, DbDep, SessionFactoryDep, Se
 from control_plane.api.v1.schemas import (
     ERROR_RESPONSES,
     PACKAGE_FILTER_DESCRIPTION,
+    STATUS_FILTER_DESCRIPTION,
+    CatalogRetireRequest,
+    CatalogStatus,
     ErrorEnvelope,
     PageOut,
     ProcessCancelRequest,
@@ -43,10 +46,13 @@ from control_plane.api.v1.schemas import (
     ProcessReplayOut,
     ProcessReplayRequest,
     ProcessResumeRequest,
+    ProcessRetireOut,
+    ProcessRetireVersionOut,
     ProcessStageStateOut,
     ProcessSuspendRequest,
     ProcessTimerOut,
     ProcessVersionOut,
+    RetirementOut,
     page_body,
 )
 from control_plane.api.write_flow import execute_write
@@ -54,6 +60,7 @@ from control_plane.application.authorization import AuthContext, authorize
 from control_plane.application.commands import process_definitions as commands
 from control_plane.application.commands import process_instances as instances
 from control_plane.application.commands import process_replays as replays
+from control_plane.application.commands.catalog_retirements import retirement_out
 from control_plane.application.common import decode_cursor, encode_cursor
 from control_plane.application.queries.lists import clamp_limit
 from control_plane.application.queries.package_links import attach_package, attach_packages
@@ -93,8 +100,11 @@ def definition_body(view: commands.ProcessDefinitionView) -> dict[str, Any]:
         identity_agent=row.identity_agent,
         owner=row.spec.get("owner"),
         expression_profile=row.expression_profile,
+        engine_revision=row.engine_revision,
         spec=row.spec,
         warnings=[ProcessProblemOut.model_validate(item) for item in row.warnings],
+        status="retired" if view.retirement is not None else "active",
+        retired=retirement_out(view.retirement),
         created_by=row.created_by,
         created_at=row.created_at,
     ).model_dump(mode="json", by_alias=True)
@@ -112,7 +122,10 @@ def version_body(view: commands.ProcessDefinitionView) -> dict[str, Any]:
         definition_hash=row.definition_hash,
         identity_agent=row.identity_agent,
         expression_profile=row.expression_profile,
+        engine_revision=row.engine_revision,
         warnings=[ProcessProblemOut.model_validate(item) for item in row.warnings],
+        status="retired" if view.retirement is not None else "active",
+        retired=retirement_out(view.retirement),
         created_by=row.created_by,
         created_at=row.created_at,
     ).model_dump(mode="json", by_alias=True)
@@ -206,6 +219,7 @@ async def list_process_definitions(
         description="Only processes whose elements refer to this document (CP-ADR-0076 §6)",
     ),
     package: str | None = Query(default=None, description=PACKAGE_FILTER_DESCRIPTION),
+    status: CatalogStatus | None = Query(default=None, description=STATUS_FILTER_DESCRIPTION),
 ) -> JSONResponse:
     after_key: str | None = None
     if cursor is not None:
@@ -221,6 +235,7 @@ async def list_process_definitions(
         workspace_id=workspace_id,
         governed_by=governed_by,
         package=package,
+        status=status,
     )
     next_cursor = encode_cursor({"k": next_key}) if next_key is not None else None
     items = [definition_body(view) for view in views]
@@ -287,12 +302,62 @@ async def replay_process_definition(
     )
 
 
+@router.post(
+    "/process-definitions/{key}:retire",
+    response_model=ProcessRetireOut,
+    responses=ERROR_RESPONSES,
+    summary="Retire a process — no new instances, open ones run to the end",
+)
+async def retire_process_definition(
+    key: str,
+    payload: CatalogRetireRequest,
+    request: Request,
+    ctx: AuthDep,
+    db: DbDep,
+    settings: SettingsDep,
+    session_factory: SessionFactoryDep,
+    dry_run: bool = Query(default=False, alias="dryRun"),
+) -> JSONResponse:
+    """CP-ADR-0074, amendment Zh2; ``dryRun`` — the same checks and answer, nothing written."""
+    await authorize(ctx, Permission.PROCESSES_WRITE)
+
+    async def retire(session: AsyncSession) -> dict[str, object]:
+        view = await commands.retire_process_definition(
+            session, ctx, key=key, reason=payload.reason, dry_run=dry_run
+        )
+        return ProcessRetireOut(
+            key=view.key,
+            retired=RetirementOut.model_validate(retirement_out(view.retirement)),
+            open_instances=view.open_instances,
+            by_version=[
+                ProcessRetireVersionOut(version=version, open_instances=count)
+                for version, count in view.by_version
+            ],
+        ).model_dump(mode="json", by_alias=True)
+
+    if dry_run:
+        return JSONResponse(await retire(db))
+
+    async def executor(session: AsyncSession) -> tuple[int, dict[str, object]]:
+        return 200, await retire(session)
+
+    return await execute_write(
+        request,
+        ctx,
+        settings,
+        session_factory,
+        canonical_body=payload.model_dump_json(),
+        executor=executor,
+    )
+
+
 # --- instances -----------------------------------------------------------------
 
 
 def instance_body(view: instances.InstanceView) -> dict[str, Any]:
     instance = view.instance
     stages = (instance.state or {}).get("stages") or {}
+    sla, sla_state = instances.instance_sla(instance)
     return ProcessInstanceOut(
         id=instance.id,
         tenant_id=instance.tenant_id,
@@ -322,6 +387,8 @@ def instance_body(view: instances.InstanceView) -> dict[str, Any]:
             )
             for timer in view.timers
         ],
+        sla=sla,
+        sla_state=sla_state,
         started_at=instance.started_at,
         updated_at=instance.updated_at,
         completed_at=instance.completed_at,
@@ -375,6 +442,11 @@ async def list_process_instances(
     instance_key: str | None = Query(default=None, alias="instanceKey"),
     status: ProcessInstanceStatus | None = Query(default=None),
     workspace_id: uuid.UUID | None = Query(default=None, alias="workspaceId"),
+    sla_state: Literal["breached", "warning"] | None = Query(
+        default=None,
+        alias="slaState",
+        description="Instances with a step or process deadline breached or past its warning",
+    ),
 ) -> JSONResponse:
     after: tuple[datetime, uuid.UUID] | None = None
     if cursor is not None:
@@ -392,6 +464,7 @@ async def list_process_instances(
         instance_key=instance_key,
         status=status,
         workspace_id=workspace_id,
+        sla_state=sla_state,
     )
     items = [instance_body(await instances.instance_view(db, row)) for row in rows]
     next_cursor = (

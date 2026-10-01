@@ -9,9 +9,10 @@ feeds their recorded inputs to the candidate with the same
 :func:`process_engine.step` a live instance runs, and compares the decisions
 and intents with the recorded ones (:mod:`control_plane.domain.process_replay`).
 
-The candidate runs under the number of each instance's version
-(:func:`process_replay.as_version`): only behaviour differs, not the number
-in the events. Every instance reports its first divergence, if any: the
+The candidate runs under the number and the engine revision of each
+instance's version (:func:`process_replay.as_version`): only the behaviour of
+the spec differs, not the number in the events nor the revision the journal
+was recorded under. Every instance reports its first divergence, if any: the
 journal entry where the paths part, the element, what was recorded and what
 the candidate decides. Memory is never asked — the answers of ``recall`` are
 inputs of the journal — and nothing is written: the transaction is ``READ
@@ -39,7 +40,7 @@ from control_plane.application.commands.process_instances import (
 from control_plane.domain import process_engine as engine
 from control_plane.domain import process_replay
 from control_plane.domain.enums import Permission
-from control_plane.domain.errors import NotFoundError
+from control_plane.domain.errors import ConflictError, NotFoundError
 from control_plane.domain.process_definition import (
     Problem,
     SpecError,
@@ -48,7 +49,7 @@ from control_plane.domain.process_definition import (
     normalized_spec,
 )
 from control_plane.infrastructure.db.engine import transaction
-from control_plane.infrastructure.db.models import ProcessInstance
+from control_plane.infrastructure.db.models import ProcessDefinition, ProcessInstance
 
 
 @dataclass(frozen=True)
@@ -126,12 +127,41 @@ async def chosen_instances(
     return list(rows.all())
 
 
+async def engine_revision_of(
+    db: AsyncSession, instance: ProcessInstance, revisions: dict[uuid.UUID, int]
+) -> int:
+    """The engine revision of the version ``instance`` is pinned to; ``revisions`` caches them."""
+    revision = revisions.get(instance.definition_id)
+    if revision is None:
+        revision = await db.scalar(
+            select(ProcessDefinition.engine_revision).where(
+                ProcessDefinition.id == instance.definition_id
+            )
+        )
+        if revision is None:
+            raise ConflictError(
+                "process_definition_unusable",
+                f"Process instance {instance.id} is pinned to a version that is not published",
+                details={
+                    "process": f"{instance.definition_key}@{instance.definition_version}",
+                    "instanceId": str(instance.id),
+                },
+            )
+        revisions[instance.definition_id] = revision
+    return revision
+
+
 async def replay_one(
-    db: AsyncSession, definition: engine.Definition, instance: ProcessInstance
+    db: AsyncSession,
+    definition: engine.Definition,
+    instance: ProcessInstance,
+    revisions: dict[uuid.UUID, int],
 ) -> InstanceReplay:
+    """Replay the journal of ``instance`` on ``definition`` under the instance's version."""
     entries = await journal_records(db, instance.id)
     calendars = await journal_calendars(db, instance.tenant_id, entries)
-    candidate = process_replay.as_version(definition, instance.definition_version)
+    revision = await engine_revision_of(db, instance, revisions)
+    candidate = process_replay.as_version(definition, instance.definition_version, revision)
     result = process_replay.replay(candidate, entries, calendars, stop=True)
     last = int(entries[-1]["seq"]) if entries else 0
     divergence = process_replay.first_divergence(result, instance.state, last)
@@ -169,6 +199,7 @@ async def replay_candidate(
         if checked.errors:
             return report
         definition = engine.Definition.build(key, body, catalog)
+        revisions: dict[uuid.UUID, int] = {}
         for instance in await chosen_instances(db, ctx, key, current.version, instance_ids, limit):
-            report.instances.append(await replay_one(db, definition, instance))
+            report.instances.append(await replay_one(db, definition, instance, revisions))
     return report

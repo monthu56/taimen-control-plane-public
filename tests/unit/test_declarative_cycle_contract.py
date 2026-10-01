@@ -13,7 +13,6 @@ no route answers 501 any more.
 
 import json
 import uuid
-from pathlib import Path
 from typing import Any
 
 import jsonschema
@@ -33,6 +32,7 @@ from control_plane.api.v1.schemas import (
 from control_plane.domain.errors import DomainError
 from control_plane.domain.work_graph import normalize_checks
 from control_plane.domain.work_item import SYSTEM_TASK_LIFECYCLE
+from tests.package_sdk import schema_path
 
 
 def _openapi() -> dict[str, Any]:
@@ -113,17 +113,10 @@ def test_an_agent_reference_is_parsed_apart_from_a_principal_id() -> None:
 # The kinds TaskType and WorkRule of the catalog carry what the core takes in
 # POST /task-types and POST /rules. What the catalog accepts for an amended
 # field, the core's request model accepts; what it rejects, the core rejects.
-# The schema is read from the superproject when this repository is checked out
-# inside it, from the pinned copy otherwise (as in test_agent_contract.py).
+# The schema is package-sdk's when it is checked out next to control-plane, the
+# pinned copy otherwise (tests/package_sdk.py).
 
-FIXTURES = Path(__file__).resolve().parents[1] / "fixtures"
-PINNED_SCHEMA = FIXTURES / "superproject" / "object.schema.json"
-SUPERPROJECT_SCHEMA = (
-    Path(__file__).resolve().parents[3] / "packages" / "schema" / "v1" / "object.schema.json"
-)
-CATALOG_SCHEMA: dict[str, Any] = json.loads(
-    (SUPERPROJECT_SCHEMA if SUPERPROJECT_SCHEMA.is_file() else PINNED_SCHEMA).read_text("utf-8")
-)
+CATALOG_SCHEMA: dict[str, Any] = json.loads(schema_path("object.schema.json").read_text("utf-8"))
 CATALOG = jsonschema.Draft202012Validator(CATALOG_SCHEMA)
 API_VERSION = CATALOG_SCHEMA["properties"]["apiVersion"]["const"]
 

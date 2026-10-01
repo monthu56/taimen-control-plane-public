@@ -30,9 +30,11 @@ V08_TYPES = "c8a51d70b394"
 # Second revision of the v0.8 line: custom fields and planned dates (ADR-0049).
 V08_FIELDS = "a1c7e94b2f60"
 # The current head of the chain the v0.8 tests upgrade back to (the last
-# revision links every catalog kind to its package, CP-ADR-0074 amendment of
-# 2026-09-29, on top of the runs per executor index of the same day).
-V08_HEAD = "b5d1e7a3c9f4"
+# revision retires process and calendar keys, CP-ADR-0074 amendment Zh1, on top
+# of the merge of the engine revision, step attempts and SLA deadlines of
+# processes, CP-ADR-0078, with the package links of every catalog kind,
+# CP-ADR-0074 amendment of 2026-09-29).
+V08_HEAD = "c3e8f1a6d2b4"
 # The revision right before the agent registry.
 BEFORE_AGENT_REGISTRY = "c3f8a2d6e1b7"
 # The revision right before attention feedback (CP-ADR-0068 approval workspaces).
@@ -366,6 +368,92 @@ async def test_process_recalls_revision_is_additive_and_reversible(
             text("SELECT context_profile FROM tasks WHERE id = :id"), {"id": task["id"]}
         ).scalar_one()
     assert profile is None
+
+
+# Engine revision, step attempts and SLA deadlines (CP-ADR-0074 amendment
+# 2026-09-29, CP-ADR-0078) and the revision right before them.
+BEFORE_PROCESS_OBSERVABILITY = "e6b3d8f1a2c9"
+
+
+async def test_process_observability_revision_is_additive_and_reversible(
+    client: httpx.AsyncClient, sync_engine: Engine, v08_alembic_config: Config
+) -> None:
+    admin = (await do_bootstrap(client))["adminPrincipal"]["id"]
+    alembic_command.downgrade(v08_alembic_config, BEFORE_PROCESS_OBSERVABILITY)
+    inspector = inspect(sync_engine)
+    assert "engine_revision" not in {
+        c["name"] for c in inspector.get_columns("process_definitions")
+    }
+    assert "remaining_unit" not in {c["name"] for c in inspector.get_columns("process_timers")}
+    instance_columns = {c["name"] for c in inspector.get_columns("process_instances")}
+    assert not {"step_attempts", "sla_due_at", "sla_warn_at"} & instance_columns
+    assert "ix_process_instances_sla_due" not in {
+        i["name"] for i in inspector.get_indexes("process_instances")
+    }
+    # A version, an instance and a frozen timer written before the revision.
+    with sync_engine.begin() as connection:
+        ids = connection.execute(
+            text(
+                "WITH d AS ("
+                " INSERT INTO process_definitions (id, tenant_id, key, version, display_name,"
+                "  definition_hash, expression_profile, spec, governed_by, warnings,"
+                "  created_by, created_at)"
+                " SELECT gen_random_uuid(), tenant_id, 'kept', 1, 'Kept', 'sha256:0', 'cel',"
+                "  '{}', '[]', '[]', id, now() FROM principals WHERE id = :admin"
+                " RETURNING id, tenant_id),"
+                " i AS ("
+                " INSERT INTO process_instances (id, tenant_id, definition_id, definition_key,"
+                "  definition_version, instance_key, status, data, state, refs, started_at,"
+                "  updated_at)"
+                " SELECT gen_random_uuid(), tenant_id, id, 'kept', 1, 'K-1', 'running',"
+                "  '{}', '{}', '{}', now(), now() FROM d"
+                " RETURNING id, tenant_id, definition_id)"
+                " INSERT INTO process_timers (id, tenant_id, instance_id, element, timer_kind,"
+                "  state, remaining_seconds, reads, provisional, created_at, updated_at)"
+                " SELECT gen_random_uuid(), tenant_id, id, 'hold', 'timeout', 'frozen', 60,"
+                "  '[]', false, now(), now() FROM i"
+                " RETURNING instance_id, (SELECT definition_id FROM i)"
+            ),
+            {"admin": admin},
+        ).one()
+    alembic_command.upgrade(v08_alembic_config, V08_HEAD)
+
+    # Existing rows read the defaults: the old semantics, wall time, no attempts
+    # and no deadline.
+    with sync_engine.connect() as connection:
+        kept = connection.execute(
+            text(
+                "SELECT d.engine_revision, t.remaining_unit, t.remaining_seconds,"
+                " i.step_attempts, i.sla_due_at, i.sla_warn_at"
+                " FROM process_instances i"
+                " JOIN process_definitions d ON d.id = i.definition_id"
+                " JOIN process_timers t ON t.instance_id = i.id"
+                " WHERE i.id = :instance AND d.id = :definition"
+            ),
+            {"instance": ids[0], "definition": ids[1]},
+        ).one()
+    assert tuple(kept) == (1, "wall", 60, {}, None, None)
+
+    inspector = inspect(sync_engine)
+    columns = {
+        (table, c["name"]): c
+        for table in ("process_definitions", "process_timers", "process_instances")
+        for c in inspector.get_columns(table)
+    }
+    assert not columns["process_definitions", "engine_revision"]["nullable"]
+    assert columns["process_definitions", "engine_revision"]["default"] == "1"
+    assert columns["process_timers", "remaining_unit"]["default"] == "'wall'::text"
+    assert columns["process_instances", "step_attempts"]["default"] == "'{}'::jsonb"
+    assert columns["process_instances", "sla_due_at"]["nullable"]
+    assert columns["process_instances", "sla_warn_at"]["nullable"]
+    (index,) = [
+        i
+        for i in inspector.get_indexes("process_instances")
+        if i["name"] == "ix_process_instances_sla_due"
+    ]
+    assert index["column_names"] == ["tenant_id", "sla_due_at"]
+    # Over the rows with a running deadline, whatever the status (CP-ADR-0078 §6).
+    assert index["dialect_options"]["postgresql_where"] == "(sla_due_at IS NOT NULL)"
 
 
 # The source of an agent revision (CP-ADR-0073, amendment 2026-09-29) and the

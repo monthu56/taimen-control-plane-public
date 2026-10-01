@@ -6,7 +6,8 @@
 реализованы в K008 (TASK-000768), документы (п. К3) — в K009 (TASK-000769),
 пакеты арендатора (п. К4) — в K010 (TASK-000770); амендмент 2026-09-28
 (company-knowledge, K031, TASK-000796): перечень сущностей
-`POST /knowledge/entities:query`
+`POST /knowledge/entities:query`; амендмент 2026-09-30 (package-sdk,
+TASK-001043): чтение набора пакетов workspace и пакета онтологии
 
 Контекст: амендмент 2026-09-23 к TAI-ADR-0042 суперпроекта («память — только
 через Control Plane») и TAI-ADR-0031 п.6: никто, кроме ядра, не ходит в
@@ -558,6 +559,91 @@ as_of=, limit=, cursor=)` — одна страница. MCP-инструмен�
 - `tests/client/test_sdk.py`: `query_knowledge_entities` проходит перечень по
   `nextCursor`.
 
+## Амендмент 2026-09-30 (package-sdk, TASK-001043): чтение того, что пишет установка пакетов
+
+**Проблема** (найдено при ревью S011, вид `KnowledgePack` в package-sdk). Ядро
+умело только писать пакеты онтологий: `POST /knowledge/packs` и
+`PUT /workspaces/{id}/knowledge-packs`. План установки (S013) не мог показать
+разницу: `PUT` заменяет набор целиком, и план не предупреждал, что пропадут
+включённые ранее онтологии. SDK регистрировал каждую онтологию при каждом
+`apply`, поэтому применяющему всегда требовались права администратора
+онтологий, а журнал получал лишние `knowledge.pack_registered` и
+`knowledge.packs_configured`.
+
+**Решение.** Два маршрута чтения. Оба — прокси в память с identity ядра, без
+транзакции БД во время вызова памяти, без событий журнала.
+
+### Ч1. `GET /api/v1/workspaces/{id}/knowledge-packs`
+
+1. **Право** — `workspaces.read` или `workspaces.manage` на
+   `workspace:<id>`: набор пакетов — настройка дерева workspace, а тот, кто
+   может его задать (`PUT`), должен видеть, что заменяет. Неизвестный
+   workspace — `404`, архивный — `422 workspace_archived` (как у `PUT`); память
+   не вызывается.
+2. **Где читается** — namespace корня дерева (как у `PUT`). В отличие от
+   `PUT`, `id` может быть любым workspace дерева: подпространство работает под
+   набором корня, ответ называет корень (`rootWorkspaceId`).
+3. **Передача** — `GET /api/memory/namespaces/{ns}/kinds` (ответ памяти
+   `{settings: {strict, packages, updated_at, …}, catalog: {packages, …}}`).
+4. **Ответ** — `200 {workspaceId, rootWorkspaceId, configured, packs, strict,
+   effective, updatedAt}`. `packs` и `strict` — в той форме, в какой их
+   принимает `PUT` (`settings.packages`, `settings.strict`); `effective` —
+   пакеты, которые память применяет (`catalog.packages`). Память хранит
+   `packages: null`, пока набор никто не задавал, — тогда действует её пакет
+   по умолчанию: `configured: false`, `packs: []`. Namespace и служебный
+   `updated_by` (это identity ядра) не отдаются.
+5. **Ошибки** — любой отказ памяти — `502 memory_unavailable`, провайдер не
+   настроен — `503 memory_disabled`.
+
+### Ч2. `GET /api/v1/knowledge/packs/{ref}`
+
+1. **Ссылка** — `name@version`, `name` (последняя версия) или
+   `tenant:name[@version]` (пакет арендатора вызывающего); грамматика имени и
+   версии — памяти (`core.kinds`), иначе `422 invalid_pack_ref`, память не
+   вызывается.
+2. **Право** — `events.read` (право читать журнал tenant'а, где записаны
+   регистрации пакетов) или `knowledge.packs.manage` на уровне tenant'а.
+   Общий пакет читает и администратор платформы из
+   `CP_KNOWLEDGE_PACK_ADMINS` без этих прав — он же его регистрирует.
+3. **Передача** — `GET /api/memory/packages/{name}?version=`. Пакет
+   арендатора — `name = tenant:<имя>` и `?namespace=tenant:<tenantId>`
+   (namespace арендатора вычисляет ядро): пакет другого арендатора с тем же
+   именем не виден.
+4. **Ответ** — пакет памяти как есть (`name`, `version`, `kinds` с
+   `idPatterns`, `relations`, `description`, `scope`, `ref`), без
+   namespace-владельца. Память отвечает `404` (нет такого пакета или версии,
+   или пакет чужого арендатора) → `404 not_found` с `details.pack`; иначе —
+   `502 memory_unavailable`; провайдер не настроен — `503 memory_disabled`.
+
+Плану установки этого достаточно: версия пакета иммутабельна, поэтому
+«зарегистрировано с тем же содержимым» проверяется сравнением с ответом Ч2, а
+`404` значит «нужна регистрация». Регистрация по-прежнему требует прав
+администратора онтологий, но только когда она действительно нужна.
+
+### Ч3. Клиенты
+
+`control-plane-client`: `get_workspace_knowledge_packs(workspace_id)` и
+`get_knowledge_pack(ref)`. MCP-инструментов нет. Провайдер памяти:
+`get_package(..., namespace=)`.
+
+### Conformance амендмента 2026-09-30
+
+- `tests/unit/test_knowledge_pack_reads.py`: запросы ядра — по закреплённым
+  маршрутам памяти (`tests/fixtures/memory_graph_contract.json`, параметр
+  `namespace` у `GET /api/memory/packages/{name}`), ответы разбираются на
+  ответах кода памяти (`namespaceKinds`, `packages`); ненастроенный namespace —
+  `configured: false`; пакет арендатора — в namespace арендатора, без
+  владельца в ответе; права; ссылки; `404` и сбои памяти.
+- `tests/unit/test_knowledge_contract.py`: оба маршрута в OpenAPI со своими
+  схемами ответа и `403`/`502`/`503`, у пакета — `404`.
+- `tests/integration/test_knowledge_pack_reads.py`: набор читается таким, каким
+  его оставил `PUT`, из корня и из подпространства; без права — `403`,
+  архивного workspace — `422 workspace_archived`, память не вызывается; пакет
+  читается по закреплённой ссылке и по имени (`ref` ответа — с версией,
+  `name@version`), пакет арендатора — только своим, чужая или неизвестная версия — `404`; чтения
+  событий не пишут.
+- `tests/client/test_sdk.py`: методы клиента читают набор и пакет.
+
 ## Conformance
 
 ```conformance
@@ -604,5 +690,15 @@ as_of=, limit=, cursor=)` — одна страница. MCP-инструмен�
 - grep: {path: "src/control_plane/application/queries/knowledge_entities.py", pattern: 'Permission.EVENTS_READ, resource=ResourceRef\("workspace"'}
   repo: control-plane
 - grep: {path: "client/src/control_plane_client/client.py", pattern: "def query_knowledge_entities"}
+  repo: control-plane
+- grep: {path: "src/control_plane/api/v1/knowledge.py", pattern: '"/knowledge/packs/\{ref\}"'}
+  repo: control-plane
+- grep: {path: "src/control_plane/api/v1/knowledge.py", pattern: "async def get_workspace_packs"}
+  repo: control-plane
+- grep: {path: "src/control_plane/application/commands/knowledge.py", pattern: 'Permission.EVENTS_READ, Permission.KNOWLEDGE_PACKS_MANAGE'}
+  repo: control-plane
+- grep: {path: "client/src/control_plane_client/client.py", pattern: "def get_workspace_knowledge_packs"}
+  repo: control-plane
+- grep: {path: "client/src/control_plane_client/client.py", pattern: "def get_knowledge_pack"}
   repo: control-plane
 ```

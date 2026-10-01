@@ -10,8 +10,8 @@ the notification service).
 **Plan** (:func:`plan_package`, a transaction that is rolled back; memory is
 asked after it closes):
 
-- ``changes`` — per object ``create | update | rename | unchanged`` and the
-  fields it changes, each with its owner: ``console`` when a person changed
+- ``changes`` — per object ``create | update | rename | restore | unchanged``
+  and the fields it changes, each with its owner: ``console`` when a person changed
   it since the last apply (``package_objects`` keeps what that apply wanted),
   kept unless ``overwriteConsole`` (:func:`package_plan.diff_fields`); a task
   type also names the active versions the apply deprecates (``deprecates``).
@@ -25,6 +25,10 @@ asked after it closes):
   ``migrations``, ``unaffected`` without one; ``migrationRequired`` when an
   element they stand on is gone and no migration carries them — a problem
   ``migration_required`` of the plan;
+- ``deadlines`` of each changed process — the open instances it migrates
+  whose deadlines the engine's step ``migrated`` sets, moves, lifts or finds
+  already past by the new version: the step taken on a copy of the migrated
+  state, as the apply takes it, nothing written (:func:`_deadlines`, FR-023);
 - ``regulationCoverage`` — the sections of each regulation the processes name
   (``governedBy``), as memory holds them, with the elements governed by each
   and the sections no element covers (FR-058);
@@ -33,7 +37,8 @@ asked after it closes):
 **Apply** (:func:`apply_package`) builds the plan again from the same files in
 its own transaction, under a lock of the tenant's applies, with the keys of
 its task types, agents and rules locked as their commands lock them
-(:func:`package_catalog.lock_keys`) and the open instances locked, and
+(:func:`package_catalog.lock_keys`), then those of its processes and
+calendars, and the open instances locked, and
 refuses ``409 plan_stale`` when its hash differs from the one shown: the
 catalog or the instances changed since. A plan with
 ``migration_required`` is ``422 migration_required``, any other error ``422
@@ -42,11 +47,16 @@ ordinary command of its kind, under the right of that kind, in the order of
 ``PLANNED_KINDS`` (a refusal of a command rolls the whole apply back); open
 instances with ``migrate`` move to the new version by the map
 (:func:`control_plane.domain.process_migration.migrate_state`) — a journal
-entry ``migrate`` with the migrated state and ``process.migrated`` each; a key
-renamed away is retired; ``package_objects`` records what the apply wanted and
-the package (key, version, plan hash) of every object of the plan.
+entry ``migrate`` with the migrated state and ``process.migrated`` each, then
+the engine's step ``migrated`` that counts the instance's deadlines by the new
+version (CP-ADR-0074 §11, amendment 2026-09-29); a key renamed away is
+retired; ``package_objects`` records what the apply wanted and the package
+(key, version, plan hash) of every object of the plan; a retired process or
+calendar the package installs as it is (``restore``) is back in use
+(CP-ADR-0074, amendment Zh3).
 """
 
+import asyncio
 import uuid
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field, replace
@@ -59,21 +69,39 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from control_plane.application.authorization import AuthContext, authorize
 from control_plane.application.commands import package_catalog, package_links
 from control_plane.application.commands.calendars import check_calendar_spec, publish_calendar
+from control_plane.application.commands.catalog_retirements import (
+    CALENDAR,
+    PROCESS,
+    RENAMED_BY,
+    lock_keys,
+    restore_key,
+    retire_key,
+    retired_keys,
+    share_keys,
+)
 from control_plane.application.commands.package_catalog import CATALOG_KINDS, Latest, SpecShape
 from control_plane.application.commands.package_test import (
     overlay_catalog,
     with_workspace,
     workspace_exists,
 )
+from control_plane.application.commands.package_trials import (
+    SUPPORTING_KINDS,
+    SupportingShape,
+    publish_supporting,
+)
 from control_plane.application.commands.process_definitions import (
+    engine_revision_for,
     load_catalog,
     process_scope,
     publish_process_definition,
 )
 from control_plane.application.commands.process_instances import (
     CORRELATION_PREFIX,
+    calendars_named,
     definition_of,
     engine_time,
+    take,
 )
 from control_plane.application.commands.process_replays import chosen_instances, replay_one
 from control_plane.application.common import new_uuid, utcnow
@@ -87,6 +115,7 @@ from control_plane.application.queries.process_regulations import (
 )
 from control_plane.config import Settings
 from control_plane.domain import process_engine as engine
+from control_plane.domain.calendar import Calendar
 from control_plane.domain.enums import Permission
 from control_plane.domain.errors import (
     AuthorizationError,
@@ -97,6 +126,7 @@ from control_plane.domain.errors import (
 )
 from control_plane.domain.package_plan import (
     PLANNED_KINDS,
+    RENAMED_KINDS,
     FieldChange,
     Rename,
     canonical_hash,
@@ -118,13 +148,18 @@ from control_plane.domain.process_definition import (
     governed_references,
     normalized_spec,
 )
+from control_plane.domain.process_definition import references as process_references
 from control_plane.domain.process_migration import (
     MIGRATE,
     MIGRATION_INPUT,
     PIN,
+    RECOUNT_INPUT,
     MigrationError,
     migrate_state,
     migration_for,
+    migration_record,
+    recount_body,
+    recounts,
     renamer,
     uncovered,
 )
@@ -144,7 +179,14 @@ from control_plane.infrastructure.db.models import PackageObject as PackageRecor
 Shapes = Mapping[str, SpecShape]
 # Diverged instances named per process in the plan.
 MAX_DIVERGED_IDS = 20
+# Deadlines a migration moves listed per process in the plan; ``deadlinesTotal`` counts all.
+MAX_PLAN_DEADLINES = 200
 _OPEN = (engine.RUNNING, engine.SUSPENDED)
+# The actions that publish no version: the object stays at its latest one.
+UNPUBLISHED = ("unchanged", "restore")
+# A retired key a package installs as it is comes back into use (Zh3).
+RESTORED_EVENTS = {"Process": "process.definition_restored", "Calendar": "calendar.restored"}
+_ENTITY_TYPES = {"Process": "process_definition", "Calendar": "calendar"}
 
 
 # --- the plan --------------------------------------------------------------------------------
@@ -188,6 +230,39 @@ class _Planned:
         }
 
 
+@dataclass(frozen=True)
+class _Moved:
+    """An open instance moved to a new version by the map: the journal entry ``migrate``.
+
+    The engine's step ``migrated`` starts from ``state`` at ``at``, the time
+    of the entry; the plan takes it on this copy, the apply after writing it.
+    """
+
+    state: dict[str, Any]
+    at: datetime
+    from_version: int
+
+    @property
+    def seq(self) -> int:
+        return int(self.state["seq"])
+
+    def recount(self, target: engine.Definition) -> dict[str, Any]:
+        """The body of the input ``migrated`` that follows the entry."""
+        return recount_body(from_version=self.from_version, target=target)
+
+
+def _move(
+    old: engine.Definition,
+    new: engine.Definition,
+    instance: ProcessInstance,
+    mapping: Mapping[str, str],
+) -> _Moved:
+    """Move ``instance`` from ``old`` to ``new`` by ``mapping``; ``MigrationError`` if it cannot."""
+    state = migrate_state(old, new, instance.state, mapping)
+    state["seq"] = int(instance.state["seq"]) + 1
+    return _Moved(state, engine_time(instance, utcnow()), instance.definition_version)
+
+
 @dataclass
 class _Group:
     """The open instances of one version of a changed process."""
@@ -199,6 +274,12 @@ class _Group:
     fate: str
     migration: Mapping[str, Any] | None
     failures: list[tuple[ProcessInstance, MigrationError]] = field(default_factory=list)
+    # The instances moved by the map, by id, when the new version recounts deadlines.
+    moved: dict[uuid.UUID, _Moved] = field(default_factory=dict)
+
+    @property
+    def mapping(self) -> dict[str, str]:
+        return dict((self.migration or {}).get("map") or {})
 
     def out(self) -> dict[str, Any]:
         return {
@@ -220,13 +301,19 @@ class PackagePlan:
     problems: list[Problem] = field(default_factory=list)
     planned: list[_Planned] = field(default_factory=list)
     outside: list[dict[str, str]] = field(default_factory=list)
+    # The artifact types, roles and skills of the package: the installer
+    # applies them, the trial publishes those the tenant lacks (TASK-001197).
+    supporting: list[PackageObject] = field(default_factory=list)
     groups: list[_Group] = field(default_factory=list)
     effective_renames: list[_Planned] = field(default_factory=list)
     behaviour: dict[str, dict[str, Any]] = field(default_factory=dict)
+    deadlines: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
     coverage: list[dict[str, Any]] = field(default_factory=list)
     etag_entries: list[dict[str, Any]] = field(default_factory=list)
     # The (kind, key) of the catalog objects the plan reads: what the apply and the trial lock.
     lock_pairs: set[tuple[str, str]] = field(default_factory=set)
+    # (kind, key) of the objects out of use (catalog_retirements, CP-ADR-0074 Zh1).
+    retired: set[tuple[str, str]] = field(default_factory=set)
     created_at: datetime = field(default_factory=utcnow)
 
     @property
@@ -246,7 +333,7 @@ class PackagePlan:
     def processes(self) -> list[dict[str, Any]]:
         out = []
         for item in self.planned:
-            if item.kind != "Process" or item.action == "unchanged":
+            if item.kind != "Process" or item.action in UNPUBLISHED:
                 continue
             out.append(
                 {
@@ -255,6 +342,8 @@ class PackagePlan:
                     "toVersion": item.published.get("version"),
                     "behaviour": self.behaviour.get(item.key),
                     "instances": [g.out() for g in self.groups if g.process is item],
+                    "deadlines": self.deadlines.get(item.key, [])[:MAX_PLAN_DEADLINES],
+                    "deadlinesTotal": len(self.deadlines.get(item.key, [])),
                 }
             )
         return out
@@ -330,11 +419,23 @@ async def _records(
     return {(r.kind, r.key): r for r in await db.scalars(stmt)}
 
 
+async def retired_pairs(
+    db: AsyncSession, tenant_id: uuid.UUID, pairs: set[tuple[str, str]]
+) -> set[tuple[str, str]]:
+    """The processes and calendars of ``pairs`` that are retired."""
+    out: set[tuple[str, str]] = set()
+    for kind in RENAMED_KINDS:
+        keys = [key for k, key in pairs if k == kind]
+        out |= {(kind, key) for key in await retired_keys(db, tenant_id, kind, keys)}
+    return out
+
+
 async def catalog_entries(
     db: AsyncSession, tenant_id: uuid.UUID, pairs: set[tuple[str, str]]
 ) -> list[dict[str, Any]]:
     """What the catalog etag is computed from, for the objects ``pairs``."""
     records = await _records(db, tenant_id, pairs, lock=False)
+    retired = await retired_pairs(db, tenant_id, pairs)
     entries = []
     for kind, key in sorted(pairs):
         latest = await _latest(db, tenant_id, kind, key)
@@ -347,8 +448,7 @@ async def catalog_entries(
                 "hash": latest.hash if latest else None,
                 "applied": record.spec_hash if record else None,
                 "package": (record.package_key or None) if record else None,
-                "retired": (record is not None and record.retired_at is not None)
-                or (latest is not None and latest.retired),
+                "retired": (kind, key) in retired or (latest is not None and latest.retired),
             }
         )
     return entries
@@ -368,7 +468,9 @@ async def build_plan(
     lock: bool = False,
 ) -> PackagePlan:
     """The plan without its reports (behaviour, coverage): what the hash covers."""
-    package = parse_package(files)
+    # Parsing is CPU work bounded by its budget: off the event loop, which the
+    # other requests share.
+    package = await asyncio.to_thread(parse_package, files)
     manifest = package.manifest_object
     plan = PackagePlan(
         package_key=manifest.key if manifest else None,
@@ -378,6 +480,11 @@ async def build_plan(
     )
     plan.problems.extend(package.problems)
     plan.outside = outside(package)
+    plan.supporting = [
+        obj
+        for kind in SUPPORTING_KINDS
+        for obj in sorted(package.of_kind(kind), key=lambda o: o.key)
+    ]
     if manifest is None:
         plan.problems.append(
             Problem(
@@ -396,7 +503,12 @@ async def build_plan(
     plan.lock_pairs = pairs
     if lock:
         await package_catalog.lock_keys(db, ctx.tenant_id, pairs)
+        # Every process and calendar up front, processes first: a publication
+        # of a process holds its key and then shares its calendars.
+        for kind in (PROCESS, CALENDAR):
+            await lock_keys(db, ctx.tenant_id, kind, (k for c, k in pairs if c == kind))
     records = await _records(db, ctx.tenant_id, pairs, lock=lock)
+    plan.retired = await retired_pairs(db, ctx.tenant_id, pairs)
     plan.etag_entries = await catalog_entries(db, ctx.tenant_id, pairs)
 
     calendars = frozenset(o.key for o in package.of_kind("Calendar"))
@@ -474,15 +586,7 @@ async def _catalog_item(
 
 def _finding(exc: DomainError, severity: str = "error") -> Problem:
     """A refusal of a command as a finding of the object it was about."""
-    details = exc.details or {}
-    where = details.get("path") or details.get("field")
-    path = ""
-    if isinstance(where, str) and where:
-        where = where.removeprefix("$.").removeprefix("spec.").removeprefix("spec")
-        path = "/spec" + "".join(
-            "/" + part for part in where.replace("[", ".").replace("]", "").split(".") if part
-        )
-    return Problem(exc.code, severity, path, exc.message)
+    return package_catalog.finding(exc, severity)
 
 
 async def _place(
@@ -513,12 +617,13 @@ async def _place(
                 )
             )
         )
-    base = item.record if item.record is not None and item.record.retired_at is None else None
+    # The link of a retired key is no base: what it wanted is not in use.
+    base = item.record if (item.kind, item.key) not in plan.retired else None
     rename = by_target.get((item.kind, item.key))
     if rename is not None:
         source = await _latest(db, ctx.tenant_id, item.kind, rename.source)
         record = records.get((item.kind, rename.source))
-        retired = record is not None and record.retired_at is not None
+        retired = (item.kind, rename.source) in plan.retired
         if source is not None and not retired and latest is None:
             # The object moves with its versions and what its last apply wanted.
             item.renamed_from, item.source_record = rename.source, record
@@ -555,6 +660,10 @@ async def _place(
         item.action = "unchanged"
     else:
         item.action = "update"
+    if item.action == "unchanged" and (item.kind, item.key) in plan.retired:
+        # Installed again as it is, a retired process or calendar is back in
+        # use: the apply deletes its retirement, no version is published (Zh3).
+        item.action = "restore"
     if item.kind in CATALOG_KINDS:
         item.version = await package_catalog.planned_version(
             db, ctx.tenant_id, item.kind, item.key, latest, item.published, item.action
@@ -565,7 +674,7 @@ async def _place(
         plan.problems.extend(item.obj.place(p) for p in found)
         return
     if item.kind == "Calendar":
-        if item.action == "unchanged" and latest is not None:
+        if item.action in UNPUBLISHED and latest is not None:
             item.version = latest.version
         elif latest is None or item.renamed_from is not None:
             item.version = 1
@@ -573,7 +682,7 @@ async def _place(
             item.version = latest.version + 1
         return
     version = item.published.get("version")
-    item.version = latest.version if item.action == "unchanged" and latest else version
+    item.version = latest.version if item.action in UNPUBLISHED and latest else version
     if (
         item.action in ("update", "rename")
         and latest is not None
@@ -602,7 +711,11 @@ async def _check(
     package: ParsedPackage,
     calendars: frozenset[str],
 ) -> None:
-    """The check of a publication (CP-ADR-0074 §2) of the spec the apply would publish."""
+    """The check of a publication (CP-ADR-0074 §2) of the spec the apply would publish.
+
+    A restored process publishes nothing: of the check only ``calendar_retired``
+    applies to it — back in use, it would need a calendar out of use (Zh3).
+    """
     if item.action == "unchanged":
         return
     previous = item.latest.row if item.latest is not None else None
@@ -621,9 +734,15 @@ async def _check(
     checked = check_process(
         item.key, item.published, catalog, file=item.obj.file, locate=item.obj.locate
     )
+    if item.action == "restore":
+        plan.problems.extend(p for p in checked.problems if p.code == "calendar_retired")
+        return
     plan.problems.extend(checked.problems)
     if not checked.errors:
-        item.definition = engine.Definition.build(item.key, item.published, catalog)
+        revision = await engine_revision_for(db, ctx.tenant_id, item.key, item.published)
+        item.definition = engine.Definition.build(
+            item.key, item.published, catalog, engine_revision=revision
+        )
 
 
 async def _instances(
@@ -667,11 +786,13 @@ async def _instances(
             error = MigrationError("definition_unusable", exc.message)
             group.failures = [(instance, error) for instance in instances]
         else:
-            mapping = (migration or {}).get("map") or {}
+            keep = recounts(item.definition)
             for instance in instances:
                 try:
                     if fate == MIGRATE:
-                        migrate_state(old, item.definition, instance.state, mapping)
+                        moved = _move(old, item.definition, instance, group.mapping)
+                        if keep:
+                            group.moved[instance.id] = moved
                     else:
                         missing = uncovered(old, instance.state, item.definition)
                         if missing:
@@ -684,6 +805,7 @@ async def _instances(
                 except MigrationError as exc:
                     group.failures.append((instance, exc))
         if group.failures:
+            group.moved.clear()
             plan.problems.append(_migration_required(item, group, found[0] if found else None))
 
 
@@ -716,6 +838,7 @@ def _migration_required(item: _Planned, group: _Group, index: int | None) -> Pro
 
 async def _behaviour(db: AsyncSession, ctx: AuthContext, plan: PackagePlan, limit: int) -> None:
     """The replay of each changed process on the latest instances of its current version."""
+    revisions: dict[uuid.UUID, int] = {}
     for item in plan.planned:
         if item.definition is None or item.latest is None or item.action == "unchanged":
             continue
@@ -724,7 +847,7 @@ async def _behaviour(db: AsyncSession, ctx: AuthContext, plan: PackagePlan, limi
         candidate = replace(item.definition, key=item.source)
         diverged: list[str] = []
         for instance in instances:
-            result = await replay_one(db, candidate, instance)
+            result = await replay_one(db, candidate, instance, revisions)
             if result.divergence is not None:
                 diverged.append(str(instance.id))
         plan.behaviour[item.key] = {
@@ -732,6 +855,60 @@ async def _behaviour(db: AsyncSession, ctx: AuthContext, plan: PackagePlan, limi
             "diverged": len(diverged),
             "instanceIds": diverged[:MAX_DIVERGED_IDS],
         }
+
+
+async def _calendars(
+    db: AsyncSession, ctx: AuthContext, plan: PackagePlan, spec: Mapping[str, Any]
+) -> dict[str, Calendar]:
+    """The calendars a version names as the apply leaves them: the package's ones published."""
+    own = {
+        item.key: Calendar.from_spec(item.published)
+        for item in plan.planned
+        if item.kind == "Calendar"
+    }
+    calendars, _ = await calendars_named(db, ctx.tenant_id, spec, own=own)
+    return calendars
+
+
+async def _deadlines(db: AsyncSession, ctx: AuthContext, plan: PackagePlan) -> None:
+    """The deadlines each migrating instance gets from the new version (FR-023).
+
+    The apply moves an instance by the map and then takes the engine's input
+    ``migrated`` (:func:`_migrate`); here the same step is taken on the
+    migrated copy :func:`_instances` kept (:func:`_move`), and its
+    ``deadline_migrated`` decisions — a deadline set, moved, lifted or
+    already past — are the section. Nothing is written. A group that cannot
+    migrate has no section: the plan says ``migration_required`` instead.
+    """
+    calendars: dict[str, dict[str, Calendar]] = {}
+    for group in plan.groups:
+        item, new = group.process, group.process.definition
+        if not group.moved or new is None:
+            continue
+        if item.key not in calendars:
+            calendars[item.key] = await _calendars(db, ctx, plan, item.published)
+        found = plan.deadlines.setdefault(item.key, [])
+        for instance in group.instances:
+            moved = group.moved[instance.id]
+            given = engine.Input(
+                RECOUNT_INPUT,
+                moved.at,
+                moved.recount(new),
+                str(ctx.principal_id),
+                calendars[item.key],
+            )
+            _, decisions, _ = engine.step(new, moved.state, given)
+            found.extend(
+                {
+                    "instanceId": str(instance.id),
+                    "element": decision.element,
+                    "previousDueAt": decision.detail.get("previousDueAt"),
+                    "dueAt": decision.detail.get("dueAt"),
+                    "breached": bool(decision.detail.get("breached")),
+                }
+                for decision in decisions
+                if decision.kind == "deadline_migrated"
+            )
 
 
 @dataclass(frozen=True)
@@ -861,6 +1038,7 @@ async def plan_package(
     replay_limit: int,
     overwrite: bool,
     shapes: Shapes,
+    supporting: Mapping[str, SupportingShape],
 ) -> PackagePlan:
     """``POST /packages:plan``: whatever is written to try the commands is rolled back."""
     await authorize(ctx, Permission.PACKAGES_PLAN)
@@ -886,6 +1064,7 @@ async def plan_package(
             )
             if replay_limit > 0:
                 await _behaviour(db, ctx, plan, replay_limit)
+            await _deadlines(db, ctx, plan)
             for item in plan.planned:
                 spec = item.published if item.action != "unchanged" else item.wanted
                 if item.kind == "Process" and governed_references(spec):
@@ -893,7 +1072,7 @@ async def plan_package(
                         scoped.append((item, await regulation_scope(db, ctx, settings, spec)))
                     except ValueError:
                         continue  # a workspace id that is no UUID: the check has said so
-            await _trial(db, ctx, plan)
+            await _trial(db, ctx, settings, plan, supporting)
         finally:
             await tx.rollback()
     plan.coverage, found = await _coverage(provider, scoped, settings, ctx.trace_run_id)
@@ -901,29 +1080,62 @@ async def plan_package(
     return plan
 
 
-async def _trial(db: AsyncSession, ctx: AuthContext, plan: PackagePlan) -> None:
+async def _trial(
+    db: AsyncSession,
+    ctx: AuthContext,
+    settings: Settings,
+    plan: PackagePlan,
+    supporting: Mapping[str, SupportingShape],
+) -> None:
     """Run the command of each task type, agent and rule the apply would publish.
 
     Each in its own savepoint, in the order of the apply, so a rule sees the
     task type and the agent the package brings; the transaction around is
     rolled back by the caller. What a command refuses is a finding of the
     object. A right the caller lacks ends the trial with a warning: the apply
-    needs the right anyway, and what follows would stumble on the gap.
+    needs the right anyway, and what follows would stumble on the gap. A
+    supporting object the caller may not publish only leaves unchecked the
+    objects that name its key (review of TASK-001197); the others are tried.
+
+    First the artifact types, roles and skills of the package the tenant
+    lacks are published the same way (:func:`package_trials.publish_supporting`):
+    the installer applies them before ``packages:apply`` (``outside``), so a
+    type, an agent or a rule is checked against the skills and artifact
+    types of its own package, not only against those the stand has
+    (TASK-001197). Their findings are warnings: the plan does not apply them.
 
     The keys are locked first, as the apply locks them
     (:func:`package_catalog.lock_keys`): a savepoint released keeps its locks,
     and taken one command at a time they would come in another order than
     the apply's.
     """
-    if any(
+    if not any(
         item.kind in CATALOG_KINDS and (item.action != "unchanged" or item.deprecates)
         for item in plan.planned
     ):
-        await package_catalog.lock_keys(db, ctx.tenant_id, plan.lock_pairs)
+        return
+    await package_catalog.lock_keys(db, ctx.tenant_id, plan.lock_pairs)
+    gaps: dict[str, AuthorizationError] = {}
+    for obj in plan.supporting:
+        try:
+            async with db.begin_nested():
+                found = await publish_supporting(db, ctx, settings, supporting, obj)
+        except AuthorizationError as exc:
+            plan.problems.append(_unchecked(obj, exc))
+            gaps[obj.key] = exc
+            continue
+        except DomainError as exc:
+            found = [_finding(exc)]
+        plan.problems.extend(obj.place(replace(p, severity="warning")) for p in found)
     for item in plan.planned:
         if item.kind not in CATALOG_KINDS or (item.action == "unchanged" and not item.deprecates):
             continue
         if any(p.error and p.file == item.obj.file for p in plan.problems):
+            continue
+        gap = _names_gap(item.published, gaps)
+        if gap is not None:
+            # Its command would refuse a key the trial could not publish, not the object.
+            plan.problems.append(_unchecked(item.obj, gap))
             continue
         try:
             async with db.begin_nested():
@@ -939,21 +1151,38 @@ async def _trial(db: AsyncSession, ctx: AuthContext, plan: PackagePlan) -> None:
                     package=plan.package,
                 )
         except AuthorizationError as exc:
-            plan.problems.append(
-                item.obj.place(
-                    Problem(
-                        "permission_required",
-                        "warning",
-                        "",
-                        f"{item.kind}/{item.key} was not checked: {exc.message}; the apply"
-                        " needs the right of every kind it changes",
-                        hint=", ".join((exc.details or {}).get("missing") or ()) or None,
-                    )
-                )
-            )
+            plan.problems.append(_unchecked(item.obj, exc))
             return
         except DomainError as exc:
             plan.problems.append(item.obj.place(_finding(exc)))
+
+
+def _names_gap(spec: Any, gaps: Mapping[str, AuthorizationError]) -> AuthorizationError | None:
+    """The refusal of a supporting object ``spec`` names: a string leaf is its key or ``key@v``."""
+    if not gaps:
+        return None
+    if isinstance(spec, str):
+        return gaps.get(spec) or gaps.get(spec.partition("@")[0])
+    values = spec.values() if isinstance(spec, Mapping) else spec if isinstance(spec, list) else ()
+    for value in values:
+        found = _names_gap(value, gaps)
+        if found is not None:
+            return found
+    return None
+
+
+def _unchecked(obj: PackageObject, exc: AuthorizationError) -> Problem:
+    """The warning of a trial that a right of the caller ended."""
+    return obj.place(
+        Problem(
+            "permission_required",
+            "warning",
+            "",
+            f"{obj.kind}/{obj.key} was not checked: {exc.message}; the apply"
+            " needs the right of every kind it changes",
+            hint=", ".join((exc.details or {}).get("missing") or ()) or None,
+        )
+    )
 
 
 async def apply_package(
@@ -1037,6 +1266,9 @@ async def apply_package(
             continue
         if item.action == "unchanged":
             continue
+        if item.action == "restore":
+            await _restore(db, ctx, plan, item)
+            continue
         if item.kind == "Calendar":
             calendar = await publish_calendar(db, ctx, key=item.key, spec=item.published)
             item.version = calendar.row.version
@@ -1061,8 +1293,16 @@ async def apply_package(
         db.add(record)
         record.version, record.spec_hash = item.latest.version, item.latest.hash
         record.package_version = plan.package_version
-        record.retired_at = now
         _stamp(record, ctx, current, now)
+        await retire_key(
+            db,
+            ctx.tenant_id,
+            item.kind,
+            item.renamed_from,
+            by=ctx.principal_id,
+            reason=f"{RENAMED_BY}{plan.package_key or ''}",
+            at=now,
+        )
     for item in plan.planned:
         record = item.record or _new_record(ctx, plan, item.kind, item.key, item.wanted, current)
         db.add(record)
@@ -1070,7 +1310,6 @@ async def apply_package(
         record.package_version = plan.package_version
         record.version = int(item.version or 0)
         record.spec, record.spec_hash = item.wanted, item.wanted_hash
-        record.retired_at = None
         _stamp(record, ctx, current, now)
     pairs = {(e["kind"], e["key"]) for e in plan.etag_entries}
     await db.flush()
@@ -1082,6 +1321,46 @@ async def apply_package(
             for item in plan.planned
         ],
     }
+
+
+async def _restore(db: AsyncSession, ctx: AuthContext, plan: PackagePlan, item: _Planned) -> None:
+    """A retired key the package installs as it is comes back into use (Zh3).
+
+    A process back in use needs its calendars in use: they are shared, as a
+    publication shares them, and read again — a retirement of one that
+    committed after the plan found the process retired, not needing it.
+    """
+    assert item.latest is not None
+    if item.kind == PROCESS:
+        calendars = process_references(item.latest.spec).calendars
+        await share_keys(db, ctx.tenant_id, CALENDAR, calendars)
+        retired = sorted(await retired_keys(db, ctx.tenant_id, CALENDAR, calendars))
+        if retired:
+            raise ConflictError(
+                "calendar_retired",
+                f"Process {item.key!r} is not restored: calendar {retired[0]!r} it needs"
+                " was retired meanwhile; publish a new version of the calendar or of the"
+                " process, then plan again",
+                details={"process": item.key, "calendars": retired},
+            )
+    await restore_key(db, ctx.tenant_id, item.kind, item.key)
+    await record_event(
+        db,
+        tenant_id=ctx.tenant_id,
+        event_type=RESTORED_EVENTS[item.kind],
+        entity_type=_ENTITY_TYPES[item.kind],
+        entity_id=item.latest.row.id,
+        actor_id=ctx.principal_id,
+        request_id=ctx.request_id,
+        correlation_id=ctx.correlation_id,
+        trace_run_id=ctx.trace_run_id,
+        payload={
+            "key": item.key,
+            "latestVersion": item.latest.version,
+            "packageKey": plan.package_key,
+            "packageVersion": plan.package_version,
+        },
+    )
 
 
 def _new_record(
@@ -1100,7 +1379,6 @@ def _new_record(
         plan_hash=current,
         applied_by=ctx.principal_id,
         applied_at=utcnow(),
-        retired_at=None,
     )
 
 
@@ -1118,29 +1396,30 @@ async def _migrate(
     target: ProcessDefinition,
     current: str,
 ) -> None:
-    """Move one open instance to ``target`` by the group's map: journal entry and event."""
+    """Move one open instance to ``target`` by the group's map: journal entry and event.
+
+    Under a revision with SLA deadlines the engine then takes ``migrated``:
+    the deadlines of the open steps and of the process are counted by the
+    new version, their timers and the due of the step's task follow.
+    """
     old = await definition_of(db, group.row)
     new = await definition_of(db, target)
-    mapping = dict((group.migration or {}).get("map") or {})
+    mapping = group.mapping
     try:
-        state = migrate_state(old, new, instance.state, mapping)
+        moved = _move(old, new, instance, mapping)
     except MigrationError as exc:  # pragma: no cover - the plan was built under the same locks
         raise ValidationError(
             "migration_required", exc.message, details={"instanceId": str(instance.id)}
         ) from exc
-    seq = int(instance.state["seq"]) + 1
-    state["seq"] = seq
-    at = engine_time(instance, utcnow())
-    from_version = instance.definition_version
-    body = {
-        "fromKey": instance.definition_key,
-        "fromVersion": from_version,
-        "toVersion": target.version,
-        "policy": MIGRATE,
-        "map": mapping,
-        "planHash": current,
-        "state": state,
-    }
+    state, seq, at, from_version = moved.state, moved.seq, moved.at, moved.from_version
+    body, migrated = migration_record(
+        from_key=instance.definition_key,
+        from_version=from_version,
+        target=new,
+        mapping=mapping,
+        plan_hash=current,
+        state=state,
+    )
     given = engine.Input(MIGRATION_INPUT, at, body, str(ctx.principal_id))
     db.add(
         ProcessInstanceEvent(
@@ -1153,17 +1432,7 @@ async def _migrate(
             event_id=None,
             actor_id=ctx.principal_id,
             input=given.out(),
-            decisions=[
-                {
-                    "kind": "migrated",
-                    "element": None,
-                    "fromKey": instance.definition_key,
-                    "fromVersion": from_version,
-                    "toVersion": target.version,
-                    "policy": MIGRATE,
-                    "map": mapping,
-                }
-            ],
+            decisions=[migrated],
             intents=[],
             calendars={},
             created_at=utcnow(),
@@ -1184,6 +1453,11 @@ async def _migrate(
         )
         for ref, value in (instance.refs or {}).items()
     }
+    # The attempt counters of step events follow the elements they count.
+    attempts: dict[str, int] = {}
+    for element, count in (instance.step_attempts or {}).items():
+        attempts[rename(element)] = max(attempts.get(rename(element), 0), int(count))
+    instance.step_attempts = attempts
     for timer in await db.scalars(
         select(ProcessTimer).where(
             ProcessTimer.instance_id == instance.id,
@@ -1218,3 +1492,15 @@ async def _migrate(
             "policy": MIGRATE,
         },
     )
+    if recounts(new):
+        await take(
+            db,
+            instance,
+            target,
+            RECOUNT_INPUT,
+            moved.recount(new),
+            at=at,
+            source_ref=f"migration:{target.id}/{RECOUNT_INPUT}",
+            actor_id=ctx.principal_id,
+            trace_run_id=ctx.trace_run_id or "",
+        )

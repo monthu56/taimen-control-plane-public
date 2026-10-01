@@ -1,0 +1,14 @@
+subject: taskType
+taskType: payment-approval
+name: завершённая исполнителем оплата ждёт решения человека и сверки сумм
+given:
+  task:
+    assignee: treasurer
+    customFields: {invoice: INV-10, invoiceAmount: "90.00"}
+  principals: {finance: [treasurer]}
+steps:
+  - complete: {output: {paymentAmount: "95.00"}}
+  - expect: {status: {key: todo, category: active}, ensureWork: []}
+  - verify: {check: decided, result: passed}
+  - verify: {check: amounts-match, result: failed}
+  - expect: {status: {key: todo, category: active}, ensureWork: []}

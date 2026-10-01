@@ -33,7 +33,7 @@ CONTROL_PLANE_AGENT_ADAPTER=claude-code control-plane-agent
 | `CONTROL_PLANE_TRACE_TRANSCRIPT` / `…_ACTIONS` / `…_TOOL_RESULTS` | `0` — выключить публикацию транскрипта / actions на инструменты / вывод инструментов в транскрипте (ADR-0051) |
 | `CONTROL_PLANE_CLAUDE_RESUME` | `0` — всегда начинать новую сессию |
 | `CONTROL_PLANE_CONTEXT_BUDGET_CHARS` | бюджет раздела «Контекст задачи» в prompt, символов (12000); общий для Claude Code, Codex и OpenCode (ADR-0059) |
-| `CONTROL_PLANE_CLAUDE_PROMPT_FILE` | файл соглашений репозитория — четвёртый слой инструкций после platform/project/taskType (CP-ADR-0066); читается на каждом запуске. У Codex и OpenCode — `CONTROL_PLANE_CODEX_PROMPT_FILE`, `CONTROL_PLANE_OPENCODE_PROMPT_FILE` |
+| `CONTROL_PLANE_CLAUDE_PROMPT_FILE` | файл соглашений агента — четвёртый слой инструкций «Agent conventions» после platform/project/taskType (CP-ADR-0066); читается на каждом запуске. Соглашения репозитория (`AGENTS.md`, через `CLAUDE.md`) Claude Code читает сам. У Codex и OpenCode — `CONTROL_PLANE_CODEX_PROMPT_FILE`, `CONTROL_PLANE_OPENCODE_PROMPT_FILE` |
 | `CONTROL_PLANE_CLAUDE_RUNTIME_DIR` | где лежат mcp.json и логи (`~/.claude-runner`) |
 
 В режиме агента (CP-ADR-0073 п.14) модель, режим разрешений, таймаут,
@@ -49,6 +49,12 @@ CONTROL_PLANE_AGENT_ADAPTER=claude-code control-plane-agent
 Аутентификация — `CLAUDE_CODE_OAUTH_TOKEN` в окружении runner (подписка) или
 `ANTHROPIC_API_KEY` (класс credential `api_key` по ADR-0016 п. 4). Адаптер
 токен не читает и никуда не копирует: дочерний процесс наследует окружение.
+
+Окружение прогона (`env` сервисов из `.agents/runner.yaml` с подстановкой)
+адаптер получает аргументом `env` метода `execute` и передаёт только процессу
+`claude` этого прогона; запрещённые имена он отбрасывает повторно, в следующий
+прогон окружение не переходит. Подробности и то же для Codex и OpenCode —
+[`runner_config.md`](../src/control_plane_agent/runner_config.md#окружение-прогона-в-адаптерах).
 
 ## Три решения, которые легко сделать неправильно
 

@@ -47,7 +47,7 @@ OUTSIDE = {"NotificationRule": "notification-service"}
 INSTALLER = "installer"
 OWNER_PACKAGE = "package"
 OWNER_CONSOLE = "console"
-ACTIONS = ("create", "update", "rename", "retire", "unchanged")
+ACTIONS = ("create", "update", "rename", "restore", "retire", "unchanged")
 # Fields that are never a person's: the number of a process version.
 NUMBER_FIELDS = frozenset({"version"})
 _ABSENT = object()

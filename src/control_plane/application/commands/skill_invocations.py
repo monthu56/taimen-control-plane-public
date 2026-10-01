@@ -44,6 +44,7 @@ from control_plane.application.queries.tool_policy import (
     resolve_effective_tool_policy,
 )
 from control_plane.config import Settings
+from control_plane.domain import process_engine
 from control_plane.domain.canonical import canonical_bytes
 from control_plane.domain.enums import (
     INVOCABLE_SKILL_PROTOCOLS,
@@ -72,6 +73,7 @@ from control_plane.domain.work_item import TERMINAL_CATEGORIES
 from control_plane.infrastructure.db.models import (
     Approval,
     Artifact,
+    ProcessInstance,
     Run,
     RunChildHandle,
     Session,
@@ -340,10 +342,11 @@ async def _side_effect_basis(
     task: Task | None,
     run: Run | None,
     approval_id: uuid.UUID | None,
+    process: tuple[ProcessInstance, str] | None = None,
 ) -> dict[str, Any] | None:
     """ADR-0056 §4: ``external_write`` needs a basis, otherwise 403.
 
-    Two bases are recognized. A gate approval on the same, still open Work
+    Three bases are recognized. A gate approval on the same, still open Work
     item that has been decided positively: single-use per skill version — one
     approval, one external action — which the partial unique index
     ``uq_skill_invocations_skill_approval`` guarantees under concurrency. And
@@ -352,7 +355,12 @@ async def _side_effect_basis(
     open and no gate approval is pending on it. That basis is recorded for
     every side-effect level — it also makes the call the one call of its run.
     A delegation with the skill in scope is not available (delegations carry
-    no scope yet); see the ADR-0056 amendment.
+    no scope yet); see the ADR-0056 amendment. And the process instance whose
+    step makes the call (amendment TASK-001197): the published version of
+    the process names this very skill version in its step, as a task type
+    names its ``execution``; only the engine passes ``process`` — the instance
+    and the activity of the step — no route does. The basis holds while that
+    activity is open, not while the instance lives (review of TASK-001197).
     """
     execution = await _execution_basis(session, skill, task=task, run=run)
     if skill.side_effects != SkillSideEffects.EXTERNAL_WRITE:
@@ -362,6 +370,15 @@ async def _side_effect_basis(
         _require_open_task(task)
         await _require_open_gates(session, ctx, task)
         return execution
+    if approval_id is None and task is None and process is not None:
+        instance, activity_id = process
+        return {
+            "kind": "process",
+            "instanceId": str(instance.id),
+            "activityId": activity_id,
+            "definitionKey": instance.definition_key,
+            "definitionVersion": instance.definition_version,
+        }
     denied = AuthorizationError(
         "external_write skill needs an approved gate on this Work item",
         code="skill_side_effect_not_authorized",
@@ -427,12 +444,15 @@ async def invoke_skill(
     run_id: uuid.UUID | None = None,
     approval_id: uuid.UUID | None = None,
     requested_by: tuple[SkillInvocationRequester, str] | None = None,
+    process: tuple[ProcessInstance, str] | None = None,
 ) -> InvocationResult:
     """Queue a call; ``requested_by`` names a requester other than the caller.
 
     Core's own requesters (the verification stage, CP-ADR-0067) call with the
     authority of a principal but on behalf of something else: the call is
     recorded as requested by that ``(kind, ref)``, checked exactly the same.
+    ``process`` — the instance whose step makes the call and the id of the
+    step's activity: the basis of an ``external_write`` (:func:`_side_effect_basis`).
     """
     await authorize(ctx, Permission.SKILLS_INVOKE)
     skill = await resolve_skill_ref(session, ctx, skill_ref)
@@ -520,7 +540,7 @@ async def invoke_skill(
         await _check_run_tool_policy(session, ctx, skill, run)
 
     basis = await _side_effect_basis(
-        session, ctx, skill, task=task, run=run, approval_id=approval_id
+        session, ctx, skill, task=task, run=run, approval_id=approval_id, process=process
     )
 
     if run is not None:
@@ -811,6 +831,20 @@ async def _basis_obstacle(
             and await pending_gate_approvals(session, invocation.tenant_id, task.id)
         ):
             return "hold", "approval_required"
+    elif basis.get("kind") == "process":
+        # The basis is the step, not the instance: once its activity closes (a
+        # timeout, a retry, a failed instance) the call is no longer awaited and
+        # a retry has queued its own. A suspended instance holds its calls.
+        instance = await session.get(
+            ProcessInstance, uuid.UUID(basis["instanceId"]), populate_existing=fresh
+        )
+        if instance is None or instance.status == process_engine.CANCELLED:
+            return "cancel", "process_cancelled"
+        activities = (instance.state or {}).get("activities") or {}
+        if basis.get("activityId") not in activities:
+            return "cancel", "process_step_closed"
+        if instance.status == process_engine.SUSPENDED:
+            return "hold", "process_suspended"
     return None
 
 

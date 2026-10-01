@@ -328,6 +328,10 @@ class FakeKnowledge:
         # every applied snapshot, checked against ``expected_state``.
         self.applied = 0
         self.calls: list[tuple[str, dict[str, Any]]] = []
+        # What was registered and enabled, read back as Memory's registry does:
+        # packs by (name as Memory takes it, version), settings by namespace.
+        self.packs: dict[tuple[str, str], dict[str, Any]] = {}
+        self.namespaces: dict[str, dict[str, Any]] = {}
 
     @property
     def state_token(self) -> str:
@@ -367,6 +371,17 @@ class FakeKnowledge:
         self.calls.append(("package", kwargs))
         self._maybe_fail()
         package = kwargs["package"]
+        tenant = package.get("scope") == "tenant"
+        name = f"tenant:{package['name']}" if tenant else package["name"]
+        self.packs[(name, str(package.get("version", "")))] = {
+            "name": package["name"],
+            "version": str(package.get("version", "")),
+            "kinds": package.get("kinds") or [],
+            "relations": package.get("relations") or [],
+            "scope": "tenant" if tenant else "common",
+            "ref": f"{name}@{package.get('version', '')}",
+            **({"namespace": package["namespace"]} if tenant else {}),
+        }
         return {
             "status": "created",
             "pack": {"name": package["name"], "version": str(package.get("version", ""))},
@@ -375,7 +390,50 @@ class FakeKnowledge:
     async def set_namespace_kinds(self, **kwargs: Any) -> dict[str, Any]:
         self.calls.append(("kinds", kwargs))
         self._maybe_fail()
+        self.namespaces[kwargs["namespace"]] = {
+            "namespace": kwargs["namespace"],
+            "strict": kwargs["strict"],
+            "packages": kwargs["packages"],
+            "updated_at": "2026-09-30T10:00:00+00:00",
+            "updated_by": "core",
+        }
         return {"namespace": kwargs["namespace"], "packages": kwargs["packages"]}
+
+    async def namespace_kinds(self, **kwargs: Any) -> dict[str, Any]:
+        """Memory's ``GET /namespaces/{ns}/kinds``: settings and the catalog."""
+        self.calls.append(("read_kinds", kwargs))
+        self._maybe_fail()
+        namespace = kwargs["namespace"]
+        conf = self.namespaces.get(
+            namespace,
+            {"namespace": namespace, "strict": False, "packages": None},
+        )
+        packages = conf["packages"]
+        return {
+            "settings": conf,
+            "catalog": {
+                "strict": conf["strict"],
+                "packages": ["default@1"] if packages is None else list(packages),
+                "kinds": [],
+            },
+        }
+
+    async def get_package(self, **kwargs: Any) -> dict[str, Any]:
+        """Memory's ``GET /packages/{name}``: the latest without a version; a
+        tenant pack only under its owner's namespace."""
+        self.calls.append(("read_package", kwargs))
+        self._maybe_fail()
+        name, version = kwargs["name"], kwargs.get("version", "")
+        found = [
+            pack
+            for (pack_name, pack_version), pack in self.packs.items()
+            if pack_name == name and version in ("", pack_version)
+        ]
+        if name.startswith("tenant:"):
+            found = [p for p in found if kwargs.get("namespace") == p["namespace"]]
+        if not found:
+            raise ContextProviderError("memory said 404", retryable=False, status=404)
+        return found[-1]
 
     async def store_document(self, **kwargs: Any) -> dict[str, Any]:
         self.calls.append(("document", kwargs))

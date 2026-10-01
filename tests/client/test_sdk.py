@@ -413,7 +413,7 @@ async def test_directory_and_artifact_reads_use_documented_paths() -> None:
 async def test_knowledge_snapshot_document_and_packs(
     client: httpx.AsyncClient, sdk: Make, app
 ) -> None:
-    from control_plane_client.errors import ConflictError
+    from control_plane_client.errors import ConflictError, NotFoundError
     from tests.helpers import FakeKnowledge, create_workspace
     from tests.helpers import knowledge_snapshot as snapshot
 
@@ -463,6 +463,12 @@ async def test_knowledge_snapshot_document_and_packs(
                 root["id"], packs=["selfdev@1"], strict=True
             )
             assert packs["packages"] == ["selfdev@1"]
+            current = await admin.get_workspace_knowledge_packs(root["id"])
+            assert (current["packs"], current["strict"]) == (["selfdev@1"], True)
+            pack = await admin.get_knowledge_pack("selfdev@1")
+            assert (pack["name"], pack["version"]) == ("selfdev", "1")
+            with pytest.raises(NotFoundError):
+                await admin.get_knowledge_pack("selfdev@2")
         app.state.context_provider = FakeKnowledge(fail_status=409)
         async with sdk(agent_key) as agent:
             with pytest.raises(ConflictError):
@@ -478,6 +484,9 @@ async def test_knowledge_snapshot_document_and_packs(
         "document",
         "package",
         "kinds",
+        "read_kinds",
+        "read_package",
+        "read_package",
     ]
     assert fake.calls[1][1]["dry_run"] is True
     assert fake.calls[2][1]["expected_state"] == "st1-1"

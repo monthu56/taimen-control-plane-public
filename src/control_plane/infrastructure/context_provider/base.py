@@ -172,8 +172,16 @@ class GraphProvider(Protocol):
     ) -> dict[str, Any]: ...
 
     async def get_package(
-        self, *, name: str, version: str = "", trace_run_id: str | None = None
-    ) -> dict[str, Any]: ...
+        self,
+        *,
+        name: str,
+        version: str = "",
+        namespace: str = "",
+        trace_run_id: str | None = None,
+    ) -> dict[str, Any]:
+        """One pack version (the latest without ``version``). A tenant pack,
+        ``tenant:<name>``, is found only with a ``namespace`` that sees it."""
+        ...
 
     async def query_entities(
         self,

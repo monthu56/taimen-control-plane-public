@@ -1,0 +1,26 @@
+# Разбор претензии поставщика к счёту: какого она рода. В тестах пакета отвечает
+# заглушка (mocks.skills), реализация не вызывается.
+apiVersion: taimen.ai/v1
+kind: Skill
+key: invoice.classify_dispute
+spec:
+  version: "1"
+  description: Род претензии к счёту по её тексту
+  sideEffects: none
+  riskLevel: low
+  contract:
+    inputs:
+      type: object
+      properties:
+        text: {type: string}
+      required: [text]
+      additionalProperties: false
+    outputs:
+      type: object
+      properties:
+        category: {enum: [overcharge, duplicate, other]}
+        confidence: {type: number}
+      required: [category, confidence]
+    implementation:
+      protocol: local
+      entrypoint: tests.skill_stubs.classify_dispute:run

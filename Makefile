@@ -1,8 +1,10 @@
 .PHONY: install lint fmt typecheck test test-db-up test-db-down run-api run-worker \
         migrate db-up compose-up compose-down check event-catalog
 
+# The targets below are the interface: CI (.github/workflows/ci.yml) and the
+# runner daemon (.agents/runner.yaml) call them instead of copying commands.
 install:
-	uv sync
+	uv sync --frozen
 
 lint:
 	uv run ruff check .

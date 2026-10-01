@@ -16,6 +16,7 @@ from control_plane.application.queries.attention import (
     item_key,
     parse_item_key,
     trailing_failures,
+    undecidable_score,
 )
 
 
@@ -31,6 +32,7 @@ def test_rules_are_versioned_and_unique() -> None:
     assert refs == [
         "approval.review@1",
         "approval.decide@1",
+        "approval.undecidable@1",
         "task.due_not_started@1",
         "task.blocked@1",
         "task.delegated_failing@1",
@@ -42,6 +44,8 @@ def test_scores_order_the_kinds_and_stay_in_range() -> None:
     assert approval_score(gate=True, waiting=timedelta(0), priority=None) == 80
     assert approval_score(gate=False, waiting=timedelta(0), priority=None) == 70
     assert approval_score(gate=False, waiting=timedelta(days=30), priority="critical") == 90
+    assert undecidable_score(waiting=timedelta(0)) == 75
+    assert undecidable_score(waiting=timedelta(days=30)) == 85
     assert due_score(left=timedelta(hours=-1), priority="medium") == 90
     assert due_score(left=DUE_SOON, priority="medium") == 60
     assert due_score(left=timedelta(0) + DUE_SOON / 2, priority="medium") == 70
@@ -84,3 +88,36 @@ def test_actions_are_calls_of_the_api() -> None:
             "href": f"/api/v1/me/attention/task.delegated_failing:{entity}:feedback",
         },
     ]
+
+
+def test_an_undecidable_approval_offers_no_decision() -> None:
+    """Its addressee may not decide it: open the approval and the process, nothing else."""
+    entity, instance = uuid.uuid4(), uuid.uuid4()
+
+    def item(process: uuid.UUID | None) -> AttentionItem:
+        return AttentionItem(
+            rule_key="approval.undecidable",
+            rule_version=1,
+            kind="undecidable",
+            reason_code="undecidable_process_owner",
+            entity_type="approval",
+            entity_id=entity,
+            score=75,
+            title="t",
+            workspace_id=None,
+            since=utcnow(),
+            details={"processInstanceId": str(process) if process else None},
+        )
+
+    feedback = {
+        "action": "feedback",
+        "method": "POST",
+        "href": f"/api/v1/me/attention/approval.undecidable:{entity}:feedback",
+    }
+    opened = {"action": "open", "method": "GET", "href": f"/api/v1/approvals/{entity}"}
+    assert item_actions(item(instance)) == [
+        opened,
+        {"action": "openProcess", "method": "GET", "href": f"/api/v1/process-instances/{instance}"},
+        feedback,
+    ]
+    assert item_actions(item(None)) == [opened, feedback]

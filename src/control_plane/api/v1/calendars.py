@@ -16,14 +16,20 @@ from control_plane.api.dependencies import AuthDep, DbDep, SessionFactoryDep, Se
 from control_plane.api.v1.schemas import (
     ERROR_RESPONSES,
     PACKAGE_FILTER_DESCRIPTION,
+    STATUS_FILTER_DESCRIPTION,
     CalendarOut,
     CalendarPublishRequest,
+    CalendarRetireOut,
+    CatalogRetireRequest,
+    CatalogStatus,
     PageOut,
+    RetirementOut,
     page_body,
 )
 from control_plane.api.write_flow import execute_write
 from control_plane.application.authorization import AuthContext, authorize
 from control_plane.application.commands import calendars as commands
+from control_plane.application.commands.catalog_retirements import retirement_out
 from control_plane.application.common import decode_cursor, encode_cursor
 from control_plane.application.queries.lists import clamp_limit
 from control_plane.application.queries.package_links import attach_package, attach_packages
@@ -48,6 +54,8 @@ def calendar_body(view: commands.CalendarView) -> dict[str, Any]:
         provisional_years=sorted(
             entry["year"] for entry in row.spec["years"] if entry.get("provisional")
         ),
+        status="retired" if view.retirement is not None else "active",
+        retired=retirement_out(view.retirement),
         created_by=row.created_by,
         created_at=row.created_at,
     ).model_dump(mode="json", by_alias=True)
@@ -137,6 +145,7 @@ async def list_calendars(
     limit: int | None = Query(default=None),
     cursor: str | None = Query(default=None),
     package: str | None = Query(default=None, description=PACKAGE_FILTER_DESCRIPTION),
+    status: CatalogStatus | None = Query(default=None, description=STATUS_FILTER_DESCRIPTION),
 ) -> JSONResponse:
     # Authentication is the whole check (module docstring).
     after_key: str | None = None
@@ -145,7 +154,7 @@ async def list_calendars(
         if not isinstance(after_key, str):
             raise ValidationError("invalid_cursor", "Malformed pagination cursor")
     views, next_key = await commands.list_calendars(
-        db, ctx, limit=clamp_limit(limit), after_key=after_key, package=package
+        db, ctx, limit=clamp_limit(limit), after_key=after_key, package=package, status=status
     )
     next_cursor = encode_cursor({"k": next_key}) if next_key is not None else None
     items = [calendar_body(view) for view in views]
@@ -162,3 +171,46 @@ async def list_calendars(
 async def get_calendar(ref: str, ctx: AuthDep, db: DbDep) -> JSONResponse:
     body = calendar_body(await commands.resolve_calendar(db, ctx, ref))
     return JSONResponse(await attach_package(db, ctx.tenant_id, "Calendar", body))
+
+
+@router.post(
+    "/calendars/{key}:retire",
+    response_model=CalendarRetireOut,
+    responses=ERROR_RESPONSES,
+    summary="Retire a calendar no process needs any more",
+)
+async def retire_calendar(
+    key: str,
+    payload: CatalogRetireRequest,
+    request: Request,
+    ctx: AuthDep,
+    db: DbDep,
+    settings: SettingsDep,
+    session_factory: SessionFactoryDep,
+    dry_run: bool = Query(default=False, alias="dryRun"),
+) -> JSONResponse:
+    """CP-ADR-0074, amendment Zh3: ``409 calendar_in_use`` while a process needs it."""
+    await authorize(ctx, Permission.CALENDARS_WRITE)
+
+    async def retire(session: AsyncSession) -> dict[str, object]:
+        view = await commands.retire_calendar(
+            session, ctx, key=key, reason=payload.reason, dry_run=dry_run
+        )
+        return CalendarRetireOut(
+            key=view.key, retired=RetirementOut.model_validate(retirement_out(view.retirement))
+        ).model_dump(mode="json", by_alias=True)
+
+    if dry_run:
+        return JSONResponse(await retire(db))
+
+    async def executor(session: AsyncSession) -> tuple[int, dict[str, object]]:
+        return 200, await retire(session)
+
+    return await execute_write(
+        request,
+        ctx,
+        settings,
+        session_factory,
+        canonical_body=payload.model_dump_json(),
+        executor=executor,
+    )

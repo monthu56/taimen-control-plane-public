@@ -133,19 +133,27 @@ class Catalog:
     ``skills`` by ``name@version``; ``task_types`` — the ``fieldSchema`` of the
     latest version by key; ``agents`` — keys of active agents; ``calendars``,
     ``artifact_types`` and ``processes`` — keys that exist (``None``: not
-    checked). ``previous`` — the latest published spec of this key, whose
-    element ids the new version keeps stable; ``versions`` — published specs
-    of the key by version, for the ``from`` side of migration maps.
+    checked); ``calendars_with_hours`` — keys whose latest version declares
+    ``workingHours`` (``None``: not checked). ``previous`` — the latest
+    published spec of this key, whose element ids the new version keeps
+    stable; ``versions`` — published specs of the key by version, for the
+    ``from`` side of migration maps.
+    ``retired_calendars`` and ``retired_processes`` — named keys out of use
+    (CP-ADR-0074, amendment Zh3, Zh2): a retired calendar is an error, a
+    call of a retired process a warning.
     """
 
     skills: Mapping[str, SkillEntry] = field(default_factory=dict)
     task_types: Mapping[str, JsonSchema | None] = field(default_factory=dict)
     agents: frozenset[str] = frozenset()
     calendars: frozenset[str] = frozenset()
+    calendars_with_hours: frozenset[str] | None = None
     artifact_types: frozenset[str] | None = None
     processes: frozenset[str] | None = None
     previous: Mapping[str, Any] | None = None
     versions: Mapping[int, Mapping[str, Any]] = field(default_factory=dict)
+    retired_calendars: frozenset[str] = frozenset()
+    retired_processes: frozenset[str] = frozenset()
 
 
 @dataclass(frozen=True)
@@ -181,8 +189,8 @@ def process_schema_from_catalog(catalog_schema: Mapping[str, Any]) -> dict[str, 
         pending.extend(_refs(definitions[name]))
     return {
         "$schema": catalog_schema.get("$schema", "https://json-schema.org/draft/2020-12/schema"),
-        "$comment": "Generated from $defs.processSpec of the superproject catalog schema"
-        " (packages/schema/v1/object.schema.json): process_schema_from_catalog().",
+        "$comment": "Generated from $defs.processSpec of the package-sdk catalog schema"
+        " (schema/v1/object.schema.json): process_schema_from_catalog().",
         "$ref": "#/$defs/processSpec",
         "$defs": {name: definitions[name] for name in sorted(needed)},
     }
@@ -407,6 +415,10 @@ def references(spec: Mapping[str, Any]) -> References:
         skills.add(str(retrospective.get("skill") or DEFAULT_RETROSPECTIVE_SKILL))
     calendars: set[str] = set()
     _add_str(calendars, spec.get("calendar"))
+    for node in _dicts(spec):
+        due = node.get("due")
+        if isinstance(due, dict):
+            _add_str(calendars, due.get("calendar"))
     artifacts: set[str] = set()
     memory = spec.get("memory")
     if isinstance(memory, dict) and isinstance(memory.get("documents"), dict):
@@ -621,6 +633,8 @@ class _Read:
 
 
 _TERMINAL_STEPS = ("complete", "raise")
+# The units of a due counted by a calendar (CP-ADR-0078 §1).
+_WORKING_UNITS = ("workdays", "workhours")
 _STEP_KINDS = (
     "human",
     "approve",
@@ -836,6 +850,7 @@ class _Checker:
             path = pointer("spec", "onEvent", index)
             place = base.but(event_payload=self._trigger(item["on"], path + "/on", base))
             self.blocks(path + "/do", item["do"], place, None)
+        self.sla_due("/spec/due", spec.get("due"), base)
         self.timers("/spec/timers", spec.get("timers"), base, None)
         for index, stage in enumerate(spec["stages"]):
             self.stage(pointer("spec", "stages", index), stage, base)
@@ -914,6 +929,13 @@ class _Checker:
                 f"no calendar {calendar!r} is published",
                 hint="publish the calendar first (POST /calendars) or install its package",
             )
+        elif calendar is not None and calendar in self.catalog.retired_calendars:
+            self.problem(
+                "calendar_retired",
+                "/spec/calendar",
+                f"calendar {calendar!r} is retired: a new version may not use it again",
+                hint="name a calendar in use, or publish a new version of this one first",
+            )
 
     def _trigger(self, trigger: Mapping[str, Any], path: str, place: _Place) -> JsonSchema | None:
         payload: JsonSchema | None = None
@@ -964,6 +986,55 @@ class _Checker:
         if isinstance(value, dict):
             self.expr(path + "/at", value.get("at"), place, TIME)
 
+    def sla_due(self, path: str, value: Any, place: _Place) -> None:
+        """A ``processDue`` (CP-ADR-0078 §1): working units need a calendar that has them."""
+        self.due(path, value, place)
+        if not isinstance(value, dict):
+            return
+        spans = [(path, value)]
+        if isinstance(value.get("warnBefore"), dict):
+            spans.append((path + "/warnBefore", value["warnBefore"]))
+        units = [
+            (f"{here}/{unit}", unit)
+            for here, span in spans
+            for unit in _WORKING_UNITS
+            if unit in span
+        ]
+        if not units:
+            return
+        key = value.get("calendar")
+        if key is None:
+            key = self.spec.get("calendar")
+            if key is None:
+                self.problem(
+                    "sla_calendar_missing",
+                    units[0][0],
+                    f"{units[0][1]} are counted by a calendar, and the process has none",
+                    hint=f"set spec.calendar or {path}/calendar",
+                )
+                return
+        elif key not in self.catalog.calendars:
+            self.problem(
+                "unknown_calendar",
+                path + "/calendar",
+                f"no calendar {key!r} is published",
+                hint="publish the calendar first (POST /calendars) or install its package",
+            )
+            return
+        hours = self.catalog.calendars_with_hours
+        if key not in self.catalog.calendars or hours is None or key in hours:
+            return
+        for here, unit in units:
+            if unit == "workhours":
+                self.problem(
+                    "sla_calendar_without_hours",
+                    here,
+                    f"workhours are counted by the working hours of a calendar,"
+                    f" and calendar {key!r} declares none",
+                    hint="declare workingHours in the calendar, or count the due in workdays",
+                )
+                return
+
     def blocks(self, path: str, steps: Any, place: _Place, parent: str | None) -> None:
         ended_by: str | None = None
         for index, step in enumerate(steps or ()):
@@ -997,7 +1068,7 @@ class _Checker:
             result = self.form(here + "/form", body.get("form")) or custom_fields
             self.expr(here + "/title", body.get("title"), place, STRING)
             self.assign_chain(here + "/assign", body["assign"], place)
-            self.due(here + "/due", body.get("due"), place)
+            self.sla_due(here + "/due", body.get("due"), place)
             self.escalations(here + "/escalations", body.get("escalations"), place)
             self.context(here + "/context", body.get("context"), place)
         elif kind == "approve":
@@ -1005,7 +1076,7 @@ class _Checker:
                 custom_fields = self.task_type(here + "/taskType", body["taskType"])
             self.assign_chain(here + "/approvers", body["approvers"], place)
             self.expr(here + "/separationOfDuties", body.get("separationOfDuties"), place, LIST)
-            self.due(here + "/due", body.get("due"), place)
+            self.sla_due(here + "/due", body.get("due"), place)
             self.escalations(here + "/escalations", body.get("escalations"), place)
             self.context(here + "/context", body.get("context"), place)
         elif kind == "call":
@@ -1016,6 +1087,7 @@ class _Checker:
             self.expr_map(here + "/input", body.get("input"), place, target=None, what="table")
         elif kind == "recall":
             result = RECALL_RESULT
+            self.sla_due(here + "/due", body.get("due"), place)
             self.anchors(here + "/anchors", body["anchors"], place)
             self.expr(here + "/query", body.get("query"), place, STRING)
             self.where(here + "/where", body.get("where"), place)
@@ -1030,6 +1102,7 @@ class _Checker:
                     option_path + "/do", option.get("do"), place.but(event_payload=payload), step_id
                 )
             self.due(here + "/timeout", body.get("timeout"), place)
+            self.sla_due(here + "/due", body.get("due"), place)
             self.blocks(here + "/onTimeout", body.get("onTimeout"), place, step_id)
         elif kind == "wait":
             self.due(here, body, place)
@@ -1088,6 +1161,7 @@ class _Checker:
         self, path: str, body: Mapping[str, Any], step: Mapping[str, Any], place: _Place
     ) -> JsonSchema | None:
         self.due(path + "/timeout", body.get("timeout"), place)
+        self.sla_due(path + "/due", body.get("due"), place)
         self.context(path + "/context", body.get("context"), place)
         skill_ref = body.get("skill")
         if skill_ref is None:
@@ -1106,6 +1180,14 @@ class _Checker:
                     path + "/process",
                     f"no process {process!r} is published yet",
                     hint="publish it before a version that calls it is started",
+                    warning=True,
+                )
+            elif process is not None and process in self.catalog.retired_processes:
+                self.problem(
+                    "process_retired",
+                    path + "/process",
+                    f"process {process!r} is retired: calling it fails at run time",
+                    hint="call a process in use, or catch process_retired with try",
                     warning=True,
                 )
             self.expr_map(path + "/input", body.get("input"), place, target=None, what="input")

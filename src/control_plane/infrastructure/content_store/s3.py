@@ -20,6 +20,7 @@ import boto3
 from botocore.config import Config
 from botocore.exceptions import BotoCoreError, ClientError
 
+from control_plane import sandbox
 from control_plane.infrastructure.content_store.base import (
     READ_CHUNK_BYTES,
     ContentObjectMissing,
@@ -111,6 +112,7 @@ class S3ContentStore(ContentStore):
             return self._client
 
     async def _call(self, fn: Any, *args: Any, **kwargs: Any) -> Any:
+        sandbox.refuse_outgoing("content_store")
         try:
             return await asyncio.to_thread(fn, *args, **kwargs)
         except ClientError:

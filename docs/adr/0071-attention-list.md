@@ -68,6 +68,7 @@ workspace объекта (у approval — его workspace, иначе workspace
 |---|---|---|---|---|
 | `approval.review` | `review` | `review_assigned` / `review_role` | pending **gate**-approval, который вызывающий вправе решить: работа стоит «на проверке» (ADR-0018, критерий `human` ADR-0067) | 80 + 1 за день ожидания (≤ 10) |
 | `approval.decide` | `decision` | `decision_assigned` / `decision_role` | pending approval без gate, который вызывающий вправе решить | 70 + 1 за день ожидания (≤ 10) |
+| `approval.undecidable` | `undecidable` | `undecidable_process_owner` / `undecidable_process_starter` / `undecidable_requester` | pending approval для роли, который никто не вправе решить: все держатели роли в его области исключены (разделение обязанностей, CP-ADR-0074 §7). Владельцу процесса, чей шаг его запросил (нет владельца — запустившему экземпляр), иначе — автору запроса (амендмент 2026-09-30) | 75 + 1 за день ожидания (≤ 10) |
 | `task.due_not_started` | `deadline` | `due_soon` / `overdue` | задача вызывающего (исполнитель, иначе владелец) категории `backlog`/`active` со сроком ≤ now + 48 ч (включая просроченные), которую никто не начал: нет активного claim и не было ни одного run | просрочена — 90; иначе 60→80 по мере приближения срока |
 | `task.blocked` | `blocked` | `task_blocked` | задача, где вызывающий — исполнитель или владелец, в статусе категории `blocked` | 55 |
 | `task.delegated_failing` | `delegated_failure` | `runs_failed` | работа, которую вызывающий отдал другому (владелец, иначе автор; исполнитель — другой principal), категории `backlog`/`active`, последние ≥ 3 run подряд — `failed` | 65 + 5 за каждый провал сверх трёх (≤ 15) |
@@ -92,6 +93,12 @@ workspace объекта (у approval — его workspace, иначе workspace
 показывает объект, который вызывающий не мог бы прочитать, и чужие объекты в
 нём не появляются ни в каком режиме `authorize`. Отдельного фильтра по
 `visible_objects` нет — он был бы шире правил, а не уже.
+
+Исключение — `approval.undecidable` (амендмент 2026-09-30, CP-ADR-0074 §7):
+владелец процесса не отношение approval в модели PDP, поэтому элемент
+владельцу (или запустившему экземпляр) показывается, только если `authorize(approvals.read)` на этот
+approval его пускает (в режиме `policy` — `approvals.read` на области
+approval); автор запроса читает approval по отношению `requested_by`.
 
 ### 4. Обратная связь
 

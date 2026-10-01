@@ -94,7 +94,6 @@ async def link_object(
         "plan_hash": install_hash,
         "applied_by": ctx.principal_id,
         "applied_at": now,
-        "retired_at": None,
     }
     stmt = insert(PackageObject).values(
         id=new_uuid(), tenant_id=ctx.tenant_id, kind=kind, key=key, **values

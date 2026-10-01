@@ -1,10 +1,10 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://taimen.ai/schema/packages/v1/test.schema.json",
-  "title": "Тест процесса пакета (TAI-ADR-0054 Р8)",
+  "title": "Тест пакета: процесс, правило или тип задачи", "$comment": "TAI-ADR-0054 Р8, TAI-ADR-0062 п.11",
   "description": "Файл <имя>.test.yaml в каталоге tests/ пакета. Прогоняет ядро (POST /packages:test) тем же движком, что живой прогон, в песочнице: задачи, approvals и таймеры — в памяти, скиллы, агенты и память — заглушки, проверенные по схемам каталога, время виртуальное. Побочных эффектов нет.",
   "type": "object",
-  "required": ["process", "name", "steps"],
+  "required": ["name", "steps"],
   "additionalProperties": false,
   "properties": {
     "$schema": {"type": "string"},
@@ -12,20 +12,13 @@
     "version": {"type": "integer", "minimum": 1, "description": "По умолчанию — версия в пакете"},
     "name": {"type": "string", "minLength": 1, "maxLength": 200},
     "description": {"type": "string", "maxLength": 2000},
-    "given": {
-      "type": "object", "additionalProperties": false,
-      "properties": {
-        "clock": {"type": "string", "format": "date-time", "description": "Начальное виртуальное время"},
-        "data": {"type": "object", "description": "Начальные данные экземпляра (без события старта)"},
-        "stage": {"type": "string", "description": "Начать с открытой стадии"},
-        "fromInstance": {"type": "string", "description": "Только пробный прогон на стенде: состояние копируется из живого экземпляра"},
-        "calendar": {"type": "string", "description": "Ключ календаря вместо календаря процесса"},
-        "principals": {
-          "type": "object", "additionalProperties": {"type": "array", "items": {"type": "string"}},
-          "description": "Роль → вымышленные principal теста (для назначений и разделения обязанностей)"
-        }
-      }
+    "subject": {
+      "enum": ["process", "rule", "taskType"], "default": "process",
+      "description": "Что проверяет тест: процесс (по умолчанию), правило вывода работы или тип задачи (исходы гейтов, критерии приёмки, действия завершения)"
     },
+    "rule": {"type": "string", "pattern": "^[a-z0-9][a-z0-9_-]*$", "description": "Ключ WorkRule пакета (subject: rule)"},
+    "taskType": {"type": "string", "pattern": "^[a-z0-9][a-z0-9_-]*$", "description": "Ключ TaskType пакета (subject: taskType)"},
+    "given": {"type": "object"},
     "mocks": {
       "type": "object", "additionalProperties": false,
       "properties": {
@@ -45,13 +38,200 @@
         }
       }
     },
-    "steps": {"type": "array", "minItems": 1, "maxItems": 500, "items": {"$ref": "#/$defs/testStep"}},
+    "steps": {"type": "array", "minItems": 1, "maxItems": 500, "items": {"type": "object"}},
     "coverage": {
       "type": "object", "additionalProperties": false,
       "properties": {"minimum": {"type": "number", "minimum": 0, "maximum": 100, "description": "Порог покрытия элементов процесса этим тестом, %"}}
     }
   },
+  "allOf": [
+    {
+      "if": {"not": {"required": ["subject"], "properties": {"subject": {"enum": ["rule", "taskType"]}}}},
+      "then": {
+        "required": ["process"],
+        "properties": {"given": {"$ref": "#/$defs/processGiven"}, "steps": {"items": {"$ref": "#/$defs/testStep"}}}
+      }
+    },
+    {
+      "if": {"required": ["subject"], "properties": {"subject": {"const": "rule"}}},
+      "then": {
+        "required": ["rule"],
+        "properties": {"given": {"$ref": "#/$defs/ruleGiven"}, "steps": {"items": {"$ref": "#/$defs/ruleStep"}}}
+      }
+    },
+    {
+      "if": {"required": ["subject"], "properties": {"subject": {"const": "taskType"}}},
+      "then": {
+        "required": ["taskType"],
+        "properties": {"given": {"$ref": "#/$defs/taskTypeGiven"}, "steps": {"items": {"$ref": "#/$defs/taskTypeStep"}}}
+      }
+    }
+  ],
   "$defs": {
+    "processGiven": {
+      "type": "object", "additionalProperties": false,
+      "properties": {
+        "clock": {"type": "string", "format": "date-time", "description": "Начальное виртуальное время"},
+        "data": {"type": "object", "description": "Начальные данные экземпляра (без события старта)"},
+        "stage": {"type": "string", "description": "Начать с открытой стадии"},
+        "fromInstance": {"type": "string", "description": "Только пробный прогон на стенде: состояние копируется из живого экземпляра"},
+        "calendar": {"type": "string", "description": "Ключ календаря вместо календаря процесса"},
+        "principals": {
+          "type": "object", "additionalProperties": {"type": "array", "items": {"type": "string"}},
+          "description": "Роль → вымышленные principal теста (для назначений и разделения обязанностей)"
+        }
+      }
+    },
+
+    "variables": {
+      "type": "object", "propertyNames": {"pattern": "^[A-Z][A-Z0-9_]*$"}, "additionalProperties": {"type": "string"},
+      "description": "Значения переменных установки для теста; остальные — default из манифеста"
+    },
+
+    "workExpectation": {
+      "type": "object", "additionalProperties": false,
+      "description": "Ожидаемая работа: заданные поля сравниваются, незаданные не проверяются",
+      "properties": {
+        "type": {"type": "string"},
+        "title": {"type": "string"},
+        "assignee": {"type": "string", "description": "agent:<key>, роль теста или вымышленный principal"},
+        "customFields": {"type": "object"},
+        "relation": {"type": "object"}
+      }
+    },
+
+    "skillExpectation": {
+      "type": "object", "required": ["skill"], "additionalProperties": false,
+      "properties": {"skill": {"type": "string", "pattern": "^[^@\\s]+@[^@\\s]+$"}, "inputs": {"type": "object", "description": "Подмножество входа вызова"}}
+    },
+
+    "ruleGiven": {
+      "type": "object", "additionalProperties": false,
+      "oneOf": [{"required": ["observation"]}, {"required": ["event"]}, {"required": ["schedule"]}],
+      "properties": {
+        "clock": {"type": "string", "format": "date-time"},
+        "variables": {"$ref": "#/$defs/variables"},
+        "task": {
+          "type": "object", "required": ["type"], "additionalProperties": false,
+          "description": "Задача, заведённая до входа: событие без taskId в payload — о ней", "$comment": "CP-ADR-0074, амендмент 2026-09-30",
+          "properties": {
+            "type": {"type": "string", "pattern": "^[a-z0-9][a-z0-9_-]*$", "description": "Ключ типа задачи пакета или tenant'а"},
+            "title": {"type": "string"},
+            "status": {"type": "string"},
+            "assignee": {"type": "string", "description": "agent:<key> или вымышленный principal"},
+            "customFields": {"type": "object"}
+          }
+        },
+        "schedule": {
+          "type": "object", "additionalProperties": false,
+          "description": "Вход — срабатывание расписания правила (trigger.kind: schedule)",
+          "properties": {"at": {"type": "string", "format": "date-time", "description": "Время слота; по умолчанию clock"}}
+        },
+        "observation": {
+          "type": "object", "required": ["kind"], "additionalProperties": false,
+          "properties": {
+            "kind": {"type": "string", "minLength": 1},
+            "data": {"type": "object"},
+            "content": {"type": "string"},
+            "source": {"type": "string"},
+            "externalRef": {"type": "object"}
+          }
+        },
+        "event": {
+          "type": "object", "required": ["type"], "additionalProperties": false,
+          "properties": {"type": {"type": "string", "minLength": 1}, "payload": {"type": "object"}}
+        }
+      }
+    },
+
+    "ruleStep": {
+      "type": "object", "additionalProperties": false, "required": ["expect"],
+      "properties": {
+        "expect": {
+          "type": "object", "additionalProperties": false,
+          "properties": {
+            "result": {"type": "string", "description": "Итог оценки правила ядра (как result события rule.evaluated)"},
+            "ensureWork": {"type": "array", "items": {"$ref": "#/$defs/workExpectation"}},
+            "invokeSkill": {"type": "array", "items": {"$ref": "#/$defs/skillExpectation"}},
+            "noSideEffects": {"const": true}
+          }
+        }
+      }
+    },
+
+    "taskTypeGiven": {
+      "type": "object", "additionalProperties": false,
+      "properties": {
+        "clock": {"type": "string", "format": "date-time"},
+        "variables": {"$ref": "#/$defs/variables"},
+        "task": {
+          "type": "object", "additionalProperties": false,
+          "properties": {
+            "title": {"type": "string"},
+            "status": {"type": "string"},
+            "assignee": {"type": "string"},
+            "customFields": {"type": "object"}
+          }
+        },
+        "artifacts": {
+          "type": "array", "maxItems": 20,
+          "items": {
+            "type": "object", "required": ["type"], "additionalProperties": false,
+            "dependentRequired": {"content": ["mediaType"], "mediaType": ["content"]},
+            "properties": {
+              "key": {"type": "string"},
+              "type": {"type": "string"},
+              "metadata": {"type": "object"},
+              "content": {"type": "string", "maxLength": 1048576, "description": "Содержимое (текст): артефакт с сохранённым содержимым, как после загрузки"},
+              "mediaType": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9!#$&^_.+-]*/[A-Za-z0-9][A-Za-z0-9!#$&^_.+-]*(\\s*;.*)?$", "description": "Тип содержимого (text/markdown, application/json, …)"}
+            }
+          }
+        },
+        "principals": {
+          "type": "object", "additionalProperties": {"type": "array", "items": {"type": "string"}},
+          "description": "Роль → вымышленные principal теста"
+        }
+      }
+    },
+
+    "taskTypeStep": {
+      "type": "object", "additionalProperties": false,
+      "oneOf": [{"required": ["approve"]}, {"required": ["verify"]}, {"required": ["complete"]}, {"required": ["expect"]}],
+      "properties": {
+        "approve": {
+          "type": "object", "required": ["decision"], "additionalProperties": false,
+          "properties": {
+            "gate": {"type": "string", "default": "default"},
+            "decision": {"enum": ["approved", "rejected"]},
+            "by": {"type": "string"},
+            "comment": {"type": "string"}
+          }
+        },
+        "verify": {
+          "type": "object", "required": ["check", "result"], "additionalProperties": false,
+          "description": "Итог критерия приёмки типа",
+          "properties": {"check": {"type": "string"}, "result": {"enum": ["passed", "failed"]}, "output": {"type": "object"}}
+        },
+        "complete": {
+          "type": "object", "additionalProperties": false,
+          "properties": {"output": {"type": "object", "description": "Выход завершения (completionSchema)"}}
+        },
+        "expect": {
+          "type": "object", "additionalProperties": false,
+          "properties": {
+            "ensureWork": {"type": "array", "items": {"$ref": "#/$defs/workExpectation"}},
+            "invokeSkill": {"type": "array", "items": {"$ref": "#/$defs/skillExpectation"}},
+            "status": {
+              "type": "object", "additionalProperties": false,
+              "properties": {"key": {"type": "string"}, "category": {"enum": ["backlog", "active", "blocked", "terminal_success", "terminal_cancelled"]}}
+            },
+            "comments": {"type": "array", "items": {"type": "string"}, "description": "Подстроки комментариев, оставленных исходами"},
+            "noSideEffects": {"const": true}
+          }
+        }
+      }
+    },
+
     "mockAnswer": {
       "type": "object", "additionalProperties": false,
       "oneOf": [{"required": ["output"]}, {"required": ["error"]}, {"required": ["timeout"]}],
@@ -109,6 +289,12 @@
             "timers": {"type": "array", "items": {"type": "object", "properties": {
               "id": {"type": "string"}, "at": {"type": "string"}, "provisional": {"type": "boolean"}}}},
             "data": {"type": "object", "description": "Путь в данных → ожидаемое значение"},
+            "sla": {
+              "type": "object", "minProperties": 1,
+              "propertyNames": {"pattern": "^[a-z][a-z0-9-]{0,62}$"},
+              "additionalProperties": {"enum": ["ok", "warning", "breached", "paused"]},
+              "description": "Состояние срока: id шага → состояние его открытой попытки; ключ process — срок процесса (spec.due)", "$comment": "CP-ADR-0078 §7"
+            },
             "events": {"type": "array", "items": {"type": "string"}, "description": "Типы событий process.* с последнего expect"},
             "memory": {"type": "object", "additionalProperties": false, "properties": {
               "recalled": {"type": "array", "items": {"type": "string"}},

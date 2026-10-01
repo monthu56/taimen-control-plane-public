@@ -211,7 +211,13 @@ async def test_the_package_brings_what_its_process_names(client: httpx.AsyncClie
             document(
                 "TaskType",
                 "review",
-                {"fieldSchema": {"type": "object", "properties": {"decision": {"type": "string"}}}},
+                {
+                    "displayName": "Review",
+                    "fieldSchema": {
+                        "type": "object",
+                        "properties": {"decision": {"type": "string"}},
+                    },
+                },
             ),
         ),
         (
@@ -304,3 +310,94 @@ async def test_an_attempt_to_write_is_a_side_effect(
     assert body["status"] == "failed"
     (failure,) = body["tests"][0]["failures"]
     assert "wrote outside the sandbox" in failure["message"] and failure["actual"] == 1
+
+
+async def test_the_check_of_a_package_sees_the_calendar_of_a_due(
+    client: httpx.AsyncClient,
+) -> None:
+    """CP-ADR-0078 §1 (P009): the refusals of publication, before the package is applied."""
+    key = await _setup(client)
+    process = PROCESS.replace(
+        'due: {at: "cal.addWorkdays(data.deadline, -2)"}', "due: {workhours: 8}"
+    )
+    assert process != PROCESS
+    here = "/spec/stages/0/steps/2/human/due/workhours"
+
+    async def errors(*extra: tuple[str, str], text: str = process) -> list[tuple[str, str]]:
+        response = await client.post(
+            "/api/v1/packages:test?checkOnly=true",
+            json={"package": package(*extra, process=text)},
+            headers=auth(key),
+        )
+        assert response.status_code == 200, response.text
+        return [
+            (p["code"], p["path"]) for p in response.json()["problems"] if p["severity"] == "error"
+        ]
+
+    # The calendar ru of the catalog, and the one the package brings, have no hours.
+    assert await errors() == [("sla_calendar_without_hours", here)]
+    assert await errors(("calendars/ru.yaml", CALENDAR)) == [("sla_calendar_without_hours", here)]
+    assert await errors(text=process.replace("  calendar: ru\n", "")) == [
+        ("sla_calendar_missing", here)
+    ]
+    # The package's version of ru declares working hours: the one the process will see.
+    with_hours = (FIXTURES / "ru-2025-2027.calendar.yaml").read_text(encoding="utf-8")
+    assert await errors(("calendars/ru.yaml", with_hours)) == []
+
+
+async def test_expect_sla_counts_by_the_calendar_the_package_brings(
+    client: httpx.AsyncClient,
+) -> None:
+    """CP-ADR-0078 §7 (P015): the deadline of a test is the live one, by the package's calendar.
+
+    The catalog's ``ru`` has no working hours; the package brings the ``ru``
+    that has them. Eight working hours from Wednesday 2025-04-30 15:00 MSK —
+    a short day before the holidays of 1-2 May and the weekend — end on
+    Monday 05-05 at 15:00 MSK, warned two working hours before.
+    """
+    key = await _setup(client)
+    process = PROCESS.replace(
+        'due: {at: "cal.addWorkdays(data.deadline, -2)"}',
+        "due: {workhours: 8, warnBefore: {workhours: 2}}",
+    )
+    assert process != PROCESS
+    test = scenario()
+    test["given"]["clock"] = "2025-04-30T12:00:00Z"
+    opened, _, decide, done = test["steps"]
+    test["steps"] = [
+        opened,
+        {"expect": {"sla": {"decide": "ok"}, "events": ["process.step_entered"]}},
+        {"advance": "P3D"},
+        {"expect": {"sla": {"decide": "ok"}}},
+        {"advance": "PT46H"},
+        {"expect": {"sla": {"decide": "warning"}, "events": ["process.sla_warning"]}},
+        {"advance": "PT2H"},
+        {"expect": {"sla": {"decide": "breached"}, "events": ["process.sla_breached"]}},
+        decide,
+        {**done, "expect": {**done["expect"], "events": ["process.step_exited"]}},
+    ]
+    with_hours = (FIXTURES / "ru-2025-2027.calendar.yaml").read_text(encoding="utf-8")
+    response = await client.post(
+        "/api/v1/packages:test",
+        json={"package": package(("calendars/ru.yaml", with_hours), process=process, test=test)},
+        headers=auth(key),
+    )
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["status"] == "passed", body
+
+    # One hour short of the warning the state is still ok: the failure names the step.
+    test["steps"][4] = {"advance": "PT45H"}
+    response = await client.post(
+        "/api/v1/packages:test",
+        json={"package": package(("calendars/ru.yaml", with_hours), process=process, test=test)},
+        headers=auth(key),
+    )
+    failures = response.json()["tests"][0]["failures"]
+    assert [(f["step"], f["expected"], f["actual"]) for f in failures] == [
+        (5, "warning", "ok"),
+        (5, "process.sla_warning", []),
+        (7, "breached", "warning"),
+        (7, "process.sla_breached", ["process.sla_warning"]),
+    ]
+    assert failures[0]["message"].startswith("SLA of step 'decide' at 2025-05-05T09:00:00Z")

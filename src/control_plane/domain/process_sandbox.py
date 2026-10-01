@@ -1,6 +1,6 @@
 """The sandbox of a package test: the engine run with its intents kept in memory (CP-ADR-0074 §10).
 
-A test (``tests/<name>.test.yaml``, ``packages/schema/v1/test.schema.json``)
+A test (``tests/<name>.test.yaml``, package-sdk ``schema/v1/test.schema.json``)
 drives instances of a package's process through :func:`process_engine.step` —
 the same function a live instance runs (FR-025) — and the sandbox executes
 what the engine asks for:
@@ -13,7 +13,15 @@ what the engine asks for:
   catalog, a recall mock against the form of a memory answer — a mock that
   does not fit fails the test. A call without a mock stays unanswered, as a
   skill that has not answered yet;
-- **remember** and ``process.*`` events are recorded for ``expect``;
+- **remember** and ``process.*`` events are recorded for ``expect``: the
+  engine's (``process.sla_*`` among them, with the attempt the core counts)
+  and the step events ``process.step_*``, projected from every step by
+  :func:`process_steps.step_events` as ``take()`` projects them, with the
+  refs of the tasks, approvals and nested instances the sandbox opened;
+- **deadlines** are the engine's: the timers ``sla``/``sla_warning`` fire on
+  ``advance`` by the calendars of the world (the package's over the
+  catalog's); ``expect.sla`` reads them as the projection of an instance
+  does (:func:`process_sla.shown`) at the test's clock (CP-ADR-0078 §7);
 - **nested processes** (``call: {process}``) run in the same sandbox;
 - **time** is virtual: ``advance: P3D`` fires the timers that fall due in
   order, each at its own moment;
@@ -45,7 +53,7 @@ from typing import Any
 from jsonschema import Draft202012Validator
 
 from control_plane.domain import process_engine as engine
-from control_plane.domain import process_replay
+from control_plane.domain import process_replay, process_sla, process_steps
 from control_plane.domain.calendar import Calendar
 from control_plane.domain.cel_profile import ExpressionError, environment, parse_iso_duration
 from control_plane.domain.process_definition import SkillEntry, step_kind
@@ -74,7 +82,9 @@ class LiveInstance:
     pending approvals ``{activity, element, approver, excluded}`` (the
     approver as the sandbox names one: a principal, ``role:<slug>``);
     ``pending`` — approvers of a sequential step not asked yet, by activity;
-    ``totals`` — how many approvers each approval activity has.
+    ``totals`` — how many approvers each approval activity has;
+    ``attempts`` — its ``step_attempts``, ``entered`` — the attempt each open
+    activity entered with, so the step events of the copy count on from them.
     """
 
     id: str
@@ -83,6 +93,8 @@ class LiveInstance:
     approvals: tuple[Mapping[str, Any], ...] = ()
     pending: Mapping[str, Sequence[Mapping[str, Any]]] = field(default_factory=dict)
     totals: Mapping[str, int] = field(default_factory=dict)
+    attempts: Mapping[str, int] = field(default_factory=dict)
+    entered: Mapping[str, int] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -175,6 +187,11 @@ class _Instance:
     definition: engine.Definition
     state: dict[str, Any] | None = None
     parent: tuple[str, str] | None = None
+    # What take() keeps in the instance's row: attempt counters and refs.
+    attempts: dict[str, int] = field(default_factory=dict)
+    refs: dict[str, Any] = field(default_factory=dict)
+    # The virtual time it closed at: its deadlines are read at that moment.
+    closed_at: datetime | None = None
 
 
 @dataclass
@@ -362,9 +379,12 @@ class Sandbox:
         self, instance: _Instance, kind: str, body: Mapping[str, Any], actor: str | None
     ) -> None:
         given = engine.Input(kind, self.clock, body, actor, self.calendars)
-        state, decisions, intents = engine.step(instance.definition, instance.state, given)
+        before = instance.state
+        state, decisions, intents = engine.step(instance.definition, before, given)
         # The state goes through JSON as a live one goes through jsonb.
         instance.state = json.loads(json.dumps(state))
+        if instance.state["status"] in engine.CLOSED and instance.closed_at is None:
+            instance.closed_at = self.clock
         self.decisions.extend((instance.definition.key, d) for d in decisions)
         # The journal as the core keeps it: a skill of this step reads its decisions.
         event = body.get("event")
@@ -403,15 +423,45 @@ class Sandbox:
                     )
                 )
         journal.extend(entries[len(entries) - len(intents) :])
+        self.project_steps(instance, before, given, decisions)
         if kind == "approval":
             self.next_approver(instance, str(body.get("activityId") or ""))
+
+    def project_steps(
+        self,
+        instance: _Instance,
+        before: Mapping[str, Any] | None,
+        given: engine.Input,
+        decisions: Sequence[engine.Decision],
+    ) -> None:
+        """The step events of the step just taken, as ``take()`` records them (§13)."""
+        projection = process_steps.step_events(
+            instance.definition,
+            instance_id=instance.id,
+            before=before,
+            after=instance.state or {},
+            decisions=[d.out() for d in decisions],
+            given=given.out(),
+            at=self.clock,
+            attempts=instance.attempts,
+            refs=instance.refs,
+        )
+        instance.attempts = projection.attempts
+        instance.refs = projection.refs
+        self.events.extend(
+            {"type": event.type, "instance": instance.id, "payload": event.payload}
+            for event in projection.events
+        )
 
     # --- intents ------------------------------------------------------------------------
 
     def do_emit_event(self, instance: _Instance, body: dict[str, Any]) -> None:
-        self.events.append(
-            {"type": body["type"], "instance": instance.id, "payload": body.get("payload")}
-        )
+        payload = dict(body.get("payload") or {})
+        if str(body["type"]).startswith(process_sla.SLA_EVENT_PREFIX):
+            payload["attempt"] = process_steps.sla_attempt(
+                payload, refs=instance.refs, attempts=instance.attempts
+            )
+        self.events.append({"type": body["type"], "instance": instance.id, "payload": payload})
 
     def do_set_timer(self, instance: _Instance, body: dict[str, Any]) -> None:
         return None  # timers live in the instance's state; advance reads them there
@@ -451,6 +501,7 @@ class Sandbox:
             due=body.get("due"),
         )
         self.tasks.append(task)
+        instance.refs[f"task:{task.id}"] = {"activity": task.activity, "element": task.element}
         if assignee.startswith("agent:"):
             answers = (self.mocks.get("agents") or {}).get(assignee[len("agent:") :])
             if answers:
@@ -510,9 +561,19 @@ class Sandbox:
             raise _Refused("invalid_approval", 422, "the step names no approvers")
         for approver in approvers:
             self.resolve([approver], "approvers")
+        listed = body.get("excludedPrincipals", [])
+        if not isinstance(listed, list) or any(p in (None, "") for p in listed):
+            # As the core: an empty value is refused, never an exclusion dropped
+            # (CP-ADR-0074 §7).
+            raise _Refused(
+                "invalid_approval", 422, "separationOfDuties names a value that is not a principal"
+            )
+        excluded = tuple(str(p) for p in listed)
+        if any(approver.get("principal") and _link(approver) in excluded for approver in approvers):
+            # As the core: an excluded approver could never decide (CP-ADR-0074 §7).
+            raise _Refused("invalid_approval", 422, "an approver of the step is excluded")
         activity = str(body["activityId"])
         self.approvers[activity] = len(approvers)
-        excluded = tuple(str(p) for p in body.get("excludedPrincipals") or ())
         first = approvers[:1] if body.get("mode") == "sequential" else approvers
         self.sequential[activity] = approvers[len(first) :]
         for approver in first:
@@ -526,11 +587,11 @@ class Sandbox:
         approver: Mapping[str, Any],
         excluded: tuple[str, ...],
     ) -> None:
-        self.approvals.append(
-            _Approval(
-                self.new_id("approval"), instance.id, activity, element, _link(approver), excluded
-            )
+        approval = _Approval(
+            self.new_id("approval"), instance.id, activity, element, _link(approver), excluded
         )
+        self.approvals.append(approval)
+        instance.refs[f"approval:{approval.id}"] = {"activity": activity, "element": element}
 
     def next_approver(self, instance: _Instance, activity: str) -> None:
         pending = self.sequential.get(activity)
@@ -637,6 +698,7 @@ class Sandbox:
         activity = str(body["activityId"])
         child = _Instance(self.new_id("instance"), definition, None, (instance.id, activity))
         self.instances[child.id] = child
+        instance.refs[f"child:{child.id}"] = {"activity": activity, "element": body.get("element")}
         self.queue.append(
             (
                 child.id,
@@ -721,6 +783,10 @@ class Sandbox:
             )
         state: dict[str, Any] = json.loads(json.dumps(live.state))
         instance = _Instance(live.id, self.process, state)
+        instance.attempts = {str(k): int(v) for k, v in live.attempts.items()}
+        instance.refs = {
+            f"{process_steps.ACTIVITY_REF}{k}": {"attempt": int(v)} for k, v in live.entered.items()
+        }
         self.instances[instance.id] = instance
         self.roots.append(instance.id)
         if not given.get("clock") and state.get("clock"):
@@ -736,28 +802,31 @@ class Sandbox:
                 assignee: str | None = self.resolve(activity.get("assign") or (), "assign")
             except _Refused:
                 assignee = None
-            self.tasks.append(
-                _Task(
-                    id=self.new_id("task"),
-                    instance=instance.id,
-                    activity=str(activity["id"]),
-                    element=element,
-                    task_type=human.get("taskType"),
-                    assignee=assignee,
-                    due=activity.get("due"),
-                )
+            task = _Task(
+                id=self.new_id("task"),
+                instance=instance.id,
+                activity=str(activity["id"]),
+                element=element,
+                task_type=human.get("taskType"),
+                assignee=assignee,
+                due=activity.get("due"),
             )
+            self.tasks.append(task)
+            instance.refs[f"task:{task.id}"] = {"activity": task.activity, "element": element}
         for approval in live.approvals:
-            self.approvals.append(
-                _Approval(
-                    self.new_id("approval"),
-                    instance.id,
-                    str(approval["activity"]),
-                    str(approval["element"]),
-                    str(approval["approver"]),
-                    tuple(str(p) for p in approval.get("excluded") or ()),
-                )
+            copied = _Approval(
+                self.new_id("approval"),
+                instance.id,
+                str(approval["activity"]),
+                str(approval["element"]),
+                str(approval["approver"]),
+                tuple(str(p) for p in approval.get("excluded") or ()),
             )
+            self.approvals.append(copied)
+            instance.refs[f"approval:{copied.id}"] = {
+                "activity": copied.activity,
+                "element": copied.element,
+            }
         self.approvers.update({str(k): int(v) for k, v in live.totals.items()})
         self.sequential.update({str(k): [dict(a) for a in v] for k, v in live.pending.items()})
 
@@ -929,6 +998,8 @@ class Sandbox:
         state = self.root() if set(spec) - {"events", "noSideEffects", "memory"} else None
         if state is not None:
             self.expect_state(state, spec, fail)
+        for key, wanted in (spec.get("sla") or {}).items():
+            self.expect_sla(str(key), str(wanted), fail)
         if "events" in spec:
             emitted = [e["type"] for e in self.events[self.seen_events :]]
             left = list(emitted)
@@ -1011,6 +1082,41 @@ class Sandbox:
                 fail(f"data has no {path}", wanted, None)
             elif not _same(wanted, actual):
                 fail(f"data {path}", wanted, actual)
+
+    def expect_sla(self, key: str, wanted: str, fail: Callable[[str, Any, Any], None]) -> None:
+        """The state of a deadline of the test's instance as its projection shows it (§6).
+
+        ``process`` is the process's deadline (``spec.due``), any other key the
+        deadline of the open attempt of that step — the latest, when the
+        element holds several. A closed instance is read at its close.
+        """
+        instance = self.instances[self.roots[0]]
+        state = instance.state or {}
+        timers = state.get("timers") or {}
+        now = instance.closed_at or self.clock
+        if key == process_sla.PROCESS:
+            what, found = "the process", state.get("sla")
+        else:
+            what = f"step {key!r}"
+            if key not in instance.definition.steps:
+                fail(f"SLA: the process has no step {key!r}", wanted, None)
+                return
+            open_ = [a for a in (state.get("activities") or {}).values() if a["element"] == key]
+            if not open_:
+                fail(f"SLA of {what}: the step has no open attempt", wanted, None)
+                return
+            found = max(open_, key=lambda a: a["n"]).get("sla")
+        due, actual, _ = process_sla.shown(found, now=now, timers=timers)
+        if actual == wanted:
+            return
+        moments = ""
+        if due is not None and due["dueAt"] is not None:
+            moments = f" (due {due['dueAt']}, warning {due['warnAt'] or '-'})"
+        fail(
+            f"SLA of {what} at {_rfc3339(now)}{moments}: {actual}, expected {wanted}",
+            wanted,
+            actual,
+        )
 
     def task_matches(self, wanted: Mapping[str, Any], task: _Task) -> bool:
         if task.element != wanted.get("step"):

@@ -1,0 +1,23 @@
+subject: taskType
+taskType: payment-approval
+name: одобренная оплата сверяет суммы, проходит приёмку и заводит оплату
+given:
+  task:
+    assignee: treasurer
+    customFields: {invoice: INV-7, invoiceAmount: "1500.00", paymentAmount: "1500.00"}
+  principals: {finance: [treasurer, director]}
+mocks:
+  skills:
+    invoice.amount_match@1:
+      - output: {matches: true, difference: "0"}
+steps:
+  - approve: {decision: approved, by: director}
+  - expect:
+      invokeSkill:
+        - {skill: invoice.amount_match@1, inputs: {invoiceAmount: "1500.00", paymentAmount: "1500.00"}}
+        - {skill: invoice.amount_match@1}
+      ensureWork:
+        - {type: invoice-payment, title: Оплатить счёт INV-7, customFields: {invoice: INV-7}}
+      status: {category: terminal_success}
+      comments: [согласована]
+      noSideEffects: true

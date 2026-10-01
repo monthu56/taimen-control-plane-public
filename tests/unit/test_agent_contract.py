@@ -7,12 +7,20 @@ superproject (``$defs.agentSpec``, declarative-agents D001), and the
 
 The examples in ``tests/fixtures/agents`` are the examples of the superproject
 (``tools/tests/test_agent_schema.py``): one per executor kind plus an identity
-without placement. The catalog schema is read from the superproject when this
-repository is checked out inside it, and from the pinned copy
-``tests/fixtures/superproject/object.schema.json`` otherwise.
+without placement, and ``universal-coder.yaml`` (``tools/tests/fixtures/agents``,
+universal-runner U001) with a catalog of repositories as its working copy.
+
+``workingCopy`` is data of the executor kind (TAI-ADR-0063, amendment of
+CP-ADR-0073 p.1): the core checks only that it is an object, looks for secret
+material in it and hashes it with the revision; its shape is the schema's
+(``$defs.agentWorkingCopies``). The catalog schema is read from package-sdk
+when it is checked out next to control-plane, and from the pinned copy
+``tests/fixtures/superproject/object.schema.json`` otherwise
+(``tests/package_sdk.py``).
 """
 
 import copy
+import hashlib
 import json
 from pathlib import Path
 from typing import Any
@@ -25,6 +33,7 @@ from pydantic import ValidationError
 
 from control_plane.api.v1.router import api_v1_router
 from control_plane.api.v1.schemas import (
+    AGENT_IMAGE_PATTERN,
     AGENT_INSTRUCTIONS_MAX_CHARS,
     AgentPublishRequest,
     AgentSpec,
@@ -34,14 +43,11 @@ from control_plane.api.v1.schemas import (
 from control_plane.application.commands.agents import spec_hash_of, split_desired_state
 from control_plane.domain.enums import AgentPhase, AgentState, Permission
 from control_plane.domain.event_catalog import get_event_type
+from tests.package_sdk import PACKAGE_SDK_SCHEMAS, PINNED_SCHEMAS, live_schema_path, schema_path
 
 FIXTURES = Path(__file__).resolve().parents[1] / "fixtures"
 AGENTS = FIXTURES / "agents"
-PINNED_SCHEMA = FIXTURES / "superproject" / "object.schema.json"
-# In the superproject control-plane is a submodule at its root (flat layout).
-SUPERPROJECT_SCHEMA = (
-    Path(__file__).resolve().parents[3] / "packages" / "schema" / "v1" / "object.schema.json"
-)
+PINNED_SCHEMA = PINNED_SCHEMAS / "object.schema.json"
 # What the kind Agent is made of in the catalog schema.
 AGENT_DEFS = (
     "agentSpec",
@@ -53,7 +59,14 @@ AGENT_DEFS = (
     "envOrUuid",
     "nodeLabel",
     "secretName",
+    "agentWorkingCopies",
+    "repositoryKey",
+    "repositoryAlias",
 )
+# The working copy of the kind claude-code in the pinned copy, as package-sdk
+# carries it (universal-runner U001, wording of package-sdk ``0d271ed``): sha256
+# of the canonical JSON of ``_working_copy_contract``. Re-pin together with the copy.
+WORKING_COPY_CONTRACT_SHA256 = "a7e88495f48bf74c9b1c77360315cd51f27fde66c55af03857d3f1ec344cfce6"
 
 
 def _objects() -> list[dict[str, Any]]:
@@ -67,8 +80,7 @@ def _object(key: str) -> dict[str, Any]:
 
 
 def _catalog_schema() -> dict[str, Any]:
-    path = SUPERPROJECT_SCHEMA if SUPERPROJECT_SCHEMA.is_file() else PINNED_SCHEMA
-    return json.loads(path.read_text(encoding="utf-8"))
+    return json.loads(schema_path("object.schema.json").read_text(encoding="utf-8"))
 
 
 CATALOG = jsonschema.Draft202012Validator(_catalog_schema())
@@ -100,6 +112,7 @@ def _set(spec: dict[str, Any], path: tuple[str, ...], value: Any) -> dict[str, A
 
 
 DELETE = object()
+DIGEST = "0123456789abcdef" * 4
 
 
 def _openapi() -> dict[str, Any]:
@@ -191,12 +204,10 @@ def test_permissions_are_in_the_catalog() -> None:
 # --- the core's validator against the catalog schema of the kind -------------
 
 
-def test_the_pinned_schema_is_the_superproject_one() -> None:
+def test_the_pinned_schema_is_the_package_sdk_one() -> None:
     """The whole copy, not only the kind Agent: the kinds TaskType and WorkRule
     carry the core's request bodies too (declarative-cycle C001/C002)."""
-    if not SUPERPROJECT_SCHEMA.is_file():
-        pytest.skip("not checked out inside the superproject")
-    live = json.loads(SUPERPROJECT_SCHEMA.read_text(encoding="utf-8"))
+    live = json.loads(live_schema_path("object.schema.json").read_text(encoding="utf-8"))
     pinned = json.loads(PINNED_SCHEMA.read_text(encoding="utf-8"))
     assert {name: pinned["$defs"][name] for name in AGENT_DEFS} == {
         name: live["$defs"][name] for name in AGENT_DEFS
@@ -214,7 +225,45 @@ def test_the_examples_cover_every_executor_kind_and_the_catalog_accepts_them() -
     assert kinds == {"claude-code", "codex", "skills", "none"}
 
 
-@pytest.mark.parametrize("key", ["coder", "reviewer", "skills-executor", "process-bridge"])
+def _working_copy_contract(schema: dict[str, Any]) -> dict[str, Any]:
+    """What decides the shape of ``workingCopy``: the forms and the dispatch by kind."""
+    defs = schema["$defs"]
+    return {
+        "forms": {
+            name: defs[name] for name in ("agentWorkingCopies", "repositoryKey", "repositoryAlias")
+        },
+        "dispatch": defs["agentSpec"]["allOf"],
+        "section": defs["agentSpec"]["properties"]["workingCopy"],
+    }
+
+
+def _sha256(document: Any) -> str:
+    raw = json.dumps(document, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def test_the_claude_code_working_copy_of_the_pinned_schema_is_the_package_one() -> None:
+    """Contract of U002: the core's copy of the claude-code form is the package's.
+
+    With package-sdk checked out beside control-plane the copy is compared with
+    its live schema; the core's own CI compares it with the pinned digest.
+    """
+    pinned = _working_copy_contract(json.loads(PINNED_SCHEMA.read_text(encoding="utf-8")))
+    assert _sha256(pinned) == WORKING_COPY_CONTRACT_SHA256
+    claude_code = pinned["forms"]["agentWorkingCopies"]["claude-code"]
+    assert (claude_code["then"], claude_code["else"]) == (
+        {"$ref": "#/$defs/agentWorkingCopies/catalog"},
+        {"$ref": "#/$defs/agentWorkingCopies/single"},
+    )
+    live_schema = PACKAGE_SDK_SCHEMAS / "object.schema.json"
+    if live_schema.is_file():
+        live = json.loads(live_schema.read_text(encoding="utf-8"))
+        assert pinned == _working_copy_contract(live)
+
+
+@pytest.mark.parametrize(
+    "key", ["coder", "reviewer", "skills-executor", "process-bridge", "universal-coder"]
+)
 def test_every_catalog_example_passes_the_core_and_comes_back_as_it_was(key: str) -> None:
     """SC-007 at the core's level: nothing is added or renamed on the way in."""
     document = _object(key)
@@ -242,11 +291,30 @@ BOTH_ACCEPT: list[tuple[str, tuple[str, ...], Any]] = [
     ("coder", ("workingCopy", "publish"), False),
     ("coder", ("workingCopy", "review", "taskTypes"), ["coding-task"]),
     ("coder", ("workingCopy", "review", "base"), "main"),
+    ("universal-coder", ("workingCopy", "publish"), False),
+    ("universal-coder", ("workingCopy", "superproject"), DELETE),
+    ("universal-coder", ("workingCopy", "repositories", "fleet", "baseRef"), DELETE),
+    ("universal-coder", ("workingCopy", "repositories", "fleet", "publish"), False),
+    ("universal-coder", ("workingCopy", "repositories", "fleet", "aliases"), ["флот"]),
+    (
+        "universal-coder",
+        ("workingCopy", "repositories", "fleet", "url"),
+        "https://git.example/org/fleet.git",
+    ),
     ("process-bridge", ("executor",), {"kind": "skills"}),
     ("process-bridge", ("description",), "Bridges process-runtime to the queue"),
     ("process-bridge", ("identity", "iam"), DELETE),
     ("coder", ("identity", "iam"), {"audiences": ["iam"], "scopeCeiling": ["iam:agents"]}),
     ("process-bridge", ("identity", "iam", "scopeCeiling"), ["policy:check-on-behalf"]),
+    # executor.image (E1): a tag, a digest or both; a registry with a port.
+    ("coder", ("executor", "image"), "observer:1.2.0"),
+    ("coder", ("executor", "image"), "observer:latest"),
+    ("coder", ("executor", "image"), f"ghcr.io/org/observer@sha256:{DIGEST}"),
+    ("coder", ("executor", "image"), f"ghcr.io/org/observer:1.2@sha256:{DIGEST}"),
+    ("coder", ("executor", "image"), "registry.local:5000/team/sub/observer:v1"),
+    ("coder", ("executor", "image"), "localhost:5000/observer:1"),
+    ("skills-executor", ("executor", "image"), "ghcr.io/org/skills-host__x:2026.09.29-1"),
+    ("coder", ("executor", "image"), "r.io/" + "o" * 248 + ":1"),  # 255 characters
 ]
 
 
@@ -265,10 +333,6 @@ BOTH_REJECT: list[tuple[str, tuple[str, ...], Any]] = [
     ("process-bridge", ("placement",), {"replicas": 1}),  # placed without executor
     ("process-bridge", ("placement",), DELETE),  # placed by default, without executor
     ("coder", ("workspace",), {"repository": "https://git.example/org/control-plane.git"}),
-    ("coder", ("workingCopy", "repository"), DELETE),
-    ("coder", ("workingCopy", "directory"), "Control Plane"),
-    ("coder", ("workingCopy", "review", "mode"), "later"),
-    ("coder", ("workingCopy", "review", "unknownField"), True),
     ("coder", ("skills", "concurrency"), 0),
     ("coder", ("skills", "concurrency"), 33),
     ("coder", ("skills", "local"), ["not an entry point"]),
@@ -310,6 +374,18 @@ BOTH_REJECT: list[tuple[str, tuple[str, ...], Any]] = [
     ("coder", ("state",), "paused"),
     ("coder", ("unknownTopLevel",), 1),
     ("coder", ("description",), "x" * 2001),
+    # executor.image (E1): no implicit latest, no credentials, no whitespace, <= 255.
+    ("coder", ("executor", "image"), "ghcr.io/org/observer"),
+    ("coder", ("executor", "image"), "observer"),
+    ("coder", ("executor", "image"), "user:secret@ghcr.io/org/observer:1"),
+    ("coder", ("executor", "image"), "https://ghcr.io/org/observer:1"),
+    ("coder", ("executor", "image"), "ghcr.io/org/observer :1"),
+    ("coder", ("executor", "image"), "ghcr.io/Org/observer:1"),
+    ("coder", ("executor", "image"), "ghcr.io/org/observer@sha256:abc"),
+    ("coder", ("executor", "image"), "ghcr.io/org/observer@md5:" + "a" * 32),
+    ("coder", ("executor", "image"), "ghcr.io/org/observer:" + "t" * 129),
+    ("coder", ("executor", "image"), "r.io/" + "o" * 249 + ":1"),  # 256 characters
+    ("coder", ("executor", "image"), ""),
 ]
 
 
@@ -320,6 +396,59 @@ def test_what_the_catalog_rejects_the_core_rejects(
     spec = _set(copy.deepcopy(_object(key)["spec"]), path, value)
     assert _catalog_errors(key, spec) != []
     assert not _core_accepts(key, spec)
+
+
+# (example, path in spec, value): shapes of ``workingCopy`` the schema of the kind
+# rejects and the core stores as they are (FR-030): the shape is not the core's.
+SCHEMA_REJECTS_CORE_STORES: list[tuple[str, tuple[str, ...], Any]] = [
+    ("coder", ("workingCopy", "repository"), DELETE),
+    ("coder", ("workingCopy", "directory"), "Control Plane"),
+    ("coder", ("workingCopy", "review", "mode"), "later"),
+    ("coder", ("workingCopy", "review", "unknownField"), True),
+    ("coder", ("workingCopy",), {}),
+    # The catalog is a form of claude-code only.
+    ("universal-coder", ("executor",), {"kind": "codex"}),
+    ("universal-coder", ("workingCopy", "repositories", "fleet", "url"), DELETE),
+    ("universal-coder", ("workingCopy", "repositories", "Fleet Service"), {"url": "${X_URL}"}),
+    ("universal-coder", ("workingCopy", "repositoryField"), DELETE),
+    ("universal-coder", ("workingCopy", "repositories"), {}),
+    ("universal-coder", ("workingCopy", "unknownField"), True),
+    ("universal-coder", ("workingCopy", "repositories", "fleet", "publish"), "no"),
+    ("universal-coder", ("workingCopy", "repositories", "fleet", "aliases"), [1, None]),
+]
+
+
+@pytest.mark.parametrize(("key", "path", "value"), SCHEMA_REJECTS_CORE_STORES)
+def test_the_core_stores_a_working_copy_whatever_its_shape(
+    key: str, path: tuple[str, ...], value: Any
+) -> None:
+    spec = _set(copy.deepcopy(_object(key)["spec"]), path, value)
+    assert _catalog_errors(key, spec) != []
+    parsed = AgentSpec.model_validate(spec)
+    assert parsed.model_dump(mode="json", by_alias=True, exclude_unset=True) == spec
+
+
+@pytest.mark.parametrize("value", ["https://git.example/org/control-plane.git", [], 1, True])
+def test_a_working_copy_is_an_object(value: Any) -> None:
+    spec = _object("coder")["spec"]
+    spec["workingCopy"] = value
+    with pytest.raises(ValidationError):
+        AgentSpec.model_validate(spec)
+
+
+def test_an_empty_working_copy_is_stored_as_sent() -> None:
+    """``null`` and absent are what they were: sent null stays null, absent stays absent."""
+    spec = _object("coder")["spec"]
+    spec["workingCopy"] = None
+    dumped = AgentSpec.model_validate(spec).model_dump(
+        mode="json", by_alias=True, exclude_unset=True
+    )
+    assert dumped["workingCopy"] is None
+    del spec["workingCopy"]
+    dumped = AgentSpec.model_validate(spec).model_dump(
+        mode="json", by_alias=True, exclude_unset=True
+    )
+    assert "workingCopy" not in dumped
 
 
 def _hash_as_published(spec: dict[str, Any]) -> str:
@@ -342,6 +471,81 @@ def test_identity_iam_is_part_of_the_revision_and_absent_iam_hashes_as_before() 
     # The hash of a spec without iam is the hash of the same dict before D014a.
     assert _hash_as_published(without_iam) == spec_hash_of(split_desired_state(without_iam)[0])[1]
     assert _hash_as_published(with_iam) != _hash_as_published(without_iam)
+
+
+def test_executor_image_is_part_of_the_revision_and_absent_image_hashes_as_before() -> None:
+    """E1-E2: ``executor.image`` is data of the spec; without it the hash is what it was."""
+    without_image = _object("coder")["spec"]
+    assert "image" not in without_image["executor"]
+    parsed = AgentSpec.model_validate(without_image)
+    assert parsed.executor is not None and parsed.executor.image is None
+    assert (
+        "image" not in parsed.model_dump(mode="json", by_alias=True, exclude_unset=True)["executor"]
+    )
+    # The hash of a spec without image is the hash of the same dict before S016.
+    assert (
+        _hash_as_published(without_image) == spec_hash_of(split_desired_state(without_image)[0])[1]
+    )
+    with_image = copy.deepcopy(without_image)
+    with_image["executor"]["image"] = "ghcr.io/org/coder:1"
+    other_image = copy.deepcopy(without_image)
+    other_image["executor"]["image"] = "ghcr.io/org/coder:2"
+    hashes = {_hash_as_published(s) for s in (without_image, with_image, other_image)}
+    assert len(hashes) == 3
+
+
+def test_executor_image_in_the_core_is_the_pattern_of_the_catalog() -> None:
+    """E1/E3: one grammar in the core, its OpenAPI and the catalog schema of the kind."""
+    catalog = _catalog_schema()["$defs"]["agentSpec"]["properties"]["executor"]["properties"]
+    published = _openapi()["components"]["schemas"]["AgentExecutorSpec"]["properties"]
+    image = next(v for v in published["image"]["anyOf"] if v.get("type") == "string")
+    assert image["pattern"] == AGENT_IMAGE_PATTERN == catalog["image"]["pattern"]
+    assert image["maxLength"] == catalog["image"]["maxLength"] == 255
+    assert "image_not_allowed" in published["image"]["description"]
+
+
+# Hashes of revisions published before the working copy became data (FR-029):
+# computed on the core that still checked the shape (``AgentWorkingCopySpec``).
+_EARLIER_HASHES: dict[str, str] = {
+    "as-is": "sha256:789f4c8f5cf628ecc49fb236146376716698be8a1886e1c321c7463c6f98c095",
+    "minimal": "sha256:216128f2fe394de2975465031f1ea7a9d7c2373495d7ac943ee136e8b6c236b8",
+    "full": "sha256:818f6c10bfcda9cb2e7a81653b3a7278b4341b69714acdb314931e3318de9b7d",
+    "absent": "sha256:495c68fc130bce70ce97ebc827fcd0ee40608c8268aae609e527b38cc3f9ae85",
+}
+
+
+def _earlier_spec(variant: str) -> dict[str, Any]:
+    spec = _object("coder")["spec"]
+    if variant == "minimal":
+        spec["workingCopy"] = {"repository": "https://git.example/org/control-plane.git"}
+    elif variant == "full":
+        spec["workingCopy"].update(
+            {
+                "baseRef": "main",
+                "publish": False,
+                "superproject": "https://git.example/org/superproject.git",
+            }
+        )
+    elif variant == "absent":
+        del spec["workingCopy"]
+    return spec
+
+
+@pytest.mark.parametrize("variant", sorted(_EARLIER_HASHES))
+def test_hashes_of_earlier_revisions_do_not_change(variant: str) -> None:
+    assert _hash_as_published(_earlier_spec(variant)) == _EARLIER_HASHES[variant]
+
+
+def test_the_working_copy_is_part_of_the_revision() -> None:
+    spec = _object("universal-coder")["spec"]
+    changed = copy.deepcopy(spec)
+    changed["workingCopy"]["repositories"]["fleet"]["baseRef"] = "develop"
+    reordered = copy.deepcopy(spec)
+    reordered["workingCopy"]["repositories"] = dict(
+        reversed(list(spec["workingCopy"]["repositories"].items()))
+    )
+    assert _hash_as_published(changed) != _hash_as_published(spec)
+    assert _hash_as_published(reordered) == _hash_as_published(spec)
 
 
 def test_executor_parameters_are_not_interpreted() -> None:

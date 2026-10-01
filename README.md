@@ -411,7 +411,8 @@ tree**, and everything "project-related" is computed from it rather than duplica
   context and the working context, and pins the hash and layer versions on the
   run and on `run.started`. All three adapters build their prompt with one
   renderer (`control_plane_agent/instructions.py`): harness note, layers, the
-  repository conventions file (`CONTROL_PLANE_CLAUDE_PROMPT_FILE`,
+  agent conventions — the "Agent conventions" layer: `executor.instructions` of the
+  agent revision or the file (`CONTROL_PLANE_CLAUDE_PROMPT_FILE`,
   `CONTROL_PLANE_CODEX_PROMPT_FILE`, `CONTROL_PLANE_OPENCODE_PROMPT_FILE`), the task,
   the memory pack as data. The raw `effectiveConfig` JSON is no longer pasted
   into the prompt. Details: [docs/api.md](docs/api.md#executor-instructions).

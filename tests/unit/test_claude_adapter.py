@@ -467,9 +467,9 @@ async def test_summary_with_a_host_path_does_not_fail_the_run(tmp_path: Path) ->
     assert_portable({"name": artifacts[0].name, "content": artifacts[0].content}, where="artifact")
 
 
-async def test_repository_conventions_file_is_appended_to_the_prompt(tmp_path: Path) -> None:
-    """CONTROL_PLANE_CLAUDE_PROMPT_FILE: правила репозитория (имена, реестры, что не
-    коммитить) идут в каждый prompt, чтобы не стоить по кругу ревью на ветку.
+async def test_agent_conventions_file_is_appended_to_the_prompt(tmp_path: Path) -> None:
+    """CONTROL_PLANE_CLAUDE_PROMPT_FILE: соглашения агента (четвёртый слой, «Agent
+    conventions») идут в каждый prompt, чтобы не стоить по кругу ревью на ветку.
     Файл читается на каждом запуске — правка без перезапуска runner'а; отсутствие
     файла не роняет run."""
     script = fake_cli(tmp_path, result=RESULT_LINE)
@@ -481,12 +481,13 @@ async def test_repository_conventions_file_is_appended_to_the_prompt(tmp_path: P
     await adapter.execute(TASK, RUN, FakeClient(), None)
 
     stdin = (tmp_path / "stdin.txt").read_text()
-    assert "### Repository conventions" in stdin
+    assert "### Agent conventions" in stdin
+    assert "Repository conventions" not in stdin
     assert "uv.lock не коммитить" in stdin
 
     adapter.prompt_file = tmp_path / "missing.md"
     await adapter.execute(TASK, RUN, FakeClient(), None)
-    assert "Repository conventions" not in (tmp_path / "stdin.txt").read_text()
+    assert "Agent conventions" not in (tmp_path / "stdin.txt").read_text()
 
 
 class FakeClientWithPack(FakeClient):
@@ -526,6 +527,126 @@ async def test_recalled_context_reaches_the_prompt(tmp_path: Path) -> None:
     await adapter_for(script, tmp_path).execute(TASK, RUN, FakeClient(), None)
     stdin = (tmp_path / "stdin.txt").read_text()
     assert "контекст памяти недоступен: unavailable" in stdin
+
+
+# -- the environment of a run (universal-runner U009, FR-018) -------------------
+
+ENV_PROBES = ("CP_TEST_DATABASE_URL", "ANTHROPIC_BASE_URL", "http_proxy", "CONTROL_PLANE_RUN_ID")
+
+
+def env_probe_cli(tmp_path: Path) -> Path:
+    """A `claude` that writes what it sees of ENV_PROBES, one `NAME=value` a line."""
+    script = tmp_path / "fake-claude"
+    probes = "".join(
+        f'printf "%s\\n" "{name}=${{{name}-<unset>}}" >> "{tmp_path}/env.txt"\n'
+        for name in ENV_PROBES
+    )
+    script.write_text(
+        "#!/bin/sh\n"
+        f'rm -f "{tmp_path}/env.txt"\n'
+        + probes
+        + "cat > /dev/null\n"
+        + f"cat <<'JSON'\n{json.dumps(RESULT_LINE)}\nJSON\n"
+    )
+    script.chmod(0o755)
+    return script
+
+
+def seen_env(tmp_path: Path) -> dict[str, str]:
+    lines = (tmp_path / "env.txt").read_text().splitlines()
+    return dict(line.split("=", 1) for line in lines)
+
+
+@pytest.mark.asyncio
+async def test_run_environment_reaches_the_process_and_not_the_next_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    for name in ENV_PROBES:
+        monkeypatch.delenv(name, raising=False)
+    adapter = adapter_for(env_probe_cli(tmp_path), tmp_path)
+    url = "postgresql+psycopg://u:p@db:5432/t"
+
+    await adapter.execute(TASK, RUN, FakeClient(), None, env={"CP_TEST_DATABASE_URL": url})
+
+    assert seen_env(tmp_path)["CP_TEST_DATABASE_URL"] == url
+    assert "CP_TEST_DATABASE_URL" not in os.environ
+
+    await adapter.execute(TASK, {"id": "run-2", "attempt": 1}, FakeClient(), None)
+
+    assert seen_env(tmp_path)["CP_TEST_DATABASE_URL"] == "<unset>"
+
+
+@pytest.mark.asyncio
+async def test_run_environment_cannot_set_reserved_names_or_the_run_ids(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Defence in depth: the parser refuses these, and the adapter drops them again."""
+    for name in ENV_PROBES:
+        monkeypatch.delenv(name, raising=False)
+    adapter = adapter_for(env_probe_cli(tmp_path), tmp_path)
+
+    await adapter.execute(
+        TASK,
+        RUN,
+        FakeClient(),
+        None,
+        env={
+            "ANTHROPIC_BASE_URL": "https://elsewhere.example",
+            "http_proxy": "http://elsewhere.example:3128",
+            "CONTROL_PLANE_RUN_ID": "someone-elses-run",
+            "CP_TEST_DATABASE_URL": "kept",
+        },
+    )
+
+    seen = seen_env(tmp_path)
+    assert seen["ANTHROPIC_BASE_URL"] == "<unset>"
+    assert seen["http_proxy"] == "<unset>"
+    assert seen["CONTROL_PLANE_RUN_ID"] == RUN["id"]
+    assert seen["CP_TEST_DATABASE_URL"] == "kept"
+
+
+@pytest.mark.asyncio
+async def test_run_ids_are_merged_over_the_run_environment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The order of the merge holds even for an environment the filter let through."""
+    for name in ENV_PROBES:
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setattr("control_plane_claude.adapter.run_environment", dict)
+    adapter = adapter_for(env_probe_cli(tmp_path), tmp_path)
+
+    await adapter.execute(
+        TASK, RUN, FakeClient(), None, env={"CONTROL_PLANE_RUN_ID": "someone-elses-run"}
+    )
+
+    assert seen_env(tmp_path)["CONTROL_PLANE_RUN_ID"] == RUN["id"]
+
+
+@pytest.mark.asyncio
+async def test_value_with_nul_is_dropped_and_the_process_still_starts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    for name in ENV_PROBES:
+        monkeypatch.delenv(name, raising=False)
+    adapter = adapter_for(env_probe_cli(tmp_path), tmp_path)
+
+    await adapter.execute(
+        TASK, RUN, FakeClient(), None, env={"CP_TEST_DATABASE_URL": "postgresql://h/d\x00"}
+    )
+
+    assert seen_env(tmp_path)["CP_TEST_DATABASE_URL"] == "<unset>"
+
+
+@pytest.mark.asyncio
+async def test_empty_run_environment_changes_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("CP_TEST_DATABASE_URL", "from-the-runner")
+    adapter = adapter_for(env_probe_cli(tmp_path), tmp_path)
+
+    await adapter.execute(TASK, RUN, FakeClient(), None, env={})
+
+    assert seen_env(tmp_path)["CP_TEST_DATABASE_URL"] == "from-the-runner"
 
 
 class FakeClientBehindARestart(FakeClient):

@@ -66,6 +66,8 @@ def _agent(pool: ExecutionWorkspacePool) -> Agent:
     agent = object.__new__(Agent)
     agent.client = _CheckpointClient()  # type: ignore[assignment]
     agent.workspaces = pool
+    agent.publish_hook = None
+    agent.unpublished = None
     return agent
 
 

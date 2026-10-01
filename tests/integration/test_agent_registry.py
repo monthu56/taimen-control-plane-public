@@ -18,6 +18,7 @@ import yaml
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
+from control_plane.application.commands.agents import spec_hash_of, split_desired_state
 from tests.helpers import (
     auth,
     claim_task,
@@ -47,6 +48,14 @@ def coder_spec(workspace: str, **overrides: Any) -> dict[str, Any]:
     spec["workingCopy"]["review"]["reviewer"] = "reviewer"
     spec["skills"]["httpOrigins"] = ["https://cp.example.test"]
     spec.update(overrides)
+    return spec
+
+
+def catalog_spec(workspace: str) -> dict[str, Any]:
+    """The universal coder example (U001): a catalog of repositories as its working copy."""
+    spec = copy.deepcopy(_fixture("universal-coder.yaml")["spec"])
+    spec["work"]["workspace"] = workspace
+    spec["work"]["taskTypes"] = ["task"]
     return spec
 
 
@@ -84,6 +93,30 @@ async def _link(
 
 
 # --- revisions ----------------------------------------------------------------
+
+
+async def test_an_agent_with_a_catalog_of_repositories_is_published(
+    client: httpx.AsyncClient,
+) -> None:
+    """U002: the working copy is data; the revision keeps it as sent and hashes it."""
+    admin_key, workspace = await _tenant(client)
+    spec = catalog_spec(workspace["id"])
+
+    published = await _publish(client, admin_key, spec)
+    assert published.status_code == 201, published.text
+    revision = published.json()["revision"]
+    assert revision["spec"]["workingCopy"] == spec["workingCopy"]
+
+    again = await _publish(client, admin_key, spec)
+    assert again.status_code == 200, again.text
+    assert again.json()["currentRevision"] == 1
+
+    moved = copy.deepcopy(spec)
+    moved["workingCopy"]["repositories"]["fleet"]["baseRef"] = "develop"
+    changed = await _publish(client, admin_key, moved)
+    assert changed.status_code == 201, changed.text
+    assert changed.json()["currentRevision"] == 2
+    assert changed.json()["revision"]["specHash"] != revision["specHash"]
 
 
 async def test_a_revision_appears_only_when_the_hash_changes(client: httpx.AsyncClient) -> None:
@@ -215,6 +248,66 @@ async def test_validate_answers_like_publish_and_writes_nothing(
         assert response.json()["error"]["details"]["path"] == "spec.work.taskTypes[0]"
 
 
+async def test_the_executor_image_is_data_of_the_revision(client: httpx.AsyncClient) -> None:
+    """Amendment E1-E3: ``executor.image`` is stored, hashed and handed out with the spec."""
+    admin_key, workspace = await _tenant(client)
+    spec = coder_spec(workspace["id"])
+    assert "image" not in spec["executor"]
+
+    # Without the field the revision is what it was before the amendment.
+    first = (await _publish(client, admin_key, spec)).json()
+    assert "image" not in first["revision"]["spec"]["executor"]
+    assert first["revision"]["specHash"] == spec_hash_of(split_desired_state(spec)[0])[1]
+
+    image = "ghcr.io/org/coder:1.2@sha256:" + "0123456789abcdef" * 4
+    imaged = copy.deepcopy(spec)
+    imaged["executor"]["image"] = image
+    second = await _publish(client, admin_key, imaged)
+    assert second.status_code == 201, second.text
+    assert second.json()["currentRevision"] == 2
+    assert second.json()["revision"]["spec"]["executor"]["image"] == image
+    # The same file again: no revision.
+    assert (await _publish(client, admin_key, imaged)).status_code == 200
+
+    # What fleet-controller reads: the list and a revision by its address.
+    listed = (await client.get("/api/v1/agents", headers=auth(admin_key))).json()["items"]
+    assert [a["revision"]["spec"]["executor"].get("image") for a in listed] == [image]
+    old = (await client.get("/api/v1/agents/coder@1", headers=auth(admin_key))).json()
+    assert "image" not in old["revision"]["spec"]["executor"]
+
+    history = await client.get("/api/v1/agents/coder/revisions", headers=auth(admin_key))
+    assert history.json()["items"][0]["changedFields"] == ["executor.image"]
+    published = await _events(client, admin_key, "agent.revision_published")
+    assert published[-1]["payload"]["executorKind"] == "claude-code"
+    assert "image" not in published[-1]["payload"]
+
+    # What the executor reads.
+    principal_id = (await _link(client, admin_key)).json()["principalId"]
+    agent_key = await _api_key(client, admin_key, principal_id)
+    me = await client.get("/api/v1/agents/me", headers=auth(agent_key))
+    assert me.status_code == 200, me.text
+    assert me.json()["revision"]["spec"]["executor"]["image"] == image
+
+    # Dropping the image rolls the spec back to the hash of the first revision.
+    rolled_back = (await _publish(client, admin_key, spec)).json()
+    assert rolled_back["currentRevision"] == 3
+    assert rolled_back["revision"]["specHash"] == first["revision"]["specHash"]
+
+    bad = copy.deepcopy(spec)
+    bad["executor"]["image"] = "ghcr.io/org/coder"  # neither tag nor digest
+    for path in ("/api/v1/agents:validate", "/api/v1/agents"):
+        response = await client.post(
+            path, json={"key": "coder", "spec": bad}, headers=auth(admin_key)
+        )
+        assert response.status_code == 400, response.text
+        assert response.json()["error"]["code"] == "invalid_request"
+        locations = [e["loc"] for e in response.json()["error"]["details"]["errors"]]
+        assert locations == ["body.spec.executor.image"]
+    assert (await client.get("/api/v1/agents/coder", headers=auth(admin_key))).json()[
+        "currentRevision"
+    ] == 3
+
+
 async def test_references_and_secrets_are_checked(client: httpx.AsyncClient) -> None:
     admin_key, workspace = await _tenant(client)
     spec = coder_spec(workspace["id"])
@@ -273,6 +366,27 @@ async def test_references_and_secrets_are_checked(client: httpx.AsyncClient) -> 
         "field": "spec.workingCopy",
         "path": "neighbours.deploy-token",
     }
+
+    # The catalog of repositories is searched the same way (TAI-ADR-0063, U002).
+    catalog = catalog_spec(workspace["id"])
+    catalog["workingCopy"]["repositories"]["fleet"]["accessToken"] = "ghp-live"
+    leaked = await _publish(client, admin_key, catalog, agent="catalog")
+    assert leaked.status_code == 422, leaked.text
+    assert leaked.json()["error"]["code"] == "secret_material_rejected"
+    assert leaked.json()["error"]["details"] == {
+        "field": "spec.workingCopy",
+        "path": "repositories.fleet.accessToken",
+    }
+    assert "ghp-live" not in leaked.text
+    # An object, but not of the shape of any kind: the shape is the schema's, not the core's.
+    odd = {**spec, "workingCopy": {"somethingElse": {"deep": [1, "two"]}}}
+    assert (await _publish(client, admin_key, odd, agent="odd")).status_code == 201
+    for not_an_object in ("https://git.example/org/control-plane.git", [], 1):
+        response = await _publish(
+            client, admin_key, {**spec, "workingCopy": not_an_object}, agent="odd"
+        )
+        assert response.status_code == 400, response.text
+        assert response.json()["error"]["code"] == "invalid_request"
 
     # Node secret names are the one allowed reference to a secret.
     named = {**spec, "placement": {**spec["placement"], "secrets": ["github-token"]}}

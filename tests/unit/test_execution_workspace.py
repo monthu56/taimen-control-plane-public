@@ -5,6 +5,7 @@ copies do not interfere, a restart resumes the same copy instead of forking a
 second one, cleanup never destroys work, and nothing naming this host leaves it.
 """
 
+import os
 import subprocess
 from pathlib import Path
 
@@ -696,6 +697,34 @@ def test_a_stale_neighbour_mirror_is_fetched_to_reach_the_pin(
     assert git(sibling, "rev-parse", "HEAD") == newest
 
 
+def test_reaching_a_pin_never_moves_a_branch_of_the_neighbour_mirror(
+    origin: Path, neighbour_origin: Path, superproject: Path, tmp_path: Path
+) -> None:
+    """The mirror may be a pool's too (universal-runner FR-006): its task
+    branches are its own, and a fetch for a pin lands in remote-tracking refs."""
+    mirror = tmp_path / "neighbour-mirror.git"
+    subprocess.run(["git", "clone", "-q", "--bare", str(neighbour_origin), str(mirror)], check=True)
+    local = git(mirror, "rev-parse", "HEAD~1")
+    git(mirror, "branch", "task/TASK-000700", local)
+    # The forge has the same branch elsewhere, and a pin the mirror lacks.
+    git(neighbour_origin, "branch", "task/TASK-000700", "HEAD")
+    (neighbour_origin / "sdk.py").write_text("newest\n")
+    git(neighbour_origin, "add", "-A")
+    git(neighbour_origin, "commit", "-qm", "newest revision")
+    pin(superproject, NEIGHBOUR, git(neighbour_origin, "rev-parse", "HEAD"))
+
+    pool = ExecutionWorkspacePool(
+        origin,
+        tmp_path / "workspaces",
+        repo_dir="control-plane",
+        neighbours=[Neighbour(NEIGHBOUR, mirror)],
+        superproject=superproject,
+    )
+    pool.acquire("TASK-000701")
+
+    assert git(mirror, "rev-parse", "refs/heads/task/TASK-000700") == local
+
+
 # --- where the branch lives, for whoever merges it -----------------------------
 
 
@@ -896,6 +925,25 @@ def test_committed_work_on_another_base_is_refused(
     assert git(origin, "rev-parse", "task/TASK-000510") == sha
 
 
+def test_detached_work_on_another_base_is_refused(
+    origin: Path, tmp_path: Path, feature_forge: Path
+) -> None:
+    """A commit on a detached HEAD is on no branch; recreating the copy would lose it."""
+    pool = _pool(origin, tmp_path)
+    first = pool.acquire("TASK-000512")
+    git(first.path, "checkout", "-q", "--detach")
+    (first.path / "done.txt").write_text("done\n")
+    git(first.path, "add", "-A")
+    git(first.path, "commit", "-qm", "TASK-000512: detached")
+    sha = first.head()
+    pool.release(first, "failed")
+
+    with pytest.raises(WorkspaceError, match="detached HEAD holds 1 commit"):
+        pool.acquire("TASK-000512", FEATURE)
+
+    assert first.head() == sha
+
+
 def test_a_legacy_branch_counts_as_cut_from_the_default(
     origin: Path, tmp_path: Path, feature_forge: Path
 ) -> None:
@@ -920,3 +968,89 @@ def test_a_legacy_branch_counts_as_cut_from_the_default(
     pool.release(again, "failed")
     with pytest.raises(WorkspaceError, match="commit"):
         pool.acquire("TASK-000511", FEATURE)  # ...and holding a commit no other ref has
+
+
+# --- the base checks are read at, and what the checks leave (U014) ------------
+
+
+def test_a_fresh_copy_reads_its_conventions_at_the_base(
+    pool: ExecutionWorkspacePool, origin: Path
+) -> None:
+    workspace = pool.acquire("TASK-000401")
+    assert workspace.conventions_base == git(origin, "rev-parse", "main")
+
+
+def test_a_branch_without_the_record_reads_at_its_fork_not_its_head(
+    pool: ExecutionWorkspacePool, origin: Path
+) -> None:
+    base = git(origin, "rev-parse", "main")
+    workspace = pool.acquire("TASK-000402")
+    (workspace.path / ".agents").mkdir()
+    (workspace.path / ".agents" / "runner.yaml").write_text("version: 1\n")
+    workspace.commit("the task edits its conventions")
+    pool.release(workspace, "failed")
+    # A branch cut before the record existed.
+    git(pool.origin, "config", "--unset", "branch.task/TASK-000402.controlPlaneBaseCommit")
+    (origin / "README.md").write_text("the base moved on\n")
+    git(origin, "commit", "-qam", "moved")
+
+    again = pool.acquire("TASK-000402")
+    assert again.base_revision == ""
+    assert again.base_commit == again.head() != base
+    assert again.conventions_base == base
+
+
+def _tracked(path: Path) -> dict[str, str]:
+    return {
+        p.relative_to(path).as_posix(): p.read_text()
+        for p in sorted(path.rglob("*"))
+        if p.is_file() and ".git" not in p.relative_to(path).parts
+    }
+
+
+def test_restore_takes_away_what_came_after_the_snapshot(pool: ExecutionWorkspacePool) -> None:
+    workspace = pool.acquire("TASK-000403")
+    root = workspace.path
+    (root / ".gitignore").write_text(".cache/\n")
+    (root / "work.txt").write_text("the executor's\n")
+    (root / "staged.txt").write_text("staged by the executor\n")
+    git(root, "add", "staged.txt")
+    (root / "gone.txt").write_text("to be removed by the executor\n")
+    workspace.commit("before")
+    (root / "gone.txt").unlink()
+    (root / "README.md").write_text("changed by the executor\n")
+    before = _tracked(root)
+    index = git(root, "ls-files", "--stage")
+    snapshot = workspace.snapshot()
+    assert git(root, "ls-files", "--stage") == index  # the copy's index is not touched
+
+    # What checks may do: add files (in new directories, with odd names),
+    # change and remove the executor's, bring a removed one back, chmod.
+    (root / "coverage.xml").write_text("<coverage/>\n")
+    (root / "reports" / "deep").mkdir(parents=True)
+    (root / "reports" / "deep" / "a *b?.txt").write_text("x\n")
+    (root / "work.txt").write_text("formatted by the check\n")
+    (root / "README.md").unlink()
+    (root / "gone.txt").write_text("back again\n")
+    (root / "staged.txt").chmod(0o755)
+    (root / ".cache").mkdir()
+    (root / ".cache" / "kept").write_text("ignored\n")
+
+    workspace.restore(snapshot)
+
+    assert _tracked(root) == {**before, ".cache/kept": "ignored\n"}
+    assert not (root / "reports").exists()
+    assert not os.access(root / "staged.txt", os.X_OK)
+    assert workspace.snapshot() == snapshot
+    sha = workspace.commit("after")
+    assert sha is not None
+    changed = git(root, "show", "--name-only", "--format=", "HEAD").split()
+    assert sorted(changed) == ["README.md", "gone.txt"]
+
+
+def test_restore_without_changes_does_nothing(pool: ExecutionWorkspacePool) -> None:
+    workspace = pool.acquire("TASK-000404")
+    snapshot = workspace.snapshot()
+    workspace.restore(snapshot)
+    assert workspace.snapshot() == snapshot
+    assert workspace.commit("nothing") is None

@@ -9,6 +9,21 @@ existing column and ``skills.protocol.opencode`` already exists.
 Continuity is server-side: the OpenCode session id and the last message id are
 written to a Run Checkpoint, so after a restart the adapter resumes the SAME
 OpenCode session instead of starting a fresh one.
+
+The environment of a run (``env`` of ``.agents/runner.yaml``, universal-runner
+FR-018) reaches OpenCode's tools only through the server process, so a run
+with one needs a server of its own (``server.py``): given the binary, the
+adapter starts ``opencode serve`` for such a run and stops it after; a run
+without an environment uses the shared server. A run with an environment and
+only a shared server fails instead of losing it.
+
+Test services of ``runner.yaml`` (universal-runner U013) are asked of the node
+by the runner daemon only, for the working copy of the task's base; this
+harness has no such copy and asks nothing. A run in a repository whose
+``runner.yaml`` declares services, with no source of the run environment,
+stops ``blocked`` (``test_services_not_offered``) instead of going on without
+them; with ``CONTROL_PLANE_AGENT_SERVICES=host`` the host provides them and
+nothing is checked.
 """
 
 import asyncio
@@ -17,14 +32,24 @@ import logging
 import os
 import signal
 import sys
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from pathlib import Path
 from typing import Any
 
+from control_plane_agent.blocked import settle_blocked
 from control_plane_agent.comments import own_principal_id, with_comments
 from control_plane_agent.instructions import (
     build_prompt,
     prompt_file_from_environment,
     read_conventions,
+)
+from control_plane_agent.runner_config import RUNNER_CONFIG_PATH, ServiceSpec, run_environment
+from control_plane_agent.services import (
+    ENV_SERVICES_MODE,
+    NOT_OFFERED,
+    ServicesBlocked,
+    declared_services_at,
+    services_mode,
 )
 from control_plane_agent.supervision import (
     ExecutionStopped,
@@ -47,6 +72,7 @@ from control_plane_opencode.opencode import (
     reply_message_id,
     reply_text,
 )
+from control_plane_opencode.server import OpenCodeServer
 
 logger = logging.getLogger("control_plane_opencode")
 
@@ -66,9 +92,15 @@ SYSTEM_PROMPT = (
     "Do the work, then summarize what you changed and what remains."
 )
 
+#: Where a run's environment comes from: ``(task, run)`` to the variables.
+RunEnvironmentSource = Callable[[dict[str, Any], dict[str, Any]], Awaitable[Mapping[str, str]]]
+#: The services ``runner.yaml`` of the repository worked in declares; raises
+#: :class:`ServicesBlocked` for a file that does not parse.
+DeclaredServices = Callable[[], Mapping[str, ServiceSpec]]
+
 
 class OpenCodeAdapter:
-    # Repository conventions, the fourth instructions layer (CP-ADR-0066).
+    # Agent conventions, the fourth instructions layer (CP-ADR-0066).
     prompt_file: Path | None = None
 
     def __init__(
@@ -86,6 +118,9 @@ class OpenCodeAdapter:
         max_cycles: int | None = None,
         prompt_file: Path | None = None,
         supervision: SupervisionSettings | None = None,
+        server: OpenCodeServer | None = None,
+        run_env: RunEnvironmentSource | None = None,
+        declared_services: DeclaredServices | None = None,
     ) -> None:
         self.client = client
         self.opencode = opencode
@@ -103,6 +138,13 @@ class OpenCodeAdapter:
         # A cancel request or a run without progress stops the prompt
         # (control_plane_agent.supervision), as for every other adapter.
         self.supervision = supervision or SupervisionSettings()
+        # With a server launcher a run with an environment gets its own
+        # ``opencode serve``; every other run uses ``opencode``, the shared one.
+        self.server = server
+        self.run_env = run_env
+        # Read before a run without ``run_env`` starts: declared services
+        # nobody asks for stop the run instead of letting it go without them.
+        self.declared_services = declared_services
         self.session_id: str | None = None
         self.session_heartbeats: HeartbeatRunner | None = None
         self._stop = asyncio.Event()
@@ -144,7 +186,48 @@ class OpenCodeAdapter:
 
     # -- one task --------------------------------------------------------------
 
-    async def _resume_opencode_session(self, run_id: str, title: str) -> tuple[str, bool]:
+    @contextlib.asynccontextmanager
+    async def _opencode_for(self, env: Mapping[str, str]) -> AsyncIterator[OpenCodeClient]:
+        """The OpenCode server of this run: its own for a run with an environment.
+
+        A run without one needs no server of its own and gets the shared one.
+        """
+        if env and self.server is not None:
+            async with self.server.running(env) as opencode:
+                yield opencode
+            return
+        if env:
+            # A shared server would hand the variables to every later run, or
+            # the run would go without them; neither is honest.
+            raise OpenCodeError(
+                "the run has its own environment, but the OpenCode server is shared; "
+                "set CONTROL_PLANE_OPENCODE_BINARY to start a server per run"
+            )
+        yield self.opencode
+
+    async def _run_environment(self, task: dict[str, Any], run: dict[str, Any]) -> dict[str, str]:
+        if self.run_env is None:
+            await self._check_services()
+            return {}
+        return run_environment(await self.run_env(task, run))
+
+    async def _check_services(self) -> None:
+        """:class:`ServicesBlocked` when ``runner.yaml`` declares services this run cannot get."""
+        if self.declared_services is None:
+            return
+        services = await asyncio.to_thread(self.declared_services)
+        if services:
+            raise ServicesBlocked(
+                NOT_OFFERED,
+                f"{RUNNER_CONFIG_PATH} asks for services ({', '.join(sorted(services))}), "
+                "but the OpenCode harness does not ask the node for them: run the task "
+                "on a runner daemon whose executor kind has services: true, or set "
+                f"{ENV_SERVICES_MODE}=host where the host provides them",
+            )
+
+    async def _resume_opencode_session(
+        self, opencode: OpenCodeClient, run_id: str, title: str
+    ) -> tuple[str, bool]:
         """Reuse the OpenCode session recorded on this run, else create one."""
         try:
             checkpoints = await self.client.list_checkpoints(run_id)
@@ -154,9 +237,9 @@ class OpenCodeAdapter:
             if checkpoint.get("kind") != CHECKPOINT_KIND:
                 continue
             candidate = (checkpoint.get("data") or {}).get("openCodeSessionId")
-            if isinstance(candidate, str) and await self.opencode.session_exists(candidate):
+            if isinstance(candidate, str) and await opencode.session_exists(candidate):
                 return candidate, True
-        return await self.opencode.create_session(title=title), False
+        return await opencode.create_session(title=title), False
 
     def _build_prompt(self, task: dict[str, Any], context: dict[str, Any]) -> str:
         # SYSTEM_PROMPT travels as OpenCode's system message; the rest is the
@@ -212,47 +295,50 @@ class OpenCodeAdapter:
             if self._own_principal is None:
                 self._own_principal = await own_principal_id(self.client)
             task = await with_comments(self.client, task, own_principal=self._own_principal)
-            opencode_session, resumed = await self._resume_opencode_session(
-                run["id"], title=task.get("publicId") or task["title"]
-            )
-            await self.client.create_checkpoint(
-                run["id"],
-                kind=CHECKPOINT_KIND,
-                data={"openCodeSessionId": opencode_session, "resumed": resumed},
-            )
-            action = await self.client.record_action(
-                run["id"],
-                action="opencode.prompt",
-                status="started",
-                external_reference=f"opencode:session/{opencode_session}",
-            )
+            env = await self._run_environment(task, run)
+            # The server of a run stops with the run: its environment with it.
+            async with self._opencode_for(env) as opencode:
+                opencode_session, resumed = await self._resume_opencode_session(
+                    opencode, run["id"], title=task.get("publicId") or task["title"]
+                )
+                await self.client.create_checkpoint(
+                    run["id"],
+                    kind=CHECKPOINT_KIND,
+                    data={"openCodeSessionId": opencode_session, "resumed": resumed},
+                )
+                action = await self.client.record_action(
+                    run["id"],
+                    action="opencode.prompt",
+                    status="started",
+                    external_reference=f"opencode:session/{opencode_session}",
+                )
 
-            supervisor = RunSupervisor(self.client, run["id"], self.supervision)
-            try:
-                reply = await supervisor.run(
-                    self.opencode.send_prompt(
-                        opencode_session,
-                        self._build_prompt(task, context),
-                        system=SYSTEM_PROMPT,
-                        model=self.model,
-                        agent=self.agent,
+                supervisor = RunSupervisor(self.client, run["id"], self.supervision)
+                try:
+                    reply = await supervisor.run(
+                        opencode.send_prompt(
+                            opencode_session,
+                            self._build_prompt(task, context),
+                            system=SYSTEM_PROMPT,
+                            model=self.model,
+                            agent=self.agent,
+                        )
                     )
-                )
-            except ExecutionStopped as stop:
-                # The request was dropped; the session itself is told to stop.
-                with contextlib.suppress(OpenCodeError):
-                    await self.opencode.abort(opencode_session)
-                with contextlib.suppress(ControlPlaneError):
-                    await self.client.finish_action(run["id"], action["id"], status="failed")
-                logger.warning("stopped %s: %s", task.get("publicId"), stop.reason)
-                await settle_stopped(
-                    self.client,
-                    run_id=run["id"],
-                    claim_id=claim["id"],
-                    fencing_token=int(claim["fencingToken"]),
-                    stop=stop,
-                )
-                return True
+                except ExecutionStopped as stop:
+                    # The request was dropped; the session itself is told to stop.
+                    with contextlib.suppress(OpenCodeError):
+                        await opencode.abort(opencode_session)
+                    with contextlib.suppress(ControlPlaneError):
+                        await self.client.finish_action(run["id"], action["id"], status="failed")
+                    logger.warning("stopped %s: %s", task.get("publicId"), stop.reason)
+                    await settle_stopped(
+                        self.client,
+                        run_id=run["id"],
+                        claim_id=claim["id"],
+                        fencing_token=int(claim["fencingToken"]),
+                        stop=stop,
+                    )
+                    return True
             summary = reply_text(reply)
             message_id = reply_message_id(reply)
             await self.client.finish_action(
@@ -285,6 +371,11 @@ class OpenCodeAdapter:
                     content={"summary": summary[:60_000]},
                 )
             await self.client.succeed_run(run["id"], output={"messageId": message_id})
+            return True
+        except ServicesBlocked as exc:
+            # Nothing ran: waiting changes nothing, a person moves the task.
+            assert run is not None  # raised by the environment of a started run
+            await settle_blocked(self.client, task, run, claim, exc.reason, failure_reason=exc.code)
             return True
         except StaleClaimError:
             if run is not None:
@@ -355,6 +446,22 @@ def main() -> int:  # pragma: no cover - process entrypoint
         print("control-plane-opencode: no credentials for the server", file=sys.stderr)
         return 2
 
+    try:
+        host_services = services_mode(os.environ) == "host"
+    except ValueError as exc:
+        print(f"control-plane-opencode: {exc}", file=sys.stderr)
+        return 2
+    workdir = Path.cwd()
+
+    binary = os.environ.get("CONTROL_PLANE_OPENCODE_BINARY") or None
+    # With the binary every run with an environment gets its own `opencode serve`
+    # (server.py); the rest use the shared one.
+    run_server = (
+        OpenCodeServer(binary, password=os.environ.get("OPENCODE_SERVER_PASSWORD") or None)
+        if binary
+        else None
+    )
+
     async def run() -> None:
         async with (
             ControlPlaneClient(server, api_key) as client,
@@ -374,6 +481,12 @@ def main() -> int:  # pragma: no cover - process entrypoint
                 agent=os.environ.get("OPENCODE_AGENT") or None,
                 prompt_file=prompt_file_from_environment("CONTROL_PLANE_OPENCODE_PROMPT_FILE"),
                 supervision=SupervisionSettings.from_environment(),
+                server=run_server,
+                # The repository OpenCode works in, at its checked-out commit:
+                # the only runner.yaml this harness can read.
+                declared_services=(
+                    None if host_services else lambda: declared_services_at(workdir, "HEAD")
+                ),
             )
             loop = asyncio.get_running_loop()
             for sig in (signal.SIGTERM, signal.SIGINT):

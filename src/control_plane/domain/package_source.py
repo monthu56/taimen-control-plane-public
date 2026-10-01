@@ -6,27 +6,33 @@ envelope ``{apiVersion, kind, key, spec}`` in any other ``*.yaml``, tests in
 ``tests/*.test.yaml``, data schemas and other files a process refers to.
 
 - **YAML 1.2.** ``on``, ``off``, ``yes``, ``no`` are strings: the key ``on``
-  of a trigger stays ``on`` (TAI-ADR-0054 p.11). The superproject's
-  ``cp_packages`` reads packages the same way.
+  of a trigger stays ``on`` (TAI-ADR-0054 p.11). package-sdk reads packages
+  the same way. Integers are those of the core schema of YAML 1.2: decimal,
+  ``0o`` and ``0x``; ``1:30`` (sexagesimal of YAML 1.1) is a string and
+  ``012`` is twelve.
 - **Places.** Each document keeps a map JSON pointer → line, so a finding of
   the check of a process (``/spec/stages/0/steps/1``) names the line of the
   file; a pointer the file does not have takes the line of its nearest parent.
 - **``data: {$ref: <file>}``** of a process is inlined from the package
   (JSON or YAML, a path relative to the process file, never outside the
-  package), as ``cp_packages`` does before it publishes.
-- **Tests** are checked against ``packages/schema/v1/test.schema.json``; the
-  copy the core holds (``package_test.schema.json``) is kept equal to the
-  superproject by a contract test.
+  package), as package-sdk does before it publishes.
+- **Tests** are checked against ``schema/v1/test.schema.json`` of package-sdk;
+  the copy the core holds (``package_test.schema.json``) is kept equal to it
+  by a contract test. A test has a subject (CP-ADR-0074 Z1): a process (the
+  default), a ``WorkRule`` or a ``TaskType`` of the package.
 
 What is found here is a finding like those of the check of a definition
 (:class:`Problem`): ``invalid_yaml``, ``invalid_document``, ``unknown_kind``,
 ``duplicate_object``, ``unresolved_data_ref``, ``invalid_test``,
-``unknown_test_process``.
+``unknown_test_process``, ``unknown_test_rule``, ``unknown_test_task_type``;
+the warning ``test_field_ignored`` names a field of a rule or task type test
+the core does not run.
 
 Pure functions over plain values; no I/O.
 """
 
 import json
+import math
 import posixpath
 import re
 from collections.abc import Callable, Iterable, Mapping, Sequence
@@ -42,9 +48,9 @@ from jsonschema import Draft202012Validator
 from control_plane.domain.process_definition import Problem, pointer
 
 # The version of the catalog format the core reads: ``apiVersion`` is
-# ``<catalog>/v1``; which catalog is the package tool's check (cp_packages).
+# ``<catalog>/v1``; which catalog is the package tool's check (package-sdk).
 FORMAT_VERSION = "v1"
-# Kinds of the catalog schema (packages/schema/v1/object.schema.json).
+# Kinds of the catalog schema (package-sdk schema/v1/object.schema.json).
 KINDS = (
     "Package",
     "Installation",
@@ -71,6 +77,22 @@ YAML_SUFFIXES = (".yaml", ".yml")
 TEST_SCHEMA_FILE = Path(__file__).with_name("package_test.schema.json")
 KEY_PATTERN = re.compile(r"^[a-z0-9][a-z0-9_-]{0,62}$")
 MAX_TEST_PROBLEMS = 20
+# What a test is about (``subject``), the field naming the object, its kind.
+SUBJECT_PROCESS = "process"
+SUBJECT_RULE = "rule"
+SUBJECT_TASK_TYPE = "taskType"
+SUBJECTS: dict[str, tuple[str, str]] = {
+    SUBJECT_PROCESS: ("process", "Process"),
+    SUBJECT_RULE: ("rule", "WorkRule"),
+    SUBJECT_TASK_TYPE: ("taskType", "TaskType"),
+}
+_UNKNOWN_TEST_OBJECT = {
+    SUBJECT_PROCESS: ("unknown_test_process", "process", "processes"),
+    SUBJECT_RULE: ("unknown_test_rule", "rule", "rules"),
+    SUBJECT_TASK_TYPE: ("unknown_test_task_type", "task type", "task types"),
+}
+# Fields schema v1 takes in a rule or task type test that only a process test runs.
+PROCESS_ONLY_FIELDS = (("version",), ("mocks", "agents"), ("mocks", "recall"))
 
 Locate = Callable[[str], int | None]
 
@@ -78,22 +100,98 @@ Locate = Callable[[str], int | None]
 # --- YAML 1.2 with places -----------------------------------------------------------------
 
 
+# Digits of an integer literal: far above any number of a package, far below
+# what makes int() quadratic or JSON unable to write it (4300 decimal digits).
+MAX_INT_DIGITS = 1000
+INT_TOO_LONG_MESSAGE = f"an integer has more than {MAX_INT_DIGITS} digits"
+# The booleans and integers of the core schema of YAML 1.2.
+_BOOLS = {
+    word: word.lower() == "true" for word in ("true", "True", "TRUE", "false", "False", "FALSE")
+}
+_INT = re.compile(r"^(?:[-+]?[0-9]+|0o[0-7]+|0x[0-9a-fA-F]+)$")
+
+
+def _shown(value: str) -> str:
+    """A scalar as a message names it: a long one cut."""
+    return value if len(value) <= 40 else f"{value[:40]}..."
+
+
+def _parse_int(text: str) -> int:
+    """An integer of the core schema of YAML 1.2 (those of JSON are among them).
+
+    Raises :class:`ValueError` for another form (``1:30``, ``1_000``, ``0b1``)
+    and for more than :data:`MAX_INT_DIGITS` digits, before ``int()`` is paid.
+    """
+    if not _INT.match(text):
+        raise ValueError(f"{_shown(text)!r} is not an integer of YAML 1.2")
+    base = {"0o": 8, "0x": 16}.get(text[:2], 10)
+    digits = text.lstrip("+-") if base == 10 else text[2:]
+    if len(digits) > MAX_INT_DIGITS:
+        raise ValueError(INT_TOO_LONG_MESSAGE)
+    return -int(digits, base) if text.startswith("-") else int(digits, base)
+
+
+def _unreadable(node: yaml.Node, message: str) -> yaml.constructor.ConstructorError:
+    """A scalar its tag cannot read, at its line."""
+    return yaml.constructor.ConstructorError(None, None, message, node.start_mark)
+
+
 @cache
 def yaml12_loader() -> type[yaml.SafeLoader]:
-    """SafeLoader with the booleans of YAML 1.2 only: ``true`` and ``false``."""
+    """SafeLoader with the booleans and integers of YAML 1.2 only.
+
+    Booleans are ``true`` and ``false``; integers are decimal, ``0o`` and
+    ``0x``, at most :data:`MAX_INT_DIGITS` digits: sexagesimal ``1:59:59`` of
+    YAML 1.1 is a string (a million characters of it cost ``int()`` half a
+    minute), and so are ``0b1`` and ``1_000``; ``012`` is twelve. A float JSON
+    has not (``.nan``, ``1e999``, ``!!float inf``) is refused. YAML 1.2 has no
+    timestamps either: ``2026-09-30`` is a string, as JSON (the stored spec, a
+    date input of a decision table) holds a date. A scalar its tag cannot read
+    (``!!int x``, ``!!bool yes``) is an error at its line.
+    """
 
     class Loader(yaml.SafeLoader):
-        pass
+        def construct_yaml_bool(self, node: yaml.ScalarNode) -> bool:
+            value = self.construct_scalar(node)
+            if value not in _BOOLS:
+                raise _unreadable(node, f"{_shown(value)!r} is not a boolean of YAML 1.2")
+            return _BOOLS[value]
 
+        def construct_yaml_int(self, node: yaml.ScalarNode) -> int:
+            try:
+                return _parse_int(self.construct_scalar(node))
+            except ValueError as exc:
+                raise _unreadable(node, str(exc)) from None
+
+        def construct_yaml_float(self, node: yaml.ScalarNode) -> float:
+            try:
+                value = super().construct_yaml_float(node)
+            except (ValueError, IndexError):
+                # float() of a word, or PyYAML on an empty !!float.
+                raise _unreadable(node, f"{_shown(node.value)!r} is not a float") from None
+            except OverflowError:
+                # Sexagesimal of YAML 1.1 past the floats: 60 ** n as an int.
+                value = math.inf
+            if not math.isfinite(value):
+                raise _unreadable(node, NOT_JSON_MESSAGE.format(_shown(node.value)))
+            return value
+
+    Loader.add_constructor("tag:yaml.org,2002:bool", Loader.construct_yaml_bool)
+    Loader.add_constructor("tag:yaml.org,2002:int", Loader.construct_yaml_int)
+    Loader.add_constructor("tag:yaml.org,2002:float", Loader.construct_yaml_float)
+    dropped = (
+        "tag:yaml.org,2002:bool",
+        "tag:yaml.org,2002:int",
+        "tag:yaml.org,2002:timestamp",
+    )
     Loader.yaml_implicit_resolvers = {
-        first: [(tag, rx) for tag, rx in resolvers if tag != "tag:yaml.org,2002:bool"]
+        first: [(tag, rx) for tag, rx in resolvers if tag not in dropped]
         for first, resolvers in yaml.SafeLoader.yaml_implicit_resolvers.items()
     }
     Loader.add_implicit_resolver(
-        "tag:yaml.org,2002:bool",
-        re.compile(r"^(?:true|True|TRUE|false|False|FALSE)$"),
-        list("tTfF"),
+        "tag:yaml.org,2002:bool", re.compile(f"^(?:{'|'.join(_BOOLS)})$"), list("tTfF")
     )
+    Loader.add_implicit_resolver("tag:yaml.org,2002:int", _INT, list("-+0123456789"))
     return Loader
 
 
@@ -106,46 +204,265 @@ class SourceError(ValueError):
         self.line = line
 
 
-def _lines(node: yaml.Node, path: str, out: dict[str, int]) -> None:
-    out.setdefault(path, node.start_mark.line + 1)
-    if isinstance(node, yaml.MappingNode):
-        for key, value in node.value:
-            name = pointer(str(key.value)) if isinstance(key, yaml.ScalarNode) else "/?"
-            out.setdefault(path + name, key.start_mark.line + 1)
-            _lines(value, path + name, out)
-    elif isinstance(node, yaml.SequenceNode):
-        for index, item in enumerate(node.value):
-            _lines(item, f"{path}/{index}", out)
+# Nodes a document may hold with every alias expanded: far above a package file,
+# far below what an alias bomb (ten aliases of the level below, level on level)
+# makes of a few hundred bytes.
+MAX_NODES = 100_000
+# Characters of the pointers of those nodes: a long key over many nodes (or
+# repeated by an alias) would make gigabytes of pointers from a small file.
+MAX_POINTER_CHARS = 20_000_000
+# Characters of the scalars of a document with its aliases expanded, as JSON
+# (the canonical hash, the stored spec) will write them: a long string an alias
+# repeats is the bomb nodes do not count. A file (at most a million characters
+# by the API) holds fewer without aliases, so only an expansion reaches it.
+MAX_SCALAR_CHARS = 4_000_000
+# What all the files of one package may hold together, a file each time a
+# ``$ref`` brings it: a bomb spread over many files, each under the limits of a
+# file. The largest package of the superproject holds 13.8 thousand
+# nodes and 103 thousand characters of strings.
+MAX_PACKAGE_NODES = 200_000
+MAX_PACKAGE_POINTER_CHARS = 20_000_000
+MAX_PACKAGE_SCALAR_CHARS = 4_000_000
+# Characters of the files read: parsing costs by the text, comments and blanks
+# included, and a file a ``$ref`` names is read once per process naming it.
+MAX_PACKAGE_SOURCE_CHARS = 4_000_000
+# Nesting of a document; deeper, the parser runs out of stack.
+MAX_DEPTH = 100
+_SURROGATE = re.compile("[\ud800-\udfff]")
+SURROGATE_MESSAGE = "a string holds a lone surrogate (\\ud800-\\udfff): not Unicode text"
+TOO_DEEP_MESSAGE = f"the document is nested deeper than {MAX_DEPTH} levels"
+TOO_LARGE_MESSAGE = (
+    f"the document has more than {MAX_NODES} nodes (or {MAX_POINTER_CHARS} characters"
+    " of their pointers) with its aliases expanded"
+)
+TOO_LONG_MESSAGE = (
+    f"the strings of the document have more than {MAX_SCALAR_CHARS} characters"
+    " with its aliases expanded"
+)
+PACKAGE_TOO_LARGE_MESSAGE = (
+    f"the files of the package have more than {MAX_PACKAGE_NODES} nodes,"
+    f" {MAX_PACKAGE_POINTER_CHARS} characters of their pointers,"
+    f" {MAX_PACKAGE_SCALAR_CHARS} characters of strings or {MAX_PACKAGE_SOURCE_CHARS}"
+    " characters of text, aliases expanded and a file counted each time a $ref names it:"
+    " the package is refused from this file on"
+)
+NOT_JSON_MESSAGE = "a value is {!r}: the package holds JSON values only"
+UNREADABLE_MESSAGE = "a scalar is not a value of its type"
+# Tags that make a JSON value; ``!!binary``, ``!!timestamp``, ``!!set``,
+# ``!!omap`` and the like make what JSON cannot write.
+JSON_TAGS = frozenset(
+    f"tag:yaml.org,2002:{name}"
+    for name in ("null", "bool", "int", "float", "str", "seq", "map", "merge")
+)
 
 
-def load_yaml(text: str) -> tuple[Any, dict[str, int]]:
-    """The document and its lines by JSON pointer; an empty file is ``None``."""
-    loader = yaml12_loader()(text)
+@dataclass
+class Budget:
+    """What one :func:`parse_package` has left to spend over its files, ``$ref`` included."""
+
+    nodes: int = MAX_PACKAGE_NODES
+    pointer_chars: int = MAX_PACKAGE_POINTER_CHARS
+    scalar_chars: int = MAX_PACKAGE_SCALAR_CHARS
+    source_chars: int = MAX_PACKAGE_SOURCE_CHARS
+
+    def read(self, text: str) -> None:
+        """Charge a file before it is parsed: its text is the cost of the parser."""
+        self.source_chars -= len(text)
+        if self.source_chars < 0:
+            raise SourceError(PACKAGE_TOO_LARGE_MESSAGE, None)
+
+
+def _within(spent: int, limit: int, left: int, message: str, line: int | None) -> None:
+    """``spent`` of a file against the limit of a file and what the package has left."""
+    if spent > limit:
+        raise SourceError(message, line)
+    if spent > left:
+        raise SourceError(PACKAGE_TOO_LARGE_MESSAGE, line)
+
+
+def _lines(root: yaml.Node, out: dict[str, int], budget: Budget) -> None:
+    """Lines by pointer, walking aliases as the document will read them.
+
+    Every node counts each time an alias brings it back, so an alias bomb or a
+    node that holds itself stops at :data:`MAX_NODES` (or at the limit of
+    pointers, of expanded strings or of depth), and what the file spent,
+    refused or not, is taken from ``budget``. A scalar with a lone surrogate
+    (``"\\ud800"``) or a tag that makes no JSON value (``!!binary``) is
+    refused; each node is searched once, however many aliases bring it back.
+    A float JSON has not (``.nan``) is refused as the document is built.
+    """
+    stack: list[tuple[yaml.Node, str, int]] = [(root, "", 0)]
+    nodes = chars = scalar_chars = 0
+    searched: set[int] = set()
+
+    def child(node: yaml.Node, path: str, name: str, depth: int) -> None:
+        # Charged before the pointer is made: a long one times many is the cost.
+        nonlocal chars
+        chars += len(path) + len(name)
+        line = node.start_mark.line + 1
+        _within(chars, MAX_POINTER_CHARS, budget.pointer_chars, TOO_LARGE_MESSAGE, line)
+        stack.append((node, path + name, depth))
+
     try:
+        while stack:
+            node, path, depth = stack.pop()
+            line = node.start_mark.line + 1
+            nodes += 1
+            _within(nodes, MAX_NODES, budget.nodes, TOO_LARGE_MESSAGE, line)
+            if depth > MAX_DEPTH:
+                raise SourceError(TOO_DEEP_MESSAGE, line)
+            out.setdefault(path, line)
+            if id(node) not in searched:
+                searched.add(id(node))
+                _json_node(node, line)
+            if isinstance(node, yaml.ScalarNode):
+                scalar_chars += len(node.value)
+                _within(scalar_chars, MAX_SCALAR_CHARS, budget.scalar_chars, TOO_LONG_MESSAGE, line)
+            elif isinstance(node, yaml.MappingNode):
+                for key, value in reversed(node.value):
+                    name = pointer(str(key.value)) if isinstance(key, yaml.ScalarNode) else "/?"
+                    child(value, path, name, depth + 1)
+                    child(key, path, name, depth + 1)
+            elif isinstance(node, yaml.SequenceNode):
+                for index in reversed(range(len(node.value))):
+                    child(node.value[index], path, f"/{index}", depth + 1)
+    finally:
+        budget.nodes -= nodes
+        budget.pointer_chars -= chars
+        budget.scalar_chars -= scalar_chars
+
+
+def _json_node(node: yaml.Node, line: int) -> None:
+    """Refuse a node that makes no JSON value, or a string JSON and the database refuse."""
+    if node.tag not in JSON_TAGS:
+        raise SourceError(NOT_JSON_MESSAGE.format(node.tag), line)
+    if not isinstance(node, yaml.ScalarNode):
+        return
+    if _SURROGATE.search(node.value):
+        raise SourceError(SURROGATE_MESSAGE, line)
+
+
+def load_yaml(text: str, budget: Budget | None = None) -> tuple[Any, dict[str, int]]:
+    """The document and its lines by JSON pointer; an empty file is ``None``.
+
+    Refused as not YAML: more than :data:`MAX_NODES` nodes or
+    :data:`MAX_SCALAR_CHARS` characters of strings with aliases expanded (or
+    more than ``budget``, the package, has left), nesting deeper than
+    :data:`MAX_DEPTH`, a string with a lone surrogate, a value JSON has not
+    (``!!binary``, ``.nan``, ``1e999``), an integer longer than
+    :data:`MAX_INT_DIGITS` digits, a scalar its tag cannot read (``!!int x``),
+    a character YAML does not allow (``\\x00``).
+    """
+    budget = budget if budget is not None else Budget()
+    budget.read(text)
+    loader: yaml.SafeLoader | None = None
+    try:
+        # The reader checks the characters of the text as it is made.
+        loader = yaml12_loader()(text)
         node = loader.get_single_node()
         if node is None:
             return None, {}
         lines: dict[str, int] = {}
-        _lines(node, "", lines)
+        _lines(node, lines, budget)
         return loader.construct_document(node), lines
     except yaml.MarkedYAMLError as exc:
         mark = exc.problem_mark or exc.context_mark
         message = " ".join(str(part) for part in (exc.context, exc.problem) if part)
         raise SourceError(message or "not YAML", mark.line + 1 if mark else None) from None
+    except yaml.reader.ReaderError as exc:
+        message = f"unacceptable character #x{exc.character:04x}: {exc.reason}"
+        raise SourceError(message, text.count("\n", 0, exc.position) + 1) from None
     except yaml.YAMLError as exc:
         raise SourceError(str(exc), None) from None
+    except RecursionError:
+        # The composer recurses per level: a document nested past the stack.
+        raise SourceError(TOO_DEEP_MESSAGE, None) from None
+    except SourceError:
+        raise
+    except ValueError:
+        # A constructor of PyYAML the loader does not replace, reading a scalar.
+        raise SourceError(UNREADABLE_MESSAGE, None) from None
     finally:
-        loader.dispose()
+        if loader is not None:
+            loader.dispose()
 
 
-def load_file(path: str, text: str) -> tuple[Any, dict[str, int]]:
-    """A YAML or JSON file of the package (JSON is YAML, but its errors read better)."""
-    if path.endswith(".json"):
-        try:
-            return json.loads(text), {}
-        except json.JSONDecodeError as exc:
-            raise SourceError(exc.msg, exc.lineno) from None
-    return load_yaml(text)
+def _json_spend(document: Any, budget: Budget) -> None:
+    """The nesting, nodes and strings of a JSON document, held as :func:`_lines` holds YAML.
+
+    Its root is level 0; keys and strings count as strings; what it spent,
+    refused or not, is taken from ``budget``.
+    """
+    nodes = scalar_chars = 0
+    stack: list[tuple[Any, int]] = [(document, 0)]
+    try:
+        while stack:
+            value, depth = stack.pop()
+            nodes += 1
+            _within(nodes, MAX_NODES, budget.nodes, TOO_LARGE_MESSAGE, None)
+            if depth > MAX_DEPTH:
+                raise SourceError(TOO_DEEP_MESSAGE, None)
+            if isinstance(value, dict):
+                scalar_chars += sum(len(key) for key in value)
+                stack.extend((item, depth + 1) for item in value.values())
+            elif isinstance(value, list):
+                stack.extend((item, depth + 1) for item in value)
+            elif isinstance(value, str):
+                scalar_chars += len(value)
+            _within(scalar_chars, MAX_SCALAR_CHARS, budget.scalar_chars, TOO_LONG_MESSAGE, None)
+    finally:
+        budget.nodes -= nodes
+        budget.scalar_chars -= scalar_chars
+
+
+def _not_finite(constant: str) -> Any:
+    raise SourceError(NOT_JSON_MESSAGE.format(constant), None)
+
+
+def _json_int(text: str) -> int:
+    try:
+        return _parse_int(text)
+    except ValueError as exc:
+        raise SourceError(str(exc), None) from None
+
+
+def _json_float(text: str) -> float:
+    value = float(text)
+    if not math.isfinite(value):
+        raise SourceError(NOT_JSON_MESSAGE.format(_shown(text)), None)
+    return value
+
+
+def load_file(path: str, text: str, budget: Budget | None = None) -> tuple[Any, dict[str, int]]:
+    """A YAML or JSON file of the package (JSON is YAML, but its errors read better).
+
+    JSON has no aliases: its size is that of the file; its nesting, nodes and
+    strings are held to what :func:`load_yaml` holds a YAML file to, and
+    ``NaN``/``Infinity`` and ``1e999`` (which Python reads, JSON has not) are
+    refused, as is an integer longer than :data:`MAX_INT_DIGITS` digits.
+    """
+    if not path.endswith(".json"):
+        return load_yaml(text, budget)
+    budget = budget if budget is not None else Budget()
+    budget.read(text)
+    try:
+        document = json.loads(
+            text, parse_constant=_not_finite, parse_int=_json_int, parse_float=_json_float
+        )
+    except SourceError:
+        raise
+    except json.JSONDecodeError as exc:
+        raise SourceError(exc.msg, exc.lineno) from None
+    except RecursionError:
+        raise SourceError(TOO_DEEP_MESSAGE, None) from None
+    except ValueError:
+        raise SourceError(UNREADABLE_MESSAGE, None) from None
+    _json_spend(document, budget)
+    try:
+        json.dumps(document, ensure_ascii=False).encode("utf-8")
+    except UnicodeEncodeError:
+        raise SourceError(SURROGATE_MESSAGE, None) from None
+    return document, {}
 
 
 def locator(lines: Mapping[str, int]) -> Locate:
@@ -193,8 +510,19 @@ class PackageTestFile:
         return str(self.data.get("name") or self.file)
 
     @property
+    def subject(self) -> str:
+        """``process`` (the default), ``rule`` or ``taskType``."""
+        return str(self.data.get("subject") or SUBJECT_PROCESS)
+
+    @property
+    def object(self) -> str:
+        """The key of the process, rule or task type under test."""
+        return str(self.data.get(SUBJECTS[self.subject][0]) or "")
+
+    @property
     def process(self) -> str:
-        return str(self.data.get("process") or "")
+        """The key of the process under test; empty for a rule or task type test."""
+        return self.object if self.subject == SUBJECT_PROCESS else ""
 
     def locate(self, path: str) -> int | None:
         return self.lines.get(path)
@@ -256,11 +584,12 @@ def parse_package(files: Iterable[tuple[str, str]]) -> ParsedPackage:
     contents = dict(files)
     package = ParsedPackage()
     seen: dict[str, str] = {}
+    budget = Budget()
     for path in sorted(contents):
         if not (path == MANIFEST or _is_object(path) or _is_test(path)):
             continue
         try:
-            document, lines = load_yaml(contents[path])
+            document, lines = load_yaml(contents[path], budget)
         except SourceError as exc:
             package.problems.append(_error("invalid_yaml", "", exc.message, path, exc.line))
             continue
@@ -286,7 +615,7 @@ def parse_package(files: Iterable[tuple[str, str]]) -> ParsedPackage:
                 package.manifest_object = obj
             continue
         if obj.kind == "Process":
-            obj = _inline_data(package, obj, contents)
+            obj = _inline_data(package, obj, contents, budget)
         if obj.ref in seen:
             package.problems.append(
                 _error(
@@ -300,25 +629,53 @@ def parse_package(files: Iterable[tuple[str, str]]) -> ParsedPackage:
             continue
         seen[obj.ref] = path
         package.objects.append(obj)
-    processes = {obj.key for obj in package.of_kind("Process")}
     for test in package.tests:
-        if test.process not in processes:
+        field_name, kind = SUBJECTS[test.subject]
+        known = {obj.key for obj in package.of_kind(kind)}
+        if test.object not in known:
+            code, noun, plural = _UNKNOWN_TEST_OBJECT[test.subject]
             package.problems.append(
                 _error(
-                    "unknown_test_process",
-                    "/process",
-                    f"the package has no process {test.process!r}",
+                    code,
+                    f"/{field_name}",
+                    f"the package has no {noun} {test.object!r}",
                     test.file,
-                    test.locate("/process"),
-                    hint=_known(processes),
+                    test.locate(f"/{field_name}"),
+                    hint=_known(plural, known),
                 )
             )
+        if test.subject != SUBJECT_PROCESS:
+            package.problems.extend(_ignored_fields(test))
     return package
 
 
-def _known(names: Iterable[str]) -> str | None:
+def _known(plural: str, names: Iterable[str]) -> str | None:
     listed = sorted(names)
-    return f"processes of the package: {', '.join(listed)}" if listed else None
+    return f"{plural} of the package: {', '.join(listed)}" if listed else None
+
+
+def _ignored_fields(test: PackageTestFile) -> list[Problem]:
+    """``test_field_ignored``: a field of schema v1 a rule or task type test does not run."""
+    problems = []
+    for parts in PROCESS_ONLY_FIELDS:
+        node: Any = test.data
+        for part in parts:
+            node = node.get(part) if isinstance(node, dict) else None
+        if node is None:
+            continue
+        where = pointer(*parts)
+        problems.append(
+            Problem(
+                "test_field_ignored",
+                "warning",
+                where,
+                f"{'.'.join(parts)} is not run in a test of subject {test.subject}",
+                hint="the field takes effect only for subject: process",
+                file=test.file,
+                line=test.locate(where),
+            )
+        )
+    return problems
 
 
 def _envelope(
@@ -362,7 +719,7 @@ def _envelope(
 
 
 def _inline_data(
-    package: ParsedPackage, obj: PackageObject, contents: Mapping[str, str]
+    package: ParsedPackage, obj: PackageObject, contents: Mapping[str, str], budget: Budget
 ) -> PackageObject:
     data = obj.spec.get("data")
     if not (isinstance(data, dict) and set(data) == {"$ref"} and isinstance(data["$ref"], str)):
@@ -391,7 +748,7 @@ def _inline_data(
     if target not in contents:
         return refuse(f"$ref {ref!r}: the package has no file {target}")
     try:
-        schema, _ = load_file(target, contents[target])
+        schema, _ = load_file(target, contents[target], budget)
     except SourceError as exc:
         return refuse(f"$ref {ref!r}: {target} is not YAML or JSON: {exc.message}")
     if not isinstance(schema, dict):

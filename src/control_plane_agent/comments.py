@@ -11,8 +11,9 @@ the feedback, the same section for every adapter.
 What is left out:
 
 * this executor's own "stopped without doing the work" comments
-  (``main.py``, ``_settle_blocked``): the author is this principal and the
-  text starts with :data:`BLOCKED_COMMENT_PREFIX`;
+  (``blocked.py``, ``settle_blocked``): the author is this principal and the
+  text starts with one of :data:`BLOCKED_COMMENT_PREFIXES` — the current one
+  or the one written before universal-runner;
 * core's "Verification attempt #N failed ..." comments: the attempt itself is
   already in the feedback section. They are told apart by the stable prefix
   of core's text written by a ``service`` author.
@@ -36,7 +37,7 @@ import logging
 from datetime import UTC, datetime
 from typing import Any
 
-from control_plane_agent.blocked import BLOCKED_COMMENT_PREFIX
+from control_plane_agent.blocked import BLOCKED_COMMENT_PREFIXES
 from control_plane_client import ControlPlaneClient, ControlPlaneError
 
 logger = logging.getLogger("control_plane_agent.comments")
@@ -137,7 +138,7 @@ async def read_task_comments(
         body = str(comment.get("body") or "")
         author_id = str(comment.get("authorPrincipalId") or "")
         own = bool(own_principal) and author_id == own_principal
-        if own and body.startswith(BLOCKED_COMMENT_PREFIX):
+        if own and body.startswith(BLOCKED_COMMENT_PREFIXES):
             continue
         author = _author(comment)
         if (

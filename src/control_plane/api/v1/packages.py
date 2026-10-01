@@ -29,6 +29,7 @@ from control_plane.api.v1.schemas import (
     ERROR_RESPONSES,
     AgentPublishRequest,
     ApiModel,
+    ArtifactTypeCreateRequest,
     PackageApplyOut,
     PackageApplyRequest,
     PackagePlanOut,
@@ -37,7 +38,9 @@ from control_plane.api.v1.schemas import (
     PackageRecordRequest,
     PackageTestOut,
     PackageTestRequest,
+    RoleCreateRequest,
     RuleCreateRequest,
+    SkillRegisterRequest,
     TaskTypeCreateRequest,
     work_document,
 )
@@ -46,6 +49,7 @@ from control_plane.application.authorization import authorize
 from control_plane.application.commands import package_links, package_plan
 from control_plane.application.commands.package_catalog import SpecShape
 from control_plane.application.commands.package_test import run_package_tests
+from control_plane.application.commands.package_trials import SupportingShape
 from control_plane.domain.calendar import Calendar, CalendarError
 from control_plane.domain.enums import Permission
 from control_plane.domain.errors import ValidationError
@@ -127,6 +131,35 @@ def rule_spec(obj: PackageObject) -> tuple[dict[str, Any] | None, list[Problem]]
     return sent, []
 
 
+def _arguments(
+    model: type[ApiModel], identity: str, obj: PackageObject, code: str
+) -> tuple[dict[str, Any] | None, list[Problem]]:
+    """A supporting object as the keyword arguments of its command, or its findings."""
+    payload, problems = _shaped(model, {identity: obj.key, **obj.spec}, code, "/spec")
+    if payload is None:
+        return None, problems
+    return payload.model_dump(), []
+
+
+def artifact_type_arguments(obj: PackageObject) -> tuple[dict[str, Any] | None, list[Problem]]:
+    """``mediaTypes`` is optional in the catalog schema: omitted, any (as package-sdk has it)."""
+    spec = obj.spec if "mediaTypes" in obj.spec else {**obj.spec, "mediaTypes": ["*/*"]}
+    return _arguments(
+        ArtifactTypeCreateRequest,
+        "key",
+        PackageObject(obj.kind, obj.key, spec, obj.file, obj.lines),
+        "invalid_artifact_type",
+    )
+
+
+def role_arguments(obj: PackageObject) -> tuple[dict[str, Any] | None, list[Problem]]:
+    return _arguments(RoleCreateRequest, "slug", obj, "invalid_role")
+
+
+def skill_arguments(obj: PackageObject) -> tuple[dict[str, Any] | None, list[Problem]]:
+    return _arguments(SkillRegisterRequest, "name", obj, "invalid_skill")
+
+
 def check_calendar(obj: PackageObject) -> tuple[Calendar | None, list[Problem]]:
     """A package object of kind Calendar: its shape (``CalendarSpec``), then the calendar itself."""
     spec, problems = calendar_spec(obj)
@@ -139,13 +172,21 @@ SHAPES: dict[str, SpecShape] = {
     "Agent": agent_spec,
     "WorkRule": rule_spec,
 }
+# What a test of a rule or a task type publishes first, when the tenant lacks it
+# (CP-ADR-0074 Z2): the arguments of the command of each kind.
+SUPPORTING: dict[str, SupportingShape] = {
+    "ArtifactType": artifact_type_arguments,
+    "Role": role_arguments,
+    "Skill": skill_arguments,
+}
 
 
 @router.post(
     "/packages:test",
     response_model=PackageTestOut,
     responses=RESPONSES,
-    summary="Check a package and run its tests in a sandbox; nothing is written",
+    summary="Check a package and run the tests of its processes, rules and task types;"
+    " nothing is written",
 )
 async def package_tests(
     payload: PackageTestRequest,
@@ -168,6 +209,8 @@ async def package_tests(
         workspace_id=payload.workspace_id,
         check_only=check_only,
         check_calendar=check_calendar,
+        shapes=SHAPES,
+        supporting=SUPPORTING,
     )
     body = PackageTestOut.model_validate(report.out()).model_dump(mode="json", by_alias=True)
     return JSONResponse(body)
@@ -197,6 +240,7 @@ async def plan_package(
         replay_limit=payload.replay_limit,
         overwrite=payload.overwrite_console,
         shapes=SHAPES,
+        supporting=SUPPORTING,
     )
     body = PackagePlanOut.model_validate(plan.out()).model_dump(mode="json", by_alias=True)
     return JSONResponse(body)

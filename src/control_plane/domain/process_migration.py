@@ -19,10 +19,17 @@ element id → new element id; an id the map does not name keeps its id.
   or an expression the new version does not have — is a
   :class:`MigrationError` naming the elements.
 
-The engine never sees a migration: the migrated state is a state of the new
-version as if the instance had run on it, so the next input is an ordinary
-step. The instance's journal records the migration with the migrated state
-whole, and a replay starts from it (:mod:`control_plane.domain.process_replay`).
+The engine never sees the move itself: the migrated state is a state of the
+new version as if the instance had run on it. The instance's journal records
+the migration with the migrated state whole (:func:`migration_record`), and a
+replay starts from it (:mod:`control_plane.domain.process_replay`). The
+record carries the engine revision of the target version: from it on the
+instance runs under that revision (CP-ADR-0074, amendment 2026-09-29). Under
+a revision with SLA deadlines the next input is the engine's own
+``migrated`` (:data:`RECOUNT_INPUT`): the deadlines, escalations and ``onDue``
+of the open steps and of the process are counted again by the new version;
+until then their timers keep the old moments, so :func:`migrate_state` does
+not refuse an expression of a due the new version dropped.
 
 Pure functions over plain values; no I/O.
 """
@@ -32,10 +39,13 @@ from collections.abc import Callable, Iterable, Mapping
 from typing import Any
 
 from control_plane.domain.process_definition import element_kinds, pointer, step_kind
-from control_plane.domain.process_engine import Definition
+from control_plane.domain.process_engine import SLA_REVISION, Definition
+from control_plane.domain.process_sla import PROCESS, SLA_TIMERS
 
 # The kind of the journal entry of a migration; its body holds the migrated state.
 MIGRATION_INPUT = "migrate"
+# The engine input right after it that recounts the deadlines by the new version.
+RECOUNT_INPUT = "migrated"
 PIN = "pin"
 MIGRATE = "migrate"
 POLICIES = (PIN, MIGRATE)
@@ -44,6 +54,14 @@ _RETROSPECTIVE = "retrospective"
 # Block names are "<prefix>:<element id>[/<rest>]" (process_engine.Definition).
 _ELEMENT_BLOCKS = ("stage", "step", "branch", "timer")
 _FRESH_STAGE = {"state": "available", "enteredAt": None, "runs": 0, "closedSeq": None}
+# Timers the engine counts again by the new version after a migration (input
+# ``migrated``, CP-ADR-0074 §11 amendment): deadlines, escalations, ``onDue``.
+_RECOUNTED = (*SLA_TIMERS, "escalation", "due")
+
+
+def _of_process(timer: Mapping[str, Any]) -> bool:
+    """A deadline timer of the process itself: its element names no element of the version."""
+    return timer.get("sla") == PROCESS
 
 
 class MigrationError(ValueError):
@@ -140,7 +158,7 @@ def standing(definition: Definition, state: Mapping[str, Any]) -> set[str]:
                 found.update(str(s) for s in frame.get("steps") or ())
     for timer in (state.get("timers") or {}).values():
         if timer.get("state") in ("pending", "frozen"):
-            if timer.get("element"):
+            if timer.get("element") and not _of_process(timer):
                 found.add(str(timer["element"]))
             scope = _scope_element(timer.get("scope"))
             if scope:
@@ -204,13 +222,19 @@ class _Carrier:
                 return target + path[len(prefix) :]
         return path
 
-    def recipe(self, recipe: Any, element: str) -> Any:
+    def recipe(self, recipe: Any, element: str, *, recounted: bool = False) -> Any:
+        """A timer's recipe with its pointers moved.
+
+        A ``recounted`` timer is counted again by the new version right after
+        the migration: an expression the new version dropped with its due is
+        no reason to refuse it.
+        """
         if not isinstance(recipe, dict):
             return recipe
         out = dict(recipe)
         if isinstance(out.get("path"), str):
             out["path"] = self.repoint(out["path"])
-            if out.get("kind") == "at" and out["path"] not in self.new.programs:
+            if out.get("kind") == "at" and out["path"] not in self.new.programs and not recounted:
                 raise MigrationError(
                     "expression_gone",
                     f"version {self.new.version} has no expression at {out['path']}"
@@ -219,7 +243,7 @@ class _Carrier:
                 )
         for name in ("due", "after"):
             if isinstance(out.get(name), dict):
-                out[name] = self.recipe(out[name], element)
+                out[name] = self.recipe(out[name], element, recounted=recounted)
         return out
 
     def frame(self, frame: dict[str, Any]) -> None:
@@ -283,6 +307,7 @@ def migrate_state(
             missing,
         )
     carrier = _Carrier(old, new, rename)
+    recounted = recounts(new)
     out = copy.deepcopy(dict(state))
 
     stages = {rename(sid): record for sid, record in (state.get("stages") or {}).items()}
@@ -304,8 +329,12 @@ def migrate_state(
     for timer in out.get("timers", {}).values():
         element = str(timer.get("element") or "")
         if timer.get("state") in ("pending", "frozen"):
-            timer["recipe"] = carrier.recipe(timer.get("recipe"), element)
-        if element:
+            timer["recipe"] = carrier.recipe(
+                timer.get("recipe"),
+                element,
+                recounted=recounted and timer.get("kind") in _RECOUNTED,
+            )
+        if element and not _of_process(timer):
             timer["element"] = rename(element)
         timer["scope"] = carrier.scope(timer.get("scope"))
     for done in out.get("done") or ():
@@ -317,6 +346,42 @@ def migrate_state(
     out["version"] = new.version
     out["definitionKey"] = new.key
     return out
+
+
+def migration_record(
+    *,
+    from_key: str,
+    from_version: int,
+    target: Definition,
+    mapping: Mapping[str, str],
+    plan_hash: str,
+    state: Mapping[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """The input body and the ``migrated`` decision of the journal entry of a migration.
+
+    ``state`` is the migrated state (:func:`migrate_state`) with its ``seq``;
+    both carry the version and the engine revision the instance moves to.
+    """
+    moved = {
+        "fromKey": from_key,
+        "fromVersion": from_version,
+        "toVersion": target.version,
+        "engineRevision": target.engine_revision,
+        "policy": MIGRATE,
+        "map": dict(mapping),
+    }
+    body = {**moved, "planHash": plan_hash, "state": dict(state)}
+    return body, {"kind": "migrated", "element": None, **moved}
+
+
+def recounts(target: Definition) -> bool:
+    """Whether a migration to ``target`` is followed by the input ``migrated``."""
+    return target.engine_revision >= SLA_REVISION
+
+
+def recount_body(*, from_version: int, target: Definition) -> dict[str, Any]:
+    """The body of the input ``migrated``: which move it follows, for the journal's reader."""
+    return {"fromVersion": from_version, "toVersion": target.version}
 
 
 def migration_for(spec: Mapping[str, Any], version: int) -> tuple[int, Mapping[str, Any]] | None:

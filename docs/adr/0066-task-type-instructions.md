@@ -148,3 +148,20 @@ ADR-0059/ADR-0064 (пакет контекста — данные, а не ин�
   ли MCP, где работать, что записывается). Файлы соглашений:
   `CONTROL_PLANE_CLAUDE_PROMPT_FILE`, `CONTROL_PLANE_CODEX_PROMPT_FILE`,
   `CONTROL_PLANE_OPENCODE_PROMPT_FILE`.
+
+## Поправка 2026-09-30: четвёртый слой — «Agent conventions» (universal-runner U009)
+
+Основание — TAI-ADR-0063 суперпроекта, п. 4; фича `universal-runner`, FR-008.
+
+- Четвёртый слой п. 3 называется «Agent conventions» (заголовок
+  `### Agent conventions`, `CONVENTIONS_TITLE` в `instructions.py`) во всех трёх
+  адаптерах. Это общие инструкции описания агента — `executor.instructions`
+  ревизии (CP-ADR-0073) или файл `CONTROL_PLANE_{CLAUDE,CODEX,OPENCODE}_PROMPT_FILE`:
+  как работает этот агент в любом репозитории.
+- Соглашения репозитория в этот слой не входят: репозиторий каталога несёт их
+  сам — прозой в `AGENTS.md` (`CLAUDE.md` = `@AGENTS.md`) и машиночитаемо в
+  `.agents/runner.yaml`, — и исполнитель читает прозу сам. Отдельного слоя
+  «Репозиторий» в prompt нет. Прежнее название («Repository conventions») смешивало
+  одно с другим.
+- Порядок слоёв, рендер и хэш не меняются: четвёртый слой, как и раньше, в хэш
+  не входит и ядру не виден.

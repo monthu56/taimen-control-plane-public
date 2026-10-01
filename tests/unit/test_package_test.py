@@ -9,6 +9,8 @@ import ast
 import copy
 import dataclasses
 import json
+import re
+import time
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -18,10 +20,20 @@ import yaml
 from control_plane.application.commands.package_test import sql_writes
 from control_plane.application.commands.process_instances import remembered
 from control_plane.application.context.graph import entity_key
+from control_plane.domain import package_source
 from control_plane.domain import process_definition as pd
 from control_plane.domain import process_sandbox as sb
 from control_plane.domain.package_source import (
+    MAX_DEPTH,
+    MAX_INT_DIGITS,
+    MAX_NODES,
+    MAX_PACKAGE_NODES,
+    MAX_PACKAGE_SOURCE_CHARS,
+    MAX_SCALAR_CHARS,
     TEST_SCHEMA_FILE,
+    Budget,
+    SourceError,
+    load_file,
     load_yaml,
     parse_package,
     select_tests,
@@ -78,6 +90,420 @@ def test_yaml_is_read_as_yaml_1_2_with_lines_by_pointer() -> None:
     assert lines["/a/on/observation"] == 2 and lines["/a/list/0"] == 5
 
 
+def _alias_bomb(depth: int, fan: int = 10) -> str:
+    """Each level lists the one below ``fan`` times: fan**depth scalars from a few hundred bytes."""
+    rows = [f"a0: &a0 [{', '.join(['x'] * fan)}]"]
+    for level in range(1, depth + 1):
+        below = ", ".join([f"*a{level - 1}"] * fan)
+        rows.append(f"a{level}: &a{level} [{below}]")
+    return "\n".join(rows) + "\n"
+
+
+def _refused(text: str) -> SourceError:
+    try:
+        load_yaml(text)
+    except SourceError as exc:
+        return exc
+    raise AssertionError("the document was read")
+
+
+def test_an_alias_bomb_is_refused_fast_as_not_yaml() -> None:
+    for depth in (6, 8, 12):
+        text = _alias_bomb(depth)
+        assert len(text) < 1024
+        started = time.monotonic()
+        error = _refused(text)
+        assert time.monotonic() - started < 1
+        assert f"more than {MAX_NODES} nodes" in error.message
+    # A node holding itself is an endless nesting, not a RecursionError.
+    assert "nested deeper" in _refused("a: &a [*a]\n").message
+    package = parse_package([("roles/bomb.yaml", _alias_bomb(8))])
+    [problem] = package.problems
+    assert (problem.code, problem.file) == ("invalid_yaml", "roles/bomb.yaml")
+
+
+def test_a_long_key_over_many_nodes_is_refused_before_its_pointers_are_made() -> None:
+    # 50k items under a key of 500k characters: 25 billion characters of pointers.
+    text = "? " + "k" * 500_000 + "\n: [" + "1, " * 50_000 + "1]\n"
+    started = time.monotonic()
+    error = _refused(text)
+    assert time.monotonic() - started < 5
+    assert (error.line, "characters of their pointers" in error.message) == (2, True)
+
+
+def test_a_long_string_repeated_by_aliases_is_refused_fast() -> None:
+    # 2000 characters, 300 aliases to them, 290 aliases to those: 87,000
+    # nodes (under the node limit) and 174 million characters from 4 KB.
+    text = (
+        f"s: &s {'x' * 2000}\nl: &l [{', '.join(['*s'] * 300)}]\nm: [{', '.join(['*l'] * 290)}]\n"
+    )
+    assert len(text) < 5000
+    started = time.monotonic()
+    error = _refused(text)
+    assert time.monotonic() - started < 1
+    assert (error.line, f"more than {MAX_SCALAR_CHARS} characters" in error.message) == (1, True)
+    # A string of 900 KB (a file near the API limit) by an alias five times over.
+    big = "y" * 900_000
+    started = time.monotonic()
+    error = _refused(f"s: &s {big}\nl: [*s, *s, *s, *s, *s]\n")
+    assert time.monotonic() - started < 1
+    assert "characters" in error.message
+    # Three times over it stays under the limit: the aliases are read.
+    document, _ = load_yaml(f"s: &s {big}\nl: [*s, *s, *s]\n")
+    assert document["l"] == [big] * 3
+    # A file at the limit of the API without aliases is always under it.
+    document, _ = load_yaml(f"s: {'z' * 999_990}\n")
+    assert len(document["s"]) == 999_990
+
+
+def test_a_string_is_searched_for_surrogates_once_however_many_aliases(
+    monkeypatch: Any,
+) -> None:
+    searched: list[str] = []
+    pattern = package_source._SURROGATE
+
+    class Counting:
+        def search(self, value: str) -> Any:
+            searched.append(value)
+            return pattern.search(value)
+
+    monkeypatch.setattr(package_source, "_SURROGATE", Counting())
+    text = f"s: &s {'x' * 40}\nl: &l [{', '.join(['*s'] * 300)}]\nm: [{', '.join(['*l'] * 20)}]\n"
+    document, _ = load_yaml(text)
+    assert len(document["m"]) == 20
+    # The keys s, l, m and the one string: 6,000 expansions, four searches.
+    assert sorted(searched) == sorted(["s", "l", "m", "x" * 40])
+    # A surrogate behind an alias is found in the one node it is.
+    error = _refused('s: &s "a\\ud800"\nl: [*s, *s]\n')
+    assert ("lone surrogate" in error.message, error.line) == (True, 1)
+
+
+def test_a_character_yaml_does_not_allow_is_not_yaml_with_its_line() -> None:
+    for text, line in (("a: \x00", 1), ("a: 1\nb: x\x07\n", 2), ("\ufffe", 1)):
+        error = _refused(text)
+        assert ("unacceptable character" in error.message, error.line) == (True, line)
+    package = parse_package([("roles/nul.yaml", "a: \x00\n")])
+    [problem] = package.problems
+    assert (problem.code, problem.file, problem.line) == ("invalid_yaml", "roles/nul.yaml", 1)
+
+
+def test_a_json_file_nested_too_deep_is_refused_like_yaml() -> None:
+    for lists in (MAX_DEPTH + 2, 5000):
+        try:
+            load_file("schemas/data.json", "[" * lists + "]" * lists)
+        except SourceError as exc:
+            assert "nested deeper" in exc.message
+        else:
+            raise AssertionError("the file was read")
+    deepest = '{"a": ' * MAX_DEPTH + "1" + "}" * MAX_DEPTH
+    assert load_file("schemas/data.json", deepest)[0] is not None
+    assert load_file("schemas/data.json", "[" * (MAX_DEPTH + 1) + "]" * (MAX_DEPTH + 1))[0]
+
+
+def test_a_document_nested_too_deep_is_not_yaml_not_a_recursion_error() -> None:
+    # The outermost list is level 0, the innermost of n lists level n - 1.
+    for lists in (MAX_DEPTH + 2, 5000):
+        assert "nested deeper" in _refused("[" * lists + "]" * lists).message
+    document, _ = load_yaml("[" * (MAX_DEPTH + 1) + "]" * (MAX_DEPTH + 1))
+    assert document is not None
+
+
+def test_a_document_with_a_few_aliases_is_read_with_them_expanded() -> None:
+    text = "base: &base {kind: x, n: 1}\nfirst: *base\nsecond: {<<: *base, n: 2}\n"
+    document, lines = load_yaml(text)
+    assert document["first"] == {"kind": "x", "n": 1}
+    assert document["second"] == {"kind": "x", "n": 2}
+    assert lines["/first/kind"] == 1 and lines["/second"] == 3
+    # Aliases of aliases are read while their expansion stays under the limit.
+    document, _ = load_yaml(_alias_bomb(3))
+    assert len(document["a3"]) == 10 and document["a3"][0][0][0] == ["x"] * 10
+
+
+def test_a_lone_surrogate_is_refused_as_not_yaml() -> None:
+    for text in (
+        'content: "\\ud800"\n',
+        'payload: {note: "a\\udfffb"}\n',
+        'list:\n  - fine\n  - "\\ud83d"\n',
+        '"\\ud800": key\n',
+    ):
+        error = _refused(text)
+        assert "lone surrogate" in error.message
+    assert _refused('list:\n  - fine\n  - "\\ud83d"\n').line == 3
+    # Characters beyond the BMP are text: written as such or as \U escape.
+    document, _ = load_yaml('a: "\U0001f600"\nb: "\\U0001F600"\n')
+    assert document == {"a": "\U0001f600", "b": "\U0001f600"}
+    # A JSON file of the package (a schema a process refers to) likewise;
+    # a surrogate pair there is one character and stays.
+    try:
+        load_file("schemas/data.json", '{"title": "\\ud800"}')
+    except SourceError as exc:
+        assert "lone surrogate" in exc.message
+    else:
+        raise AssertionError("the file was read")
+    assert load_file("schemas/data.json", '{"t": "\\ud83d\\ude00"}')[0] == {"t": "\U0001f600"}
+    package = parse_package([("tests/bad.test.yaml", 'process: p\nname: "\\ud800"\n')])
+    [problem] = package.problems
+    assert (problem.code, problem.file, problem.line) == ("invalid_yaml", "tests/bad.test.yaml", 2)
+
+
+def test_a_bomb_spread_over_many_files_is_refused_by_the_budget_of_the_package() -> None:
+    # Nine aliases on four levels: 75 thousand nodes from 250 bytes, under the
+    # limit of a file; 300 such files hold 22 million.
+    text = _alias_bomb(4, fan=9)
+    assert len(text) < 300
+    load_yaml(text)
+    files = [(f"roles/bomb{index:03}.yaml", text) for index in range(300)]
+    started = time.monotonic()
+    package = parse_package(files)
+    assert time.monotonic() - started < 2
+    # The first two fit (and are no catalog objects); from the third on the package is spent.
+    codes = [(p.code, p.file) for p in package.problems]
+    assert codes[:2] == [
+        ("invalid_document", "roles/bomb000.yaml"),
+        ("invalid_document", "roles/bomb001.yaml"),
+    ]
+    refused = package.problems[2:]
+    assert [p.file for p in refused] == [path for path, _ in files[2:]]
+    assert {p.code for p in refused} == {"invalid_yaml"}
+    assert all(f"more than {MAX_PACKAGE_NODES} nodes" in p.message for p in refused)
+    # A file refused by the limit of a file spends the budget all the same.
+    refusing = [(f"roles/bomb{index:03}.yaml", _alias_bomb(5)) for index in range(300)]
+    started = time.monotonic()
+    package = parse_package(refusing)
+    assert time.monotonic() - started < 2
+    assert f"more than {MAX_NODES} nodes" in package.problems[0].message
+    assert f"more than {MAX_PACKAGE_NODES} nodes" in package.problems[-1].message
+    # Each package starts with a budget of its own.
+    assert parse_package(files[:2]).problems[-1].code == "invalid_document"
+
+
+def test_the_budget_counts_strings_pointers_and_text_over_files_and_refs() -> None:
+    budget = Budget()
+    load_yaml(f"s: {'x' * 1000}\nl: [1, 2]\n", budget)
+    assert budget.nodes == MAX_PACKAGE_NODES - 7
+    assert budget.source_chars == MAX_PACKAGE_SOURCE_CHARS - 1014
+    # Strings: 4.2 million characters in two files of the package, each under a file's limit.
+    budget = Budget()
+    load_yaml(f"s: &s {'y' * 900_000}\nl: [*s, *s, *s]\n", budget)
+    error = None
+    try:
+        load_yaml(f"s: &s {'y' * 200_000}\nl: [*s, *s]\n", budget)
+    except SourceError as exc:
+        error = exc
+    assert error is not None and "the files of the package" in error.message
+    # Pointers: a long key over many nodes, twice.
+    budget = Budget(pointer_chars=1_000)
+    load_yaml("? " + "k" * 100 + "\n: [1, 2, 3]\n", budget)
+    try:
+        load_yaml("? " + "k" * 100 + "\n: [1, 2, 3, 4, 5, 6, 7]\n", budget)
+    except SourceError as exc:
+        assert "the files of the package" in exc.message
+    else:
+        raise AssertionError("the document was read")
+    # Text: a schema of comments twenty processes name is read each time; once
+    # 4 million characters are read, the rest of the package is refused unread.
+    body = spec("stages: []")
+    schema = "# " + "c" * 400_000 + "\ntype: object\n"
+    files = [
+        (
+            f"processes/p{index:02}.yaml",
+            _process_file({**body, "data": {"$ref": "../schemas/s.yaml"}}, f"p{index:02}"),
+        )
+        for index in range(20)
+    ]
+    started = time.monotonic()
+    package = parse_package([*files, ("schemas/s.yaml", schema)])
+    assert time.monotonic() - started < 5
+    assert [o.key for o in package.objects] == [f"p{index:02}" for index in range(10)]
+    assert [(p.code, p.file) for p in package.problems[:2]] == [
+        ("unresolved_data_ref", "processes/p09.yaml"),
+        ("invalid_yaml", "processes/p10.yaml"),
+    ]
+    assert all("the files of the package" in p.message for p in package.problems)
+    # A JSON schema a process names spends nodes and strings as YAML does.
+    budget = Budget()
+    load_file("schemas/a.json", json.dumps({"k": ["abc"] * 10}), budget)
+    assert budget.nodes == MAX_PACKAGE_NODES - 12
+    try:
+        load_file("schemas/a.json", json.dumps(list(range(10))), Budget(nodes=5))
+    except SourceError as exc:
+        assert "the files of the package" in exc.message
+    else:
+        raise AssertionError("the file was read")
+
+
+def test_a_value_json_has_not_is_refused_and_a_date_is_a_string() -> None:
+    for text in (
+        "a: !!binary aGVsbG8=\n",
+        "a: !!timestamp 2026-09-30\n",
+        "a: !!set {x: null}\n",
+        "a: !!omap [{x: 1}]\n",
+        "a: .nan\n",
+        "a: [1, -.inf]\n",
+        "a: !!float .Inf\n",
+    ):
+        error = _refused(text)
+        assert "JSON values only" in error.message, text
+    assert _refused("a: 1\nb: !!binary aGVsbG8=\n").line == 2
+    # YAML 1.2: a date and a time are strings, as a date input of a decision table takes them.
+    document, _ = load_yaml("day: 2026-09-30\nat: 2026-09-30T10:00:00Z\nn: 1.5\ninf: .infinity\n")
+    assert document == {
+        "day": "2026-09-30",
+        "at": "2026-09-30T10:00:00Z",
+        "n": 1.5,
+        "inf": ".infinity",
+    }
+    json.dumps(document, allow_nan=False)
+    # The explicit tags of JSON values and a merge key stay.
+    document, _ = load_yaml("b: &b {x: 1}\na: !!str 1\nc: {<<: *b}\nd: !!int '2'\n")
+    assert document == {"b": {"x": 1}, "a": "1", "c": {"x": 1}, "d": 2}
+    for text in ('{"a": NaN}', "[Infinity]", '{"a": -Infinity}'):
+        try:
+            load_file("schemas/a.json", text)
+        except SourceError as exc:
+            assert "JSON values only" in exc.message
+        else:
+            raise AssertionError("the file was read")
+    package = parse_package([("tests/bin.test.yaml", "process: p\nname: !!binary aGVsbG8=\n")])
+    [problem] = package.problems
+    assert (problem.code, problem.file, problem.line) == ("invalid_yaml", "tests/bin.test.yaml", 2)
+
+
+def test_integers_are_those_of_yaml_1_2_and_sexagesimal_costs_nothing() -> None:
+    document, _ = load_yaml(
+        "a: 012\nb: 0o17\nc: 0x1F\nd: -12\ne: +3\nf: 0\n"
+        "g: 1:30\nh: 0b101\ni: 1_000\nj: -0x1F\nk: !!int 0o17\nl: !!int '-7'\n"
+    )
+    assert document == {
+        "a": 12,
+        "b": 15,
+        "c": 31,
+        "d": -12,
+        "e": 3,
+        "f": 0,
+        "g": "1:30",
+        "h": "0b101",
+        "i": "1_000",
+        "j": "-0x1F",
+        "k": 15,
+        "l": -7,
+    }
+    # A megabyte of sexagesimal: YAML 1.1 made it one int in half a minute.
+    clock = "1" + ":59" * 330_000
+    started = time.monotonic()
+    document, _ = load_yaml(f"a: {clock}\n")
+    assert time.monotonic() - started < 2
+    assert document == {"a": clock}
+
+
+def test_an_integer_past_its_digits_is_refused_before_int_pays_for_it() -> None:
+    assert MAX_INT_DIGITS == 1000
+    for fits in ("9" * 1000, "-" + "9" * 1000, "0x" + "f" * 1000, "0o" + "7" * 1000):
+        document, _ = load_yaml(f"a: {fits}\n")
+        json.dumps(document)
+    assert load_file("schemas/a.json", f"[{'9' * 1000}]")[0] == [int("9" * 1000)]
+    for text in (
+        "a: " + "9" * 1001,
+        "a: " + "9" * 5000,
+        "a: -" + "9" * 5000,
+        "a: 0x" + "f" * 5000,
+        "a: 0o" + "7" * 1001,
+        "a: !!int " + "1" * 5000,
+    ):
+        started = time.monotonic()
+        error = _refused("x: 1\n" + text + "\n")
+        assert time.monotonic() - started < 1
+        assert (error.message, error.line) == ("an integer has more than 1000 digits", 2)
+    for text in ("[" + "9" * 5000 + "]", '{"a": -' + "9" * 1001 + "}"):
+        try:
+            load_file("schemas/a.json", text)
+        except SourceError as exc:
+            assert exc.message == "an integer has more than 1000 digits"
+        else:
+            raise AssertionError("the file was read")
+
+
+def test_every_float_is_finite_however_it_is_written() -> None:
+    for value in (
+        "1.0e+999",
+        "-1.0e+999",
+        "1" + "0" * 5000 + ".0",
+        "!!float nan",
+        "!!float inf",
+        "!!float -inf",
+        "!!float 1e999",
+        "!!float .NaN",
+        "1" + ":59" * 330_000 + ".5",
+    ):
+        started = time.monotonic()
+        error = _refused(f"x: 1\na: {value}\n")
+        assert time.monotonic() - started < 2
+        assert "JSON values only" in error.message and error.line == 2, value
+        assert len(error.message) < 120  # a long scalar is cut in the message
+    for text in ("[1e999]", '{"a": -1e999}', '{"a": 1.5e400}'):
+        try:
+            load_file("schemas/a.json", text)
+        except SourceError as exc:
+            assert "JSON values only" in exc.message, text
+        else:
+            raise AssertionError("the file was read")
+    document, _ = load_yaml("a: 1.5\nb: -0.0\nc: 1.7e+308\nd: !!float 2\n")
+    assert document == {"a": 1.5, "b": -0.0, "c": 1.7e308, "d": 2.0}
+    assert load_file("schemas/a.json", "[1.5, 1e300]")[0] == [1.5, 1e300]
+
+
+def test_a_scalar_its_tag_cannot_read_is_not_yaml_at_its_line() -> None:
+    for value, message in (
+        ("!!int abc", "'abc' is not an integer of YAML 1.2"),
+        ("!!int 1:30", "'1:30' is not an integer of YAML 1.2"),
+        ("!!int ''", "'' is not an integer of YAML 1.2"),
+        ("!!float abc", "'abc' is not a float"),
+        ("!!float ''", "'' is not a float"),
+        ("!!bool maybe", "'maybe' is not a boolean of YAML 1.2"),
+        ("!!bool yes", "'yes' is not a boolean of YAML 1.2"),
+    ):
+        error = _refused(f"x: 1\na: {value}\n")
+        assert (error.message, error.line) == (message, 2), value
+    document, _ = load_yaml("a: !!bool true\nb: !!bool False\n")
+    assert document == {"a": True, "b": False}
+    package = parse_package([("tests/n.test.yaml", "process: p\nname: !!int x\n")])
+    [problem] = package.problems
+    assert (problem.code, problem.file, problem.line) == ("invalid_yaml", "tests/n.test.yaml", 2)
+
+
+def test_the_packages_of_the_fixtures_read_as_before() -> None:
+    """No number of theirs is written in a form YAML 1.1 and 1.2 read apart."""
+    root = Path(__file__).resolve().parents[1] / "fixtures"
+    files = sorted(root.rglob("*.yaml"))
+    assert len(files) > 50
+    for path in files:
+        text = path.read_text(encoding="utf-8")
+        old = yaml.load(text, Loader=_yaml11_but_bool_and_timestamp())
+        assert load_yaml(text)[0] == old, path
+
+
+def _yaml11_but_bool_and_timestamp() -> type[yaml.SafeLoader]:
+    """The loader before TASK-001247: integers and floats of YAML 1.1."""
+
+    class Loader(yaml.SafeLoader):
+        pass
+
+    Loader.yaml_implicit_resolvers = {
+        first: [
+            (tag, rx)
+            for tag, rx in resolvers
+            if tag not in ("tag:yaml.org,2002:bool", "tag:yaml.org,2002:timestamp")
+        ]
+        for first, resolvers in yaml.SafeLoader.yaml_implicit_resolvers.items()
+    }
+    Loader.add_implicit_resolver(
+        "tag:yaml.org,2002:bool",
+        re.compile(r"^(?:true|True|TRUE|false|False|FALSE)$"),
+        list("tTfF"),
+    )
+    return Loader
+
+
 def _process_file(spec_body: dict[str, Any], key: str = "test") -> str:
     document = {"apiVersion": API_VERSION, "kind": "Process", "key": key, "spec": spec_body}
     return str(yaml.safe_dump(document, sort_keys=False, allow_unicode=True))
@@ -132,6 +558,18 @@ def test_a_data_ref_is_inlined_from_the_package_and_never_from_outside() -> None
         "processes/b.yaml",
         "/spec/data/$ref",
     )
+
+
+def test_a_data_ref_to_a_file_the_loader_refuses_is_unresolved() -> None:
+    body = spec("stages: []")
+    for name, content in (
+        ("schemas/a.json", '{"title": "\\ud800"}'),
+        ("schemas/a.yaml", _alias_bomb(8)),
+    ):
+        target = {**body, "data": {"$ref": f"../{name}"}}
+        package = parse_package([("processes/a.yaml", _process_file(target, "a")), (name, content)])
+        (problem,) = package.problems
+        assert (problem.code, problem.file) == ("unresolved_data_ref", "processes/a.yaml")
 
 
 def test_the_request_may_name_tests_and_a_name_that_is_no_test_is_a_finding() -> None:
@@ -319,6 +757,27 @@ def test_the_core_refuses_an_excluded_or_ineligible_approver() -> None:
     )
     assert refused.status == "failed"
     assert refused.failures[0].actual == "separation_of_duties_violation"
+
+
+def test_an_excluded_approver_is_refused_as_the_core_refuses_it() -> None:
+    """Nobody could decide: the step fails ``intent_failed`` in the sandbox as on the core."""
+    body = APPROVE.replace("[{role: lead}]", f"[{{role: lead}}, {{principal: {AUTHOR}}}]")
+    result = run(
+        body,
+        [opened(), {"expect": {"status": "failed", "error": "intent_failed"}}],
+        given={"principals": {"lead": ["bob"]}},
+    )
+    assert result.status == "passed", result.failures
+
+
+def test_an_empty_exclusion_fails_the_step_as_on_the_core() -> None:
+    """``uploadedBy`` left empty is no exclusion dropped: ``intent_failed`` (CP-ADR-0074 §7)."""
+    result = run(
+        APPROVE,
+        [opened(author=""), {"expect": {"status": "failed", "error": "intent_failed"}}],
+        given={"principals": {"lead": ["bob"]}},
+    )
+    assert result.status == "passed", result.failures
 
 
 def test_virtual_time_fires_timers_in_order_at_their_own_moment() -> None:

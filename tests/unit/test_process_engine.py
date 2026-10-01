@@ -24,6 +24,7 @@ from control_plane.domain.calendar import Calendar
 from control_plane.domain.event_catalog import current_version, schema_for
 from control_plane.domain.process_definition import Catalog, SkillEntry
 from control_plane.domain.process_engine import Definition, Input
+from control_plane.domain.process_sla import SLA_TIMERS
 from tests.unit.test_process_contract import PROCESS, _yaml12_loader, retrospective_contract
 
 FIXTURES = Path(__file__).resolve().parents[1] / "fixtures" / "processes"
@@ -201,11 +202,13 @@ class Run:
         )
 
     def timer(self, element: str, kind: str | None = None) -> dict[str, Any]:
+        """The one timer of ``element``; without ``kind`` its deadline timers do not count."""
         assert self.state is not None
         found = [
             t
             for t in self.state["timers"].values()
-            if t["element"] == element and (kind is None or t["kind"] == kind)
+            if t["element"] == element
+            and (t["kind"] == kind if kind is not None else t["kind"] not in SLA_TIMERS)
         ]
         assert len(found) == 1, f"{element}: {found}"
         return found[0]
@@ -1662,6 +1665,42 @@ def test_approve_requests_approvals_without_the_excluded_principals() -> None:
         {"atLeast": 2},
         True,
     )
+
+
+@pytest.mark.parametrize(
+    ("listed", "author", "excluded"),
+    [
+        ("[data.author]", "", [""]),
+        ("[data.decision]", AUTHOR, [None]),
+        ("[]", AUTHOR, []),
+    ],
+)
+def test_an_empty_exclusion_is_passed_on_for_the_core_to_refuse(
+    listed: str, author: str, excluded: list[Any]
+) -> None:
+    """The engine filters nothing (CP-ADR-0074 §7): an empty value reaches the
+    application, which refuses the step rather than drop the exclusion."""
+    run = Run(_approve("all").replace('"[data.author]"', f'"{listed}"'))
+    run.start(author=author)
+    (asked,) = run.intents("request_approvals")
+    assert asked["excludedPrincipals"] == excluded
+
+
+def test_the_owner_chain_of_an_instance_is_computed_from_its_data() -> None:
+    """The owner the application tells about an approval nobody may decide (CP-ADR-0074 §7)."""
+    run = Run(_approve("all"))
+    run.start()
+    assert run.state is not None
+    assert pe.owner_chain(run.definition, run.state, run.clock) == [{"role": "lead"}]
+    computed = Run(
+        _approve("all") + 'owner: [{expr: "data.author"}, {expr: data.decision}, {role: lead}]\n'
+    )
+    computed.start()
+    assert computed.state is not None
+    assert pe.owner_chain(computed.definition, computed.state, computed.clock) == [
+        {"principal": AUTHOR},
+        {"role": "lead"},
+    ]
 
 
 def test_two_of_three_approve_early() -> None:

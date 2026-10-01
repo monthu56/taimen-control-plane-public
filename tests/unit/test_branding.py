@@ -52,6 +52,7 @@ SCAN_GLOBS = [
     "Makefile",
     "Dockerfile",
     ".env.example",
+    ".agents/*.yaml",
 ]
 
 

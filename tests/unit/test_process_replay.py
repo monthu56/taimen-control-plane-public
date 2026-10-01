@@ -68,7 +68,7 @@ def _candidate(body: str, version: int = 2) -> Definition:
 
 def _divergence(candidate: Definition, run: Run) -> Any:
     journal = _journal(run)
-    result = replay(as_version(candidate, 1), journal, lambda named: CALENDARS, stop=True)
+    result = replay(as_version(candidate, 1, 1), journal, lambda named: CALENDARS, stop=True)
     return first_divergence(result, run.state, len(journal) - 1)
 
 

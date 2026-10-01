@@ -1,6 +1,7 @@
 """Delegations: allow an agent to act on behalf of a human."""
 
 import uuid
+from collections.abc import Sequence
 from datetime import datetime
 
 from sqlalchemy import select
@@ -128,6 +129,34 @@ async def find_active_delegation(
             Delegation.revoked_at.is_(None),
             Delegation.starts_at <= now,
         )
+    )
+    for delegation in result:
+        if delegation.expires_at is None or delegation.expires_at > now:
+            return delegation
+    return None
+
+
+async def find_delegation_from_any(
+    session: AsyncSession,
+    *,
+    tenant_id: uuid.UUID,
+    human_principal_ids: Sequence[uuid.UUID],
+    agent_principal_id: uuid.UUID,
+) -> Delegation | None:
+    """An active delegation to the agent from any of the principals, if there is one."""
+    if not human_principal_ids:
+        return None
+    now = utcnow()
+    result = await session.scalars(
+        select(Delegation)
+        .where(
+            Delegation.tenant_id == tenant_id,
+            Delegation.human_principal_id.in_(human_principal_ids),
+            Delegation.agent_principal_id == agent_principal_id,
+            Delegation.revoked_at.is_(None),
+            Delegation.starts_at <= now,
+        )
+        .order_by(Delegation.created_at, Delegation.id)
     )
     for delegation in result:
         if delegation.expires_at is None or delegation.expires_at > now:

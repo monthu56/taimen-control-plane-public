@@ -25,7 +25,7 @@ from control_plane.application.context import graph
 from control_plane.worker.main import Worker
 from tests.fake_graph_memory import Edge, FakeGraphMemory, Node
 from tests.helpers import auth, create_agent_with_key, create_workspace
-from tests.integration.test_package_test import API_VERSION, CALENDAR, snapshot
+from tests.integration.test_package_test import API_VERSION, CALENDAR, FIXTURES, snapshot
 from tests.integration.test_process_instances import (
     AGENT,
     _complete,
@@ -222,9 +222,13 @@ async def test_a_renamed_step_with_a_map_moves_every_open_instance_onto_it(
         assert instance["definitionVersion"] == 2
         assert instance["status"] == "running"
         assert _open(instance, "check")["taskId"] is not None
-        assert [t["element"] for t in instance["timers"]] == ["check"]
+        # The escalation and the deadline of the step (engine revision 2) moved onto check.
+        assert [t["element"] for t in instance["timers"]] == ["check", "check"]
         journal = await _journal(client, key, instance_id)
-        assert any(e["kind"] == "migration" for e in journal)
+        [moved] = [e for e in journal if e["kind"] == "migration"]
+        # The instance runs under the engine revision of version 2 from here on.
+        assert moved["data"]["toVersion"] == 2
+        assert moved["data"]["engineRevision"] == 2
     migrated = await _events(client, key, "process.migrated")
     assert sorted(e["payload"]["instanceId"] for e in migrated) == sorted(instances)
     assert all(
@@ -397,6 +401,9 @@ async def test_a_renamed_process_takes_its_instances_and_the_old_key_starts_noth
     assert refused.status_code == 409, refused.text
     assert refused.json()["error"]["code"] == "process_retired"
     await _start(client, key, "N-2", "sample-renamed")
+    old = await client.get(f"/api/v1/process-definitions/{PROCESS}", headers=auth(key))
+    assert old.json()["status"] == "retired"
+    assert old.json()["retired"]["reason"] == "renamed by package sample-plan"
 
     # The rename is done: the same package plans nothing more.
     again = await _plan(client, key, moved)
@@ -412,6 +419,156 @@ async def test_a_renamed_process_takes_its_instances_and_the_old_key_starts_noth
     await _start(client, key, "N-3")
     conflict = await _plan(client, key, moved)
     assert "rename_target_exists" in _errors(conflict)
+
+
+async def test_a_process_retired_between_plan_and_apply_is_plan_stale(
+    client: httpx.AsyncClient,
+) -> None:
+    s = await _setup(client)
+    key, admin = s["key"], s["admin"]
+    await _plan_and_apply(client, key, _package(_spec(admin)))
+    next_version = _package(_spec(admin, version=2, display="Sample plan v2"))
+    plan = await _plan(client, key, next_version)
+
+    retired = await client.post(
+        f"/api/v1/process-definitions/{PROCESS}:retire",
+        json={"reason": "replaced"},
+        headers=auth(key),
+    )
+    assert retired.status_code == 200, retired.text
+    stale = await _apply(client, key, next_version, plan["planHash"])
+    assert stale.status_code == 409, stale.text
+    assert stale.json()["error"]["code"] == "plan_stale"
+
+    # The package publishing a new version brings the key back (CP-ADR-0074 Zh1).
+    applied = await _plan_and_apply(client, key, next_version)
+    assert applied["applied"][0]["action"] == "update"
+    shown = await client.get(f"/api/v1/process-definitions/{PROCESS}", headers=auth(key))
+    assert (shown.json()["status"], shown.json()["retired"]) == ("active", None)
+    await _start(client, key, "N-1")
+
+
+async def _retire(client: httpx.AsyncClient, key: str, path: str) -> None:
+    response = await client.post(
+        f"/api/v1/{path}:retire", json={"reason": "replaced"}, headers=auth(key)
+    )
+    assert response.status_code == 200, response.text
+
+
+def _actions(plan: dict[str, Any]) -> dict[tuple[str, str], str]:
+    return {(c["kind"], c["key"]): c["action"] for c in plan["changes"]}
+
+
+async def test_a_retired_process_and_its_calendar_installed_as_they_are_are_restored(
+    client: httpx.AsyncClient,
+) -> None:
+    s = await _setup(client)
+    key, admin = s["key"], s["admin"]
+    spec = {**_spec(admin), "calendar": "ru"}
+    package = _package(spec, calendar=True)
+    await _plan_and_apply(client, key, package)
+    await _retire(client, key, f"process-definitions/{PROCESS}")
+    await _retire(client, key, "calendars/ru")
+
+    # Without the calendar the restored process would need one out of use.
+    alone = await _plan(client, key, _package(spec))
+    assert _actions(alone) == {("Process", PROCESS): "restore"}
+    assert [(p["code"], p["path"]) for p in alone["problems"] if p["severity"] == "error"] == [
+        ("calendar_retired", "/spec/calendar")
+    ]
+    refused = await _apply(client, key, _package(spec), alone["planHash"])
+    assert refused.status_code == 422, refused.text
+
+    # The package installs both as they are: the plan says so, and the apply does it.
+    plan = await _plan(client, key, package)
+    assert _actions(plan) == {("Calendar", "ru"): "restore", ("Process", PROCESS): "restore"}
+    assert _errors(plan) == []
+    assert plan["processes"] == []
+    applied = await _apply(client, key, package, plan["planHash"])
+    assert applied.status_code == 200, applied.text
+    assert [(a["kind"], a["action"], a["version"]) for a in applied.json()["applied"]] == [
+        ("Calendar", "restore", 1),
+        ("Process", "restore", 1),
+    ]
+    calendar = await client.get("/api/v1/calendars/ru", headers=auth(key))
+    assert (calendar.json()["status"], calendar.json()["version"]) == ("active", 1)
+    shown = await client.get(f"/api/v1/process-definitions/{PROCESS}", headers=auth(key))
+    assert (shown.json()["status"], shown.json()["version"]) == ("active", 1)
+    await _start(client, key, "N-1")
+    [process_event] = await _events(client, key, "process.definition_restored")
+    assert process_event["entityType"] == "process_definition"
+    assert process_event["payload"] == {
+        "key": PROCESS,
+        "latestVersion": 1,
+        "packageKey": "sample-plan",
+        "packageVersion": "1.0.0",
+    }
+    [calendar_event] = await _events(client, key, "calendar.restored")
+    assert calendar_event["payload"]["key"] == "ru"
+
+    # Back in use, the same package plans nothing more.
+    again = await _plan(client, key, package)
+    assert set(_actions(again).values()) == {"unchanged"}
+
+
+async def test_a_retired_calendar_installed_as_it_is_serves_a_process_updated_to_it(
+    client: httpx.AsyncClient,
+) -> None:
+    s = await _setup(client)
+    key, admin = s["key"], s["admin"]
+    await _plan_and_apply(client, key, _package(_spec(admin), calendar=True))
+    await _retire(client, key, "calendars/ru")
+
+    # The new version names the calendar; the package installs it as it is.
+    package = _package({**_spec(admin, version=2), "calendar": "ru"}, calendar=True)
+    plan = await _plan(client, key, package)
+    assert _actions(plan) == {("Calendar", "ru"): "restore", ("Process", PROCESS): "update"}
+    assert _errors(plan) == []
+    applied = await _apply(client, key, package, plan["planHash"])
+    assert applied.status_code == 200, applied.text
+    assert [(a["kind"], a["action"], a["version"]) for a in applied.json()["applied"]] == [
+        ("Calendar", "restore", 1),
+        ("Process", "update", 2),
+    ]
+    calendar = await client.get("/api/v1/calendars/ru", headers=auth(key))
+    assert (calendar.json()["status"], calendar.json()["version"]) == ("active", 1)
+    shown = await client.get(f"/api/v1/process-definitions/{PROCESS}", headers=auth(key))
+    assert (shown.json()["status"], shown.json()["version"]) == ("active", 2)
+    assert shown.json()["spec"]["calendar"] == "ru"
+    [calendar_event] = await _events(client, key, "calendar.restored")
+    assert calendar_event["payload"]["key"] == "ru"
+    await _start(client, key, "N-1")
+
+    # The calendar is needed again: it is not retired a second time.
+    refused = await client.post(
+        "/api/v1/calendars/ru:retire", json={"reason": "replaced"}, headers=auth(key)
+    )
+    assert refused.status_code == 409, refused.text
+    assert refused.json()["error"]["code"] == "calendar_in_use"
+
+
+async def test_a_retired_process_installed_as_it_is_is_restored(
+    client: httpx.AsyncClient,
+) -> None:
+    s = await _setup(client)
+    key, admin = s["key"], s["admin"]
+    package = _package(_spec(admin))
+    await _plan_and_apply(client, key, package)
+    await _retire(client, key, f"process-definitions/{PROCESS}")
+    refused = await client.post(
+        "/api/v1/process-instances", json={"process": PROCESS, "key": "N-1"}, headers=auth(key)
+    )
+    assert refused.json()["error"]["code"] == "process_retired"
+
+    applied = await _plan_and_apply(client, key, package)
+    assert applied["applied"] == [
+        {"kind": "Process", "key": PROCESS, "action": "restore", "version": 1}
+    ]
+    versions = await client.get(
+        f"/api/v1/process-definitions/{PROCESS}/versions", headers=auth(key)
+    )
+    assert [(v["version"], v["status"]) for v in versions.json()["items"]] == [(1, "active")]
+    await _start(client, key, "N-1")
 
 
 class RegulationMemory(FakeGraphMemory):
@@ -509,3 +666,27 @@ async def test_plan_and_apply_need_their_permission_and_a_manifest(
     invalid = await _apply(client, key, headless, plan["planHash"])
     assert invalid.status_code == 422, invalid.text
     assert invalid.json()["error"]["code"] == "invalid_package"
+
+
+async def test_the_plan_checks_the_calendar_of_a_due(client: httpx.AsyncClient) -> None:
+    """CP-ADR-0078 §1 (P009): the plan refuses what the publication would."""
+    s = await _setup(client)
+    key, admin = s["key"], s["admin"]
+    spec = _spec(admin)
+    spec["stages"][0]["steps"][0]["human"]["due"] = {"workhours": 8}
+    here = "/spec/stages/0/steps/0/human/due/workhours"
+
+    def problems(plan: dict[str, Any]) -> list[tuple[str, str]]:
+        return [(p["code"], p["path"]) for p in plan["problems"] if p["severity"] == "error"]
+
+    plan = await _plan(client, key, _package(spec, calendar=True))
+    assert problems(plan) == [("sla_calendar_missing", here)]
+    spec["calendar"] = "ru"
+    plan = await _plan(client, key, _package(spec, calendar=True))
+    assert problems(plan) == [("sla_calendar_without_hours", here)]
+    package = _package(spec, calendar=True)
+    with_hours = (FIXTURES / "ru-2025-2027.calendar.yaml").read_text(encoding="utf-8")
+    for item in package["files"]:
+        if item["path"] == "calendars/ru.yaml":
+            item["content"] = with_hours
+    assert problems(await _plan(client, key, package)) == []

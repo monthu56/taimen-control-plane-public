@@ -1,0 +1,12 @@
+subject: taskType
+taskType: payment-approval
+name: отказ в оплате заводит доработку и остаётся открытым
+given:
+  task: {customFields: {invoice: INV-7}}
+steps:
+  - approve: {decision: rejected, comment: нет договора}
+  - expect:
+      ensureWork: [{type: invoice-payment, customFields: {invoice: INV-7}}]
+      invokeSkill: []
+      status: {key: todo, category: active}
+      comments: [отклонена]

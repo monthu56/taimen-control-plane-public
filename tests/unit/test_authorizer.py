@@ -211,3 +211,34 @@ async def test_memory_visibility_maps_policy_objects_to_namespaces() -> None:
     )
     configure_authorizer(Authorizer(policy, "shadow"))
     assert await memory_visibility(ctx, settings) is None
+
+
+async def test_inside_a_package_test_the_pdp_decides_only_the_callers_reads() -> None:
+    """CP-ADR-0074 Z7: a read in the caller's name of what the test did not write."""
+    from control_plane import sandbox
+
+    policy = FakePolicy(allowed=False, objects=["w1"])
+    configure_authorizer(Authorizer(policy, "policy"))
+    caller = make_ctx("admin")
+    other = make_ctx("admin")
+    trial = sandbox.Trial(
+        clock=datetime(2026, 1, 5, tzinfo=UTC), policy_subjects=frozenset({caller.policy_subject})
+    )
+    trial.written.add("t-new")
+    with sandbox.trial(trial):
+        with pytest.raises(AuthorizationError):
+            await authorize(caller, Permission.TASKS_READ, resource=ResourceRef("task", "t-old"))
+        assert await visible_objects(caller, Permission.TASKS_READ, "workspace") == {"w1"}
+        # The rest is the local check: rows of the test, writes, principals of the test.
+        await authorize(caller, Permission.TASKS_READ, resource=ResourceRef("task", "t-new"))
+        await authorize(caller, Permission.TASKS_WRITE, resource=ResourceRef("task", "t-old"))
+        await authorize(other, Permission.TASKS_READ, resource=ResourceRef("task", "t-old"))
+        assert await visible_objects(other, Permission.TASKS_READ, "workspace") is None
+        # Anything else that would reach the PDP is still refused.
+        with pytest.raises(sandbox.SandboxOutgoingCall):
+            sandbox.refuse_outgoing("policy")
+    assert policy.calls == [
+        ("tasks.read", "task:t-old", caller.policy_subject),
+        ("tasks.read", "workspace", caller.policy_subject),
+    ]
+    assert trial.outgoing == ["policy"]

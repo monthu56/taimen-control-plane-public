@@ -7,11 +7,13 @@ import uuid
 from datetime import UTC, datetime
 from typing import Any
 
+from control_plane import sandbox
 from control_plane.domain.errors import ValidationError
 
 
 def utcnow() -> datetime:
-    return datetime.now(UTC)
+    """Now; inside a package test, the virtual clock of the test (CP-ADR-0074 Z2)."""
+    return sandbox.virtual_now() or datetime.now(UTC)
 
 
 def new_uuid() -> uuid.UUID:

@@ -30,15 +30,20 @@ against a combination of revisions that exists in no commit anywhere.
 """
 
 import contextlib
+import functools
 import logging
 import os
 import re
 import shutil
+import signal
 import subprocess
-from collections.abc import Iterable, Mapping, Sequence
+import tempfile
+from collections.abc import Callable, Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal
+
+from control_plane_agent.runner_config import RunnerConfig
 
 logger = logging.getLogger("control_plane_agent.workspace")
 
@@ -46,6 +51,14 @@ CHECKPOINT_KIND = "execution.workspace"
 ARTIFACT_TYPE = "commit"
 BRANCH_PREFIX = "task/"
 DEFAULT_COMMITTER = ("control-plane-agent", "agent@control-plane.local")
+#: The executor changed a neighbour, which is read-only (universal-runner FR-007).
+NEIGHBOUR_MODIFIED = "neighbour_modified"
+#: The prose conventions whose blob the trace of a catalog run records (FR-011).
+AGENTS_MD = "AGENTS.md"
+#: Seconds a fetch of the base branch may take before it counts as failed.
+BASE_FETCH_TIMEOUT = 120.0
+#: Where a neighbour mirror keeps the revisions placed from it (``mirrors.py``).
+PINS_PREFIX = "refs/remotes/pins/"
 
 Outcome = Literal["succeeded", "failed", "suspended"]
 
@@ -95,12 +108,30 @@ _BASE_BRANCH_KEY = "controlPlaneBase"
 _BASE_COMMIT_KEY = "controlPlaneBaseCommit"
 
 
+#: How a published task branch relates to the mirror's (``published_state``).
+PublishedState = Literal["unreachable", "absent", "same", "behind", "diverged"]
+
+
 class WorkspaceError(RuntimeError):
     """The working copy is not in the state the caller assumed."""
 
 
 class WorkspaceBusyError(WorkspaceError):
     """Another process already holds this workspace."""
+
+
+class WorkspaceBlocked(WorkspaceError):
+    """The copy cannot be worked in until a person acts.
+
+    ``code`` is the failure reason of the run (:data:`NEIGHBOUR_MODIFIED`,
+    ``runner_config_invalid``), ``reason`` the words for the person; neither
+    carries a local path.
+    """
+
+    def __init__(self, code: str, reason: str) -> None:
+        super().__init__(f"{code}: {reason}")
+        self.code = code
+        self.reason = redact_local_paths(reason)
 
 
 class UnsafePayloadError(ValueError):
@@ -179,7 +210,13 @@ def public_remote_url(url: str) -> str | None:
     return url
 
 
-def _git(cwd: Path, *args: str, check: bool = True) -> str:
+def _git(
+    cwd: Path,
+    *args: str,
+    check: bool = True,
+    env: Mapping[str, str] | None = None,
+    stdin: str | None = None,
+) -> str:
     # Fixed argv, never a shell: workspace keys are validated before they reach git.
     result = subprocess.run(
         ["git", *args],
@@ -187,6 +224,8 @@ def _git(cwd: Path, *args: str, check: bool = True) -> str:
         capture_output=True,
         text=True,
         check=False,
+        env={**os.environ, **env} if env is not None else None,
+        input=stdin,
     )
     if check and result.returncode != 0:
         detail = f"git {' '.join(args)} failed: {result.stderr.strip()}"
@@ -197,6 +236,26 @@ def _git(cwd: Path, *args: str, check: bool = True) -> str:
         logger.warning("%s", detail)
         raise WorkspaceError(redact_local_paths(detail))
     return result.stdout.strip()
+
+
+#: How long a push or a fetch from the forge may take before it counts as failed.
+REMOTE_TIMEOUT_SECONDS = 300.0
+
+
+def _git_remote(
+    cwd: Path, *args: str, timeout: float = REMOTE_TIMEOUT_SECONDS
+) -> subprocess.CompletedProcess[str] | None:
+    """Run a git command that talks to a forge; None when it did not finish in time.
+
+    Bounded by ``timeout`` (:data:`REMOTE_TIMEOUT_SECONDS` unless the caller
+    has a tighter one) with its transport killed too (:func:`_bounded`), and
+    never asks for credentials on a terminal nobody watches: a forge that
+    wants a password fails the command instead of hanging the daemon.
+    """
+    result = _bounded(["git", *args], cwd, timeout, env={**os.environ, "GIT_TERMINAL_PROMPT": "0"})
+    if result is None:
+        logger.warning("git %s did not finish in %gs", args[0], timeout)
+    return result
 
 
 @dataclass(frozen=True)
@@ -216,6 +275,176 @@ class Neighbour:
     def __post_init__(self) -> None:
         if not _NEIGHBOUR_RE.match(self.path):
             raise WorkspaceError(f"unsafe neighbour name: {self.path!r}")
+
+
+# A submodule path of a superproject: relative segments of the same standard.
+_SUBMODULE_PATH_RE = re.compile(
+    r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}(?:/[A-Za-z0-9][A-Za-z0-9._-]{0,63})*$"
+)
+
+
+@dataclass(frozen=True)
+class PinnedNeighbour:
+    """A neighbour of a catalog run, at the revision the superproject pins.
+
+    ``name`` is its catalog key, as the checkpoint names it; ``path`` is
+    where it goes — relative to the task's container, beside the copy, or,
+    for a task of the superproject itself, relative to the copy, at the
+    submodule's path. ``origin`` is its neighbour mirror (``mirrors.py``).
+    """
+
+    name: str
+    path: str
+    origin: Path
+    revision: str
+
+    def __post_init__(self) -> None:
+        if not _SUBMODULE_PATH_RE.match(self.path) or ".." in self.path.split("/"):
+            raise WorkspaceError(f"unsafe neighbour path: {self.path!r}")
+
+
+@dataclass(frozen=True)
+class Conventions:
+    """What a catalog run is prepared by, read from the base revision (TAI-ADR-0063 §4).
+
+    ``revision`` is the commit ``runner.yaml`` and ``AGENTS.md`` were read
+    from; ``config`` is None when the repository has no ``runner.yaml``
+    there. ``inside`` — the neighbours are submodules of the copy itself.
+    """
+
+    revision: str
+    config: RunnerConfig | None = None
+    agents_md: str | None = None
+    neighbours: tuple[PinnedNeighbour, ...] = ()
+    inside: bool = False
+
+
+#: Reads the conventions of a repository:
+#: ``(mirror, base revision, head of the task branch, ref of the base branch)
+#: -> Conventions``.
+ConventionsReader = Callable[[Path, str, str, str], Conventions]
+
+
+def _keep_pin(neighbour: PinnedNeighbour) -> None:
+    """Keep a placed revision under a ref of its mirror.
+
+    A copy left at it is then no "commit of its own" when the forge rewrites
+    the branch that had it (a force-push), and gc does not take it.
+
+    Not checked: replicas share the mirror, and two of them keeping the same
+    pin at once race for the ref's lock. The loser has nothing to redo — the
+    ref names the same commit either way — and a later run keeps it again.
+    """
+    _git(
+        neighbour.origin,
+        "update-ref",
+        f"{PINS_PREFIX}{neighbour.revision}",
+        neighbour.revision,
+        check=False,
+    )
+
+
+def prune_pins(mirror: Path) -> list[str]:
+    """Drop pins of ``mirror`` no copy cut from it stands at; the revisions dropped.
+
+    A pin exists for a copy (:func:`_keep_pin`); once no worktree of the
+    mirror is at its revision, it only keeps a commit the forge may have
+    dropped from gc, and pins would pile up with every move of a pointer.
+
+    Refs are listed before worktrees: a copy is placed before its pin is
+    kept, so a pin listed here has its copy listed too. A pin fetched by
+    ``reach`` for a copy not placed yet may go; its commit stays in the
+    object store until gc's expiry, and placing the copy keeps the pin again.
+    """
+    refs = _git(mirror, "for-each-ref", "--format=%(refname)", PINS_PREFIX, check=False)
+    _git(mirror, "worktree", "prune", check=False)
+    listed = _git(mirror, "worktree", "list", "--porcelain", check=False)
+    in_use = {line.split()[1] for line in listed.splitlines() if line.startswith("HEAD ")}
+    stale = [
+        ref.removeprefix(PINS_PREFIX)
+        for ref in refs.splitlines()
+        if ref and ref.removeprefix(PINS_PREFIX) not in in_use
+    ]
+    if stale:
+        # With the old value: a ref named by its own sha is never moved, and
+        # a delete that finds something else there leaves it alone.
+        commands = "".join(f"delete {PINS_PREFIX}{sha} {sha}\n" for sha in stale)
+        result = subprocess.run(
+            ["git", "update-ref", "--stdin"],
+            cwd=mirror,
+            input=commands,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if result.returncode != 0:
+            # Another replica pruned or kept one of them meanwhile: the next
+            # prune gets the rest.
+            logger.info("pins of %s not pruned: %s", mirror.name, result.stderr.strip()[:200])
+            return []
+        logger.info("pruned %d pin(s) of %s", len(stale), mirror.name)
+    return stale
+
+
+def _run_bounded(
+    argv: Sequence[str], cwd: Path, timeout: float
+) -> subprocess.CompletedProcess[str]:
+    """Run ``argv``; a run past ``timeout`` is killed with its children and fails."""
+    result = _bounded(argv, cwd, timeout)
+    if result is None:
+        return subprocess.CompletedProcess(
+            list(argv), -signal.SIGKILL, "", f"timed out after {timeout:g} s"
+        )
+    return result
+
+
+def _bounded(
+    argv: Sequence[str], cwd: Path, timeout: float, *, env: Mapping[str, str] | None = None
+) -> subprocess.CompletedProcess[str] | None:
+    """Run ``argv``; None when it ran past ``timeout`` and was killed with its children.
+
+    A fetch spawns a transport (``ssh``, ``git-remote-https``, a local
+    ``upload-pack``) that a kill of git alone leaves behind holding the
+    pipes, so the process gets a group of its own and the whole group goes.
+    """
+    process = subprocess.Popen(
+        list(argv),
+        cwd=cwd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        start_new_session=True,
+        env=None if env is None else dict(env),
+    )
+    try:
+        stdout, stderr = process.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        with contextlib.suppress(ProcessLookupError):
+            os.killpg(process.pid, signal.SIGKILL)
+        process.wait()
+        return None
+    return subprocess.CompletedProcess(list(argv), process.returncode, stdout, stderr)
+
+
+def _tree_gitlink(repository: Path, revision: str, path: str) -> str:
+    """The commit a gitlink at ``revision:path`` points to; empty if none is there."""
+    fields = _git(repository, "ls-tree", revision, "--", path, check=False).split()
+    return fields[2] if len(fields) >= 3 and fields[0] == "160000" else ""
+
+
+def _index_gitlink(repository: Path, path: str) -> str:
+    """The commit a gitlink staged at ``path`` points to; empty if none is staged."""
+    fields = _git(repository, "ls-files", "--stage", "--", path, check=False).split()
+    return fields[1] if len(fields) >= 3 and fields[0] == "160000" else ""
+
+
+def blob_of(repository: Path, revision: str, path: str) -> str | None:
+    """Id of the blob at ``revision:path``; None when there is no file there."""
+    spec = f"{revision}:{path}"
+    kind = _git(repository, "cat-file", "-t", spec, check=False)
+    if kind != "blob":
+        return None
+    return _git(repository, "rev-parse", "--verify", "--quiet", spec, check=False) or None
 
 
 def _check_branch_name(name: str) -> None:
@@ -279,6 +508,26 @@ class Workspace:
     # Branch the copy was cut from and the work is meant to be merged into: the
     # task's own ``baseBranch`` (a feature branch), or the pool's default.
     base_branch: str = ""
+    # Key of the repository in the agent's catalog (universal-runner U005);
+    # empty for the one-repository form of ``workingCopy``.
+    repository_key: str = ""
+    # The commit the task branch was cut from — for a published branch taken
+    # over, the point it shares with the base. Empty when no record says.
+    base_revision: str = ""
+    # What the run was prepared by (a catalog run, universal-runner U006).
+    conventions: Conventions | None = None
+    # The commit the run's runner.yaml is read at: the task's base as the pool
+    # found it (``_base_of``), never the branch's own head. Empty when the
+    # pool could not tell.
+    conventions_base: str = ""
+    # (name, directory, revision) of each neighbour placed for this run.
+    placed: tuple[tuple[str, Path, str], ...] = ()
+    # Refs of the base branch in the copy: a submodule pointer a merge of
+    # them brought in is the base's, not a change of the task's own.
+    base_refs: tuple[str, ...] = ()
+    # Brings the forge's copy of the base into ``base_refs``, best-effort:
+    # the task may have merged a base that moved after the copy was cut.
+    refresh_base: Callable[[], object] | None = field(default=None, repr=False, compare=False)
     _lock_fd: int | None = None
 
     @property
@@ -297,6 +546,15 @@ class Workspace:
         }
         if self.base_branch:
             data["baseBranch"] = self.base_branch
+        if self.repository_key:
+            # The trace of a catalog run (FR-011); the one-repository form
+            # keeps its checkpoint as it was.
+            data["repositoryKey"] = self.repository_key
+            if self.base_revision:
+                data["baseRevision"] = self.base_revision
+        if self.conventions is not None:
+            data["conventionsRevision"] = self.conventions.revision
+            data["agentsMdBase"] = self.conventions.agents_md
         if self.neighbours:
             data["neighbours"] = dict(self.neighbours)
         assert_portable(data, where=CHECKPOINT_KIND)
@@ -309,11 +567,182 @@ class Workspace:
     def head(self) -> str:
         return _git(self.path, "rev-parse", "HEAD")
 
+    def head_state(self) -> tuple[str, str]:
+        """Where HEAD is: its branch (``HEAD`` when detached) and its commit."""
+        ref = _git(self.path, "rev-parse", "--symbolic-full-name", "HEAD", check=False)
+        return ref or "HEAD", self.head()
+
+    def head_message(self) -> str:
+        """The message of the commit HEAD points at; empty when it cannot be read."""
+        return _git(self.path, "log", "-1", "--format=%B", "HEAD", check=False)
+
+    def agents_md_at(self, revision: str) -> str | None:
+        """Blob of ``AGENTS.md`` at ``revision`` of the copy; None without the file."""
+        return blob_of(self.path, revision, AGENTS_MD)
+
+    def neighbour_changes(self) -> dict[str, str]:
+        """What happened to each neighbour placed for the run, if anything.
+
+        A neighbour is read-only (FR-007): changed or new files that are not
+        ignored, a HEAD moved off the pinned revision, a directory removed
+        or replaced — each means the run did not work against the revisions
+        its checkpoint names, and only the task's repository is published.
+
+        For a task of the superproject the pointer is the neighbour's too: a
+        pointer staged in the copy's index, or committed on the task branch
+        and brought in by no merge of the base, is a change of the neighbour.
+        """
+        changes: dict[str, str] = {}
+        if self._nested() and self.refresh_base is not None:
+            self.refresh_base()
+        for name, directory, revision in self.placed:
+            if not (directory / ".git").exists():
+                changes[name] = "was removed or replaced"
+                continue
+            head = _git(directory, "rev-parse", "HEAD", check=False)
+            if head != revision:
+                changes[name] = f"moved from {revision[:12]} to {head[:12] or 'nothing'}"
+            elif _git(directory, "status", "--porcelain", check=False):
+                changes[name] = "has changed or new files"
+            elif directory in self._nested():
+                pointer = self._pointer_change(self._nested()[directory], revision)
+                if pointer:
+                    changes[name] = pointer
+        return changes
+
+    def _nested(self) -> dict[Path, str]:
+        """Neighbours placed inside the copy, by directory: their submodule paths."""
+        if self.conventions is None or not self.conventions.inside:
+            return {}
+        return {
+            directory: directory.relative_to(self.path).as_posix()
+            for _, directory, _ in self.placed
+        }
+
+    def _pointer_change(self, path: str, revision: str) -> str:
+        """What the task did to the pointer of the submodule at ``path``; empty if nothing."""
+        staged = _index_gitlink(self.path, path)
+        committed = _tree_gitlink(self.path, "HEAD", path)
+        if staged != committed:
+            return f"has its pointer staged at {staged[:12] or 'nothing'} in the copy"
+        # The base's pointer where the branch last met its base: the point it
+        # was cut from, moved on by each merge of a ref of the base branch.
+        # Only the latest meeting counts — a pointer rolled back to what the
+        # base had before a merge is the task's change, not the base's.
+        points = {self.base_revision} if self.base_revision else set()
+        for ref in self.base_refs:
+            fork = _git(self.path, "merge-base", "HEAD", ref, check=False)
+            if fork:
+                points.add(fork)
+        latest = [
+            point
+            for point in points
+            if not any(other != point and self._is_ancestor(point, other) for other in points)
+        ]
+        allowed = {_tree_gitlink(self.path, point, path) for point in latest} or {revision}
+        if committed not in allowed:
+            return (
+                f"has its pointer committed at {committed[:12] or 'nothing'} on the task "
+                "branch, which no merge of the base brought in"
+            )
+        return ""
+
+    def _is_ancestor(self, ancestor: str, descendant: str) -> bool:
+        result = subprocess.run(
+            ["git", "merge-base", "--is-ancestor", ancestor, descendant],
+            cwd=self.path,
+            capture_output=True,
+            check=False,
+        )
+        return result.returncode == 0
+
+    def snapshot(self) -> str:
+        """Tree of what the copy holds now, as ``commit`` would take it.
+
+        Written through an index of its own: the copy's index, and so what
+        the executor staged, is not touched.
+        """
+        with tempfile.TemporaryDirectory(prefix="cp-snapshot-") as tmp:
+            env = {"GIT_INDEX_FILE": str(Path(tmp) / "index")}
+            _git(self.path, "read-tree", "HEAD", env=env)
+            _git(self.path, "add", "-A", "--", ".", *self._excluded(), env=env)
+            return _git(self.path, "write-tree", env=env)
+
+    def restore(self, tree: str) -> None:
+        """Put the files of the copy back to ``tree`` (:meth:`snapshot`).
+
+        What was added since goes, what was changed or removed comes back;
+        ignored files and nested neighbours stay as they are. The checks run
+        in the copy, and what they leave behind is not the executor's work.
+
+        The ``.gitignore`` files come back first, and the rest is compared
+        under them: a check that ignored its own output there would otherwise
+        leave it behind, to be committed once the file is back.
+        """
+        changes = self._changes_since(tree)
+        ignores = [change for change in changes if Path(change[1]).name == ".gitignore"]
+        if ignores:
+            self._put_back(tree, ignores)
+            changes = self._changes_since(tree)
+        self._put_back(tree, changes)
+
+    def _changes_since(self, tree: str) -> list[tuple[str, str]]:
+        """``(status, path)`` of what differs between ``tree`` and the copy now."""
+        diff = _git(
+            self.path,
+            "diff",
+            "--no-renames",
+            "--name-status",
+            "-z",
+            tree,
+            self.snapshot(),
+            "--",
+            ".",
+            *self._excluded(),
+        )
+        fields = diff.split("\0")
+        return list(zip(fields[::2], fields[1::2], strict=False))
+
+    def _put_back(self, tree: str, changes: list[tuple[str, str]]) -> None:
+        added: list[str] = []
+        back: list[str] = []
+        for status, path in changes:
+            (added if status == "A" else back).append(path)
+        root = self.path.resolve()
+        for path in added:
+            target = self.path / path
+            with contextlib.suppress(FileNotFoundError):
+                target.unlink()
+            # Directories the checks made for their files go with them.
+            parent = target.parent
+            while parent.resolve() != root:
+                try:
+                    parent.rmdir()
+                except OSError:
+                    break
+                parent = parent.parent
+        if back:
+            _git(
+                self.path,
+                "restore",
+                f"--source={tree}",
+                "--worktree",
+                "--pathspec-from-file=-",
+                "--pathspec-file-nul",
+                env={"GIT_LITERAL_PATHSPECS": "1"},
+                stdin="\0".join(back),
+            )
+
+    def _excluded(self) -> list[str]:
+        """Pathspecs of the nested neighbours: never part of the task's work."""
+        return [f":(exclude,literal){path}" for path in self._nested().values()]
+
     def commit(
         self,
         summary: str = "",
         *,
         committer: tuple[str, str] = DEFAULT_COMMITTER,
+        allow_empty: bool = False,
     ) -> str | None:
         """Commit everything in the copy as evidence. None if nothing changed.
 
@@ -324,11 +753,56 @@ class Workspace:
         branch that moved past ``base_commit``. That IS the evidence — the
         daemon must publish it, not report "no changes" and leave the branch
         stranded on the runner (seen on the first BidOps smoke run).
+
+        With ``allow_empty`` a clean copy still gets a commit of its own:
+        the result of a run that continued saved WIP and added nothing is
+        not that WIP (FR-022).
         """
-        _git(self.path, "add", "-A")
-        if not self.is_dirty:
+        self._stage_all()
+        if not allow_empty and not _git(self.path, "diff", "--cached", "--name-only", check=False):
             head = self.head()
             return head if head != self.base_commit else None
+        self._commit_staged(summary, committer, allow_empty=allow_empty)
+        return self.head()
+
+    def commit_wip(
+        self, summary: str, *, committer: tuple[str, str] = DEFAULT_COMMITTER
+    ) -> str | None:
+        """Commit what the copy holds, uncommitted, as WIP; None if it holds nothing.
+
+        Unlike :meth:`commit`, it never answers with a commit already there:
+        a WIP record names only a commit made here. A moved submodule pointer
+        is left out: the pin is the superproject's business, and a WIP that
+        moved it would be taken for a decision nobody made.
+        """
+        self._stage_all()
+        # "-z --raw": ":<old mode> <new mode> <old> <new> <status>\0<path>\0" per entry.
+        tokens = _git(self.path, "diff", "--cached", "--raw", "--no-renames", "-z").split("\0")
+        gitlinks = [
+            path
+            for meta, path in zip(tokens[::2], tokens[1::2], strict=False)
+            if _GITLINK_MODE in meta.lstrip(":").split()[:2]
+        ]
+        if gitlinks:
+            _git(self.path, "reset", "-q", "--", *gitlinks)
+        staged = subprocess.run(
+            ["git", "diff", "--cached", "--quiet"], cwd=self.path, check=False
+        ).returncode
+        if staged == 0:
+            return None
+        self._commit_staged(summary, committer)
+        return self.head()
+
+    def _stage_all(self) -> None:
+        # Nested neighbours stay out: the pointer on the branch is the base's
+        # (checked by ``neighbour_changes``), while the checkout under it may
+        # be of an older pin when the task merged its base during the run.
+        excluded = self._excluded()
+        _git(self.path, "add", "-A", *(["--", ".", *excluded] if excluded else []))
+
+    def _commit_staged(
+        self, summary: str, committer: tuple[str, str], *, allow_empty: bool = False
+    ) -> None:
         name, email = committer
         message = summary.strip() or f"{self.key}: automated execution"
         if self.key not in message:
@@ -341,10 +815,10 @@ class Workspace:
             f"user.email={email}",
             "commit",
             "--no-verify",
+            *(["--allow-empty"] if allow_empty else []),
             "-m",
             message,
         )
-        return self.head()
 
     def push(self, remote: str = "origin") -> bool:
         """Publish the task branch so the work can be reviewed in the forge.
@@ -358,13 +832,11 @@ class Workspace:
         commit is already the evidence, so a forge that is unreachable must not
         turn finished work into a failed run.
         """
-        result = subprocess.run(
-            ["git", "push", remote, f"refs/heads/{self.branch}:refs/heads/{self.branch}"],
-            cwd=self.path,
-            capture_output=True,
-            text=True,
-            check=False,
+        result = _git_remote(
+            self.path, "push", remote, f"refs/heads/{self.branch}:refs/heads/{self.branch}"
         )
+        if result is None:
+            return False
         if result.returncode != 0:
             # stderr may name the remote URL and local paths, so it stays in the
             # runner's log and never travels to the Control Plane.
@@ -411,6 +883,11 @@ class ExecutionWorkspacePool:
         superproject: Path | str | None = None,
         superproject_ref: str = "HEAD",
         superproject_remote: str = "",
+        repository_key: str = "",
+        publish_url: str = "",
+        conventions: ConventionsReader | None = None,
+        neighbour_mirrors: Path | str | None = None,
+        base_fetch_timeout: float = BASE_FETCH_TIMEOUT,
     ) -> None:
         self.origin = Path(origin).expanduser().resolve()
         self.root = Path(root).expanduser().resolve()
@@ -422,6 +899,10 @@ class ExecutionWorkspacePool:
         # needs a credential on the runner and because not every deployment
         # wants a branch per attempt in its forge.
         self.push_remote = push_remote
+        # A forge that hangs must not hang the start or the end of a run: a
+        # fetch of the base past this is a failed one, and the copy goes on
+        # with the ref it has (``_track_base``).
+        self.base_fetch_timeout = base_fetch_timeout
         # The working copy's own directory name inside the container. It
         # matters when a neighbour's path dependency is written relative to it,
         # so it defaults to the repository name rather than something generic.
@@ -432,6 +913,22 @@ class ExecutionWorkspacePool:
         self.superproject = Path(superproject).expanduser().resolve() if superproject else None
         self.superproject_ref = superproject_ref
         self.superproject_remote = superproject_remote
+        # The catalog key this pool cuts copies of, written to the checkpoint
+        # (``catalog.py``); empty for a pool of the one-repository form.
+        self.repository_key = repository_key
+        # The address branches are meant to go to, as the configuration names
+        # it (the catalog entry's url, ``workingCopy.repository``): the push
+        # target is checked against it before every push (``publish.py``).
+        # Empty — nothing to check against but the remote itself.
+        self.publish_url = publish_url
+        # A catalog pool reads its neighbours from ``runner.yaml`` at the base
+        # revision of each task (``conventions.py``) instead of ``neighbours``;
+        # they are cut from mirrors under ``neighbour_mirrors``, which is also
+        # how their copies are told from anything else in a container.
+        self.conventions = conventions
+        self.neighbour_mirrors = (
+            Path(neighbour_mirrors).expanduser().resolve() if neighbour_mirrors else None
+        )
         if self.neighbours and self.superproject is None:
             # Placing neighbours at "whatever their main is" is the failure this
             # exists to prevent, so it is refused at construction rather than
@@ -460,6 +957,211 @@ class ExecutionWorkspacePool:
             return None
         url = _git(self.origin, "remote", "get-url", self.push_remote, check=False)
         return public_remote_url(url) if url else None
+
+    def push_urls(self) -> list[str]:
+        """Every address ``git push`` to the push remote goes to, as git resolves them.
+
+        A remote may have several push URLs, and git pushes to each of them:
+        checking only the first would let the others through.
+        """
+        if not self.push_remote:
+            return []
+        out = _git(
+            self.origin, "remote", "get-url", "--push", "--all", self.push_remote, check=False
+        )
+        return [line.strip() for line in out.splitlines() if line.strip()]
+
+    def is_task_branch(self, branch: str) -> bool:
+        """Whether ``branch`` is a task branch this pool cuts: prefix and a valid key."""
+        prefix = self.branch_prefix
+        return (
+            bool(prefix)
+            and branch.startswith(prefix)
+            and bool(_KEY_RE.match(branch[len(prefix) :]))
+        )
+
+    def branch_head(self, branch: str) -> str | None:
+        """The commit ``branch`` points at in the mirror; None if there is no such branch."""
+        return (
+            _git(
+                self.origin,
+                "rev-parse",
+                "--verify",
+                "--quiet",
+                f"refs/heads/{branch}^{{commit}}",
+                check=False,
+            )
+            or None
+        )
+
+    def push_branch(
+        self, branch: str, commit: str | None = None, *, urls: Sequence[str] | None = None
+    ) -> str | None:
+        """Push ``branch`` of the mirror; None when it went, else why not. Never forced.
+
+        The same limits as :meth:`Workspace.push`; pushing from the mirror
+        rather than a copy lets a branch whose copy is gone be published.
+        Only a task branch is pushed (:meth:`is_task_branch`), whoever asks.
+        ``commit`` — push exactly that commit to the branch (the one the
+        target check was asked about), not whatever the branch holds by
+        then. ``urls`` — push to exactly these addresses, one by one, rather
+        than to the push remote by name: the mirror's config is shared with
+        the executor's copies, and a push URL read at the check may be
+        another by the push. Callers go through ``publish.publish_branch``,
+        which checks the target first. The reason is git's own words and may
+        name addresses: callers redact it before recording it.
+        """
+        if not self.is_task_branch(branch):
+            logger.warning("refusing to push %r: not a task branch", branch)
+            return "not a task branch"
+        _check_branch_name(branch)
+        ref = f"refs/heads/{branch}"
+        targets = [self.push_remote] if urls is None else list(urls)
+        if not targets or not all(targets):
+            return "no address to push to"
+        for target in targets:
+            result = _git_remote(self.origin, "push", target, f"{commit or ref}:{ref}")
+            if result is None:
+                return f"git push did not finish in {REMOTE_TIMEOUT_SECONDS:g}s"
+            if result.returncode != 0:
+                error = result.stderr.strip()
+                # stderr may name the remote URL and local paths: the log only.
+                logger.warning("push of %s failed: %s", branch, error[:300])
+                lines = [line.strip() for line in error.splitlines() if line.strip()]
+                telling = [x for x in lines if x.startswith(("fatal:", "!", "remote: error"))]
+                return (telling or lines or [f"git push exited {result.returncode}"])[0]
+        return None
+
+    def published_state(self, branch: str) -> PublishedState:
+        """How the published ``branch`` relates to this mirror's, fetched now.
+
+        ``unreachable`` — the forge did not answer; ``absent`` — not
+        published; ``same`` — published as it is here; ``behind`` — a push
+        would fast-forward it; ``diverged`` — it has commits this mirror does
+        not (rewritten, or continued elsewhere): a push can never succeed.
+
+        A remote may push to several addresses (:meth:`push_urls`), and a
+        push may have gone to some of them only: each is asked, and the
+        branch is ``same`` only when it is the same at every one. The fetch
+        address is fetched as before; any other is asked with ``ls-remote``.
+        """
+        if not self.push_remote:
+            return "absent"
+        fetch_url = _git(self.origin, "remote", "get-url", self.push_remote, check=False)
+        mine = _git(
+            self.origin, "rev-parse", "--verify", "--quiet", f"refs/heads/{branch}", check=False
+        )
+        states: list[PublishedState] = []
+        for url in self.push_urls() or [fetch_url]:
+            if url == fetch_url:
+                fetched, theirs = self._fetch_published(branch)
+            else:
+                fetched, theirs = self._list_published(url, branch)
+            if fetched == "unreachable":
+                return "unreachable"
+            if fetched != "fetched" or theirs is None:
+                states.append("absent")
+            elif mine == theirs:
+                states.append("same")
+            elif mine and self._is_ancestor(theirs, mine):
+                states.append("behind")
+            else:
+                return "diverged"
+        if all(state == "same" for state in states):
+            return "same"
+        return "behind" if "behind" in states else "absent"
+
+    def _fetch_published(self, branch: str) -> tuple[str, str | None]:
+        """Fetch the published ``branch`` into its remote-tracking ref.
+
+        ``("fetched", sha)``, ``("absent", None)`` when the forge has no such
+        branch, ``("unreachable", None)`` when it could not be asked.
+        """
+        if not self.push_remote:
+            return "absent", None
+        local = f"refs/heads/{branch}"
+        tracking = f"refs/remotes/{self.push_remote}/{branch}"
+        # At acquisition too, where a hung forge must not hold the copy
+        # longer than the base fetch may (``base_fetch_timeout``).
+        result = _git_remote(
+            self.origin,
+            "fetch",
+            "--quiet",
+            "--no-write-fetch-head",
+            self.push_remote,
+            f"+{local}:{tracking}",
+            timeout=min(self.base_fetch_timeout, REMOTE_TIMEOUT_SECONDS),
+        )
+        if result is None:
+            return "unreachable", None
+        if result.returncode != 0:
+            if "couldn't find remote ref" in result.stderr:
+                return "absent", None
+            return "unreachable", None
+        return "fetched", _git(self.origin, "rev-parse", tracking)
+
+    def _list_published(self, url: str, branch: str) -> tuple[str, str | None]:
+        """Ask ``url`` where ``branch`` is, without fetching; as :meth:`_fetch_published`.
+
+        A commit the mirror does not have is still named: it is not an
+        ancestor of the local branch, and that is what the caller asks.
+        """
+        ref = f"refs/heads/{branch}"
+        if url.startswith("-"):
+            return "unreachable", None  # an option, not an address
+        result = _git_remote(
+            self.origin,
+            "ls-remote",
+            "--quiet",
+            url,
+            ref,
+            timeout=min(self.base_fetch_timeout, REMOTE_TIMEOUT_SECONDS),
+        )
+        if result is None or result.returncode != 0:
+            return "unreachable", None
+        for line in result.stdout.splitlines():
+            sha, _, name = line.partition("\t")
+            if name.strip() == ref:
+                return "fetched", sha.strip()
+        return "absent", None
+
+    def has_copy(self, key: str) -> bool:
+        """Whether this pool holds a working copy of task ``key`` on this host."""
+        return bool(_KEY_RE.match(key)) and (self.path_for(key) / ".git").exists()
+
+    def reopen(self, key: str) -> Workspace | None:
+        """Take the copy of ``key`` as it is, without refreshing anything; None if absent.
+
+        For a copy whose run is being closed (restart recovery): its work is
+        saved and published, not continued, so no base is fetched and no
+        neighbour is placed. ``base_commit`` is where the branch was cut, so
+        :meth:`Workspace.commit` sees every commit of the task's own.
+        :class:`WorkspaceBusyError` if another process holds it. Give it back
+        with :meth:`release` (outcome ``failed``: the copy stays).
+        """
+        if not self.has_copy(key):
+            return None
+        branch = self.branch_for(key)
+        path = self.path_for(key)
+        lock_fd = self._lock(key)
+        try:
+            self._verify(path, branch)
+            base_branch, base_commit = self._recorded_base(branch)
+            head = _git(path, "rev-parse", "HEAD")
+        except Exception:
+            os.close(lock_fd)
+            raise
+        return Workspace(
+            key=key,
+            branch=branch,
+            path=path,
+            base_commit=base_commit or head,
+            reused=True,
+            base_branch=base_branch,
+            repository_key=self.repository_key,
+            base_revision=base_commit,
+            _lock_fd=lock_fd,
+        )
 
     @property
     def base_branch(self) -> str:
@@ -508,8 +1210,26 @@ class ExecutionWorkspacePool:
                 self._verify(path, branch)
             else:
                 self._create(path, branch, base_ref, wanted)
-            neighbours = self._place_neighbours(container)
+            self._catch_up(path, branch)
+            conventions: Conventions | None = None
+            placed: tuple[tuple[str, Path, str], ...] = ()
             base = _git(path, "rev-parse", "HEAD")
+            if self.conventions is not None:
+                conventions_base = self._base_of(branch, base_ref)
+                conventions = self.conventions(self.origin, conventions_base, base, base_ref)
+                placed = self._place_pinned(
+                    path if conventions.inside else container, conventions.neighbours
+                )
+                neighbours = {n.name: n.revision for n in conventions.neighbours}
+            else:
+                neighbours = self._place_neighbours(container)
+                # Read only when checks run (``checks.py``); a base that
+                # cannot be told blocks them there, not every run here.
+                try:
+                    conventions_base = self._base_of(branch, base_ref)
+                except WorkspaceError:
+                    conventions_base = ""
+            _, base_revision = self._recorded_base(branch)
         except Exception:
             os.close(lock_fd)
             raise
@@ -521,6 +1241,13 @@ class ExecutionWorkspacePool:
             reused=reused,
             neighbours=neighbours,
             base_branch=wanted,
+            repository_key=self.repository_key,
+            base_revision=base_revision,
+            conventions=conventions,
+            conventions_base=conventions_base,
+            placed=placed,
+            base_refs=self._base_refs(wanted),
+            refresh_base=functools.partial(self._track_base, wanted),
             _lock_fd=lock_fd,
         )
 
@@ -529,16 +1256,60 @@ class ExecutionWorkspacePool:
 
         A failed or suspended run keeps its copy verbatim — that is the state a
         later attempt resumes from. A successful one may drop the working copy,
-        but the branch always stays: the commit is the evidence.
+        but the branch always stays: the commit is the evidence. The disk
+        budget never prunes a copy whose branch waits to be published again
+        (:meth:`pinned_tasks`).
         """
         try:
             if outcome == "succeeded" and not self.keep_on_success:
                 self._remove(workspace)
-            self._enforce_disk_budget(keep=workspace.key)
+            self._enforce_disk_budget(keep={workspace.key})
         finally:
             if workspace._lock_fd is not None:
                 os.close(workspace._lock_fd)
                 workspace._lock_fd = None
+
+    def discard(self, key: str) -> str | None:
+        """Remove a task's copy and branch unless they hold work; the work, if any.
+
+        For a task that moved to another repository of the catalog
+        (``catalog.py``): a copy nobody wrote to and a branch without commits
+        of its own go, anything else stays verbatim and is described in the
+        return value — this module never destroys work. The branch in the
+        forge is not touched.
+        """
+        if not _KEY_RE.match(key):
+            raise WorkspaceError(f"unsafe workspace key: {key!r}")
+        branch = self.branch_for(key)
+        path = self.path_for(key)
+        lock_fd = self._lock(key)
+        try:
+            _git(self.origin, "worktree", "prune")
+            if path.exists() and _git(path, "status", "--porcelain", check=False):
+                return "uncommitted changes"
+            has_branch = self._has_ref(f"refs/heads/{branch}")
+            if has_branch:
+                _, base_commit = self._recorded_base(branch)
+                own = self._own_commits(branch, base_commit)
+                if own:
+                    return f"{own} commit(s) of its own on {branch}"
+            stray = self._stray_commits(path)
+            if stray:
+                return f"{stray} commit(s) on a detached HEAD that no branch has"
+            if self._stashed(branch):
+                # A stash survives the copy in the shared refs/stash, so it is
+                # not lost; still, a person should know it is there.
+                logger.warning("%s: a stash made on %s stays behind", key, branch)
+            self._drop_nested(path)
+            if path.exists():
+                # Clean (checked above): what is left is ignored files.
+                _git(self.origin, "worktree", "remove", "--force", str(path))
+            self._drop_neighbours(self.container_for(key))
+            if has_branch:
+                _git(self.origin, "branch", "-D", branch)
+            return None
+        finally:
+            os.close(lock_fd)
 
     # -- internals -------------------------------------------------------------
 
@@ -568,7 +1339,10 @@ class ExecutionWorkspacePool:
         branch, and that ref is what we branch from. Updating the local branch
         directly is what git refuses when a working copy has it checked out —
         true for a plain repository, and true on a runner the moment someone
-        opens a copy of the base for themselves.
+        opens a copy of the base for themselves. The tracking ref is also what
+        tells a merge of the base from a change of the task's own
+        (``Workspace.base_refs``): a task that pulled its base with
+        ``git pull`` or merged ``FETCH_HEAD`` leaves no ref of it behind.
 
         Best-effort on purpose. A runner may have no upstream at all, and an
         unreachable forge must not stop work that can proceed from what is
@@ -580,23 +1354,37 @@ class ExecutionWorkspacePool:
             return self._refresh_task_base(base_branch)
         if not self.push_remote:
             return self.base_ref
-        branch = self.base_branch
-        result = subprocess.run(
-            ["git", "fetch", "--quiet", self.push_remote, branch],
-            cwd=self.origin,
-            capture_output=True,
-            text=True,
-            check=False,
-        )
+        return self._track_base(self.base_branch) or self.base_ref
+
+    def _track_base(self, base_branch: str) -> str | None:
+        """Fetch the base branch into its remote-tracking ref; the ref, or None.
+
+        Best-effort: a failure is logged and leaves the ref where it was. Only
+        the tracking ref moves — never a branch, least of all a task's.
+        """
+        if not self.push_remote:
+            return None
+        result = self._fetch_base(base_branch)
         if result.returncode != 0:
             logger.warning(
                 "could not refresh %s from %s: %s",
-                branch,
+                base_branch,
                 self.push_remote,
                 redact_local_paths(result.stderr.strip())[:200],
             )
-            return self.base_ref
-        return "FETCH_HEAD"
+            return None
+        return self._tracking_ref(base_branch)
+
+    def _tracking_ref(self, base_branch: str) -> str:
+        return f"refs/remotes/{self.push_remote}/{base_branch}"
+
+    def _fetch_base(self, base_branch: str) -> subprocess.CompletedProcess[str]:
+        refspec = f"+refs/heads/{base_branch}:{self._tracking_ref(base_branch)}"
+        return _run_bounded(
+            ["git", "fetch", "--quiet", self.push_remote, refspec],
+            self.origin,
+            self.base_fetch_timeout,
+        )
 
     def _refresh_task_base(self, base_branch: str) -> str:
         """Fetch a task's own base branch and return the ref to cut from.
@@ -616,14 +1404,8 @@ class ExecutionWorkspacePool:
             if not self._has_ref(local):
                 raise WorkspaceError(f"base branch {base_branch} does not exist in the repository")
             return local
-        tracking = f"refs/remotes/{self.push_remote}/{base_branch}"
-        result = subprocess.run(
-            ["git", "fetch", "--quiet", self.push_remote, f"+{local}:{tracking}"],
-            cwd=self.origin,
-            capture_output=True,
-            text=True,
-            check=False,
-        )
+        tracking = self._tracking_ref(base_branch)
+        result = self._fetch_base(base_branch)
         if result.returncode == 0:
             return tracking
         stderr = result.stderr.strip()
@@ -687,7 +1469,15 @@ class ExecutionWorkspacePool:
                 f"{branch} was cut from {recorded}, the task now asks for {wanted}, "
                 f"and the branch holds {own} commit(s) of its own; move them by hand"
             )
+        stray = self._stray_commits(path)
+        if stray:
+            raise WorkspaceError(
+                f"{branch} was cut from {recorded}, the task now asks for {wanted}, "
+                f"and the copy's detached HEAD holds {stray} commit(s) no branch has; "
+                "move them by hand"
+            )
         logger.info("recreating %s: cut from %s, task now asks for %s", branch, recorded, wanted)
+        self._drop_nested(path)
         if path.exists():
             # The copy is clean (checked above): whatever is left is ignored
             # files, caches and a .venv, which --force may drop.
@@ -705,6 +1495,36 @@ class ExecutionWorkspacePool:
             spec = [f"refs/heads/{branch}", "--not", f"--exclude={branch}", "--branches"]
             spec += ["--tags", "--remotes"]
         return int(_git(self.origin, "rev-list", "--count", *spec) or "0")
+
+    def _stray_commits(self, path: Path) -> int:
+        """Commits the copy's HEAD reaches that no branch, tag or remote does.
+
+        Work committed on a detached HEAD is on no branch: removing the copy
+        removes its HEAD and reflog with it, and the commits are gone. The
+        task branch counts as a ref here; its own commits are counted apart.
+        """
+        if not path.exists():
+            return 0
+        count = _git(
+            path,
+            "rev-list",
+            "--count",
+            "HEAD",
+            "--not",
+            "--branches",
+            "--tags",
+            "--remotes",
+            check=False,
+        )
+        return int(count or "0")
+
+    def _stashed(self, branch: str) -> bool:
+        """Whether a stash entry was made on ``branch`` (``On``/``WIP on <branch>:``)."""
+        # ``stash list`` wants a work tree; the mirror is bare, refs/stash is shared.
+        entries = _git(self.origin, "log", "-g", "--format=%gs", "refs/stash", check=False)
+        return any(
+            line.startswith((f"On {branch}:", f"WIP on {branch}:")) for line in entries.splitlines()
+        )
 
     def _adopt_flat_copy(self, container: Path, path: Path) -> None:
         """Move a copy made before containers existed into the new layout.
@@ -774,7 +1594,9 @@ class ExecutionWorkspacePool:
         if probe.returncode == 0:
             return
         result = subprocess.run(
-            ["git", "fetch", "--quiet", "origin", "+refs/heads/*:refs/heads/*"],
+            # Into remote-tracking refs, never over branches: the mirror may be
+            # a pool's too, and its task branches are not the forge's to move.
+            ["git", "fetch", "--quiet", "origin", "+refs/heads/*:refs/remotes/origin/*"],
             cwd=neighbour.origin,
             capture_output=True,
             text=True,
@@ -805,6 +1627,101 @@ class ExecutionWorkspacePool:
             logger.info("keeping local changes in %s; left off the pinned revision", neighbour.path)
             return
         _git(dest, "checkout", "--quiet", "--detach", revision)
+
+    def _base_refs(self, base_branch: str) -> tuple[str, ...]:
+        """Refs of the base branch in the copy: the forge's copy of it, then its own.
+
+        Not filtered by what exists now: the task may fetch its base during
+        the run, and ``Workspace.refresh_base`` fetches it again before the
+        pointers are checked.
+        """
+        refs = [f"refs/heads/{base_branch}"]
+        if self.push_remote:
+            refs.insert(0, f"refs/remotes/{self.push_remote}/{base_branch}")
+        return tuple(refs)
+
+    def _base_of(self, branch: str, base_ref: str) -> str:
+        """The commit a catalog run reads its conventions from: the task's base.
+
+        The point the task branch was cut from, as recorded; for a branch
+        without the record, the point it shares with the base; for a branch
+        that does not exist yet, the base itself. Never the branch's own
+        head: a change of ``runner.yaml`` on the task branch takes effect only
+        once it is reviewed and merged (FR-009).
+        """
+        _, recorded = self._recorded_base(branch)
+        if recorded:
+            return recorded
+        fork = _git(self.origin, "merge-base", f"refs/heads/{branch}", base_ref, check=False)
+        return fork or _git(self.origin, "rev-parse", "--verify", f"{base_ref}^{{commit}}")
+
+    def _place_pinned(
+        self, root: Path, neighbours: Sequence[PinnedNeighbour]
+    ) -> tuple[tuple[str, Path, str], ...]:
+        """Put each neighbour of a catalog run at its pinned revision under ``root``.
+
+        A neighbour left with changes, or with commits no ref of its mirror
+        has, by an earlier run is not moved and not worked beside:
+        :class:`WorkspaceBlocked` with :data:`NEIGHBOUR_MODIFIED`, and a
+        person decides what becomes of that work.
+        """
+        placed = []
+        for neighbour in neighbours:
+            dest = root / neighbour.path
+            self._place_one(dest, neighbour)
+            placed.append((neighbour.name, dest, neighbour.revision))
+        return tuple(placed)
+
+    def _place_one(self, dest: Path, neighbour: PinnedNeighbour) -> None:
+        if (dest / ".git").exists():
+            owner = self._neighbour_owner(dest)
+            dirty = _git(dest, "status", "--porcelain", check=False)
+            stray = _git(
+                dest,
+                "rev-list",
+                "--count",
+                "HEAD",
+                "--not",
+                "--branches",
+                "--tags",
+                "--remotes",
+                check=False,
+            )
+            if dirty or (stray and stray != "0"):
+                what = "changed or new files" if dirty else f"{stray} commit(s) of its own"
+                raise WorkspaceBlocked(
+                    NEIGHBOUR_MODIFIED,
+                    f"neighbour {neighbour.name} ({neighbour.path}) holds {what}, and "
+                    "neighbours are read-only; move the change to a task of that repository "
+                    "or drop it, then return the task",
+                )
+            if owner == neighbour.origin.resolve():
+                if _git(dest, "rev-parse", "HEAD", check=False) != neighbour.revision:
+                    _git(dest, "checkout", "--quiet", "--detach", neighbour.revision)
+                _keep_pin(neighbour)
+                prune_pins(neighbour.origin)
+                return
+            if not (dest / ".git").is_file():
+                raise WorkspaceBlocked(
+                    NEIGHBOUR_MODIFIED,
+                    f"{neighbour.path} is a repository of its own, not a copy of neighbour "
+                    f"{neighbour.name}; move it away, then return the task",
+                )
+            # Clean, and cut from another repository (a copy of the
+            # one-repository form, or another mirror): made again below.
+            common = _git(dest, "rev-parse", "--git-common-dir")
+            _git((dest / common).resolve(), "worktree", "remove", "--force", str(dest))
+        elif dest.exists() and any(dest.iterdir()):
+            raise WorkspaceBlocked(
+                NEIGHBOUR_MODIFIED,
+                f"{neighbour.path} holds files that are no copy of neighbour {neighbour.name}; "
+                "move them away, then return the task",
+            )
+        _git(neighbour.origin, "worktree", "prune")
+        # An empty directory is what a checkout leaves for a submodule.
+        _git(neighbour.origin, "worktree", "add", "--detach", str(dest), neighbour.revision)
+        _keep_pin(neighbour)
+        prune_pins(neighbour.origin)
 
     def _refresh_superproject(self) -> str:
         """Update the pin source, best-effort, and return the ref to read.
@@ -868,20 +1785,16 @@ class ExecutionWorkspacePool:
             return False
         local = f"refs/heads/{branch}"
         # FETCH_HEAD may be the base this copy is about to be cut from.
-        result = subprocess.run(
-            [
-                "git",
-                "fetch",
-                "--quiet",
-                "--no-write-fetch-head",
-                self.push_remote,
-                f"{local}:{local}",
-            ],
-            cwd=self.origin,
-            capture_output=True,
-            text=True,
-            check=False,
+        result = _git_remote(
+            self.origin,
+            "fetch",
+            "--quiet",
+            "--no-write-fetch-head",
+            self.push_remote,
+            f"{local}:{local}",
         )
+        if result is None:
+            return False
         if result.returncode != 0:
             stderr = result.stderr.strip()
             if "couldn't find remote ref" not in stderr:
@@ -902,6 +1815,57 @@ class ExecutionWorkspacePool:
         logger.info("continuing %s as published in %s", branch, self.push_remote)
         return True
 
+    def _catch_up(self, path: Path, branch: str) -> None:
+        """Move the task branch to its published head when that only adds to it.
+
+        Replicas share the forge, not their mirrors: a task this replica
+        worked before may have gone on elsewhere — saved as WIP before a
+        ``blocked`` status, or returned by its verification — and its branch
+        here is behind. Resuming from the old head would lose that work and
+        fork a line the never-forced push cannot publish. So the published
+        branch is fetched and, when the local one is its ancestor, the local
+        one is fast-forwarded (a copy with uncommitted changes is not moved).
+        A branch that diverged is left as it is, with a warning: that is a
+        person's business. Best-effort: an unreachable forge changes nothing.
+        """
+        if not self.push_remote:
+            return
+        state, theirs = self._fetch_published(branch)
+        if state != "fetched" or theirs is None:
+            return  # not published, or the forge is unreachable
+        local = f"refs/heads/{branch}"
+        mine = _git(self.origin, "rev-parse", local)
+        if mine == theirs or self._is_ancestor(theirs, mine):
+            return  # the same, or this replica is ahead (its push is pending)
+        if not self._is_ancestor(mine, theirs):
+            logger.warning(
+                "%s here and in %s have diverged; continuing the local one",
+                branch,
+                self.push_remote,
+            )
+            return
+        if path.exists():
+            if _git(path, "status", "--porcelain"):
+                logger.warning(
+                    "%s is behind %s, but the copy holds uncommitted changes; not moved",
+                    branch,
+                    self.push_remote,
+                )
+                return
+            _git(path, "merge", "--ff-only", "--quiet", theirs)
+        else:
+            _git(self.origin, "update-ref", local, theirs, mine)
+        logger.info("%s caught up with %s (%s)", branch, self.push_remote, theirs[:12])
+
+    def _is_ancestor(self, ancestor: str, descendant: str) -> bool:
+        result = subprocess.run(
+            ["git", "merge-base", "--is-ancestor", ancestor, descendant],
+            cwd=self.origin,
+            capture_output=True,
+            check=False,
+        )
+        return result.returncode == 0
+
     def _verify(self, path: Path, branch: str) -> None:
         if not (path / ".git").exists():
             raise WorkspaceError(f"{path.name} exists but is not a git worktree")
@@ -921,6 +1885,7 @@ class ExecutionWorkspacePool:
         # ignored files, and on a runner that leaves ~130 MB per finished task
         # behind until the disk budget prunes it. Forcing here destroys nothing
         # that could be evidence.
+        self._drop_nested(workspace.path)
         _git(self.origin, "worktree", "remove", "--force", str(workspace.path), check=False)
         if workspace.path.exists():
             logger.info("keeping %s: git declined to remove the worktree", workspace.key)
@@ -939,28 +1904,113 @@ class ExecutionWorkspacePool:
             dest = container / neighbour.path
             if dest.exists():
                 _git(neighbour.origin, "worktree", "remove", str(dest), check=False)
+        if self.neighbour_mirrors is not None and container.is_dir():
+            # Placed by runner.yaml of some base revision: what is there is
+            # found on disk, so a copy made before a restart goes as well.
+            for dest in container.iterdir():
+                if dest.name != self.repo_dir:
+                    self._drop_placed(dest)
         with contextlib.suppress(OSError):
             container.rmdir()  # only when nothing else is left in it
 
-    def _enforce_disk_budget(self, *, keep: str) -> None:
-        """Bound how much disk idle copies may hold. Branches are never touched."""
-        candidates = sorted(self._idle_workspaces(keep=keep), key=lambda item: item[1])
+    def _drop_nested(self, copy: Path) -> None:
+        """Remove neighbours placed inside ``copy`` (submodules of a superproject task).
+
+        Before the copy itself: removing the copy would take their files and
+        leave their mirrors with records of worktrees that no longer exist.
+        """
+        if self.neighbour_mirrors is None or not (copy / ".git").exists():
+            return
+        for line in _git(copy, "ls-files", "--stage", check=False).splitlines():
+            mode, _, rest = line.partition(" ")
+            if mode == _GITLINK_MODE:
+                self._drop_placed(copy / rest.split("\t", 1)[-1])
+
+    def _drop_placed(self, dest: Path) -> None:
+        """Remove ``dest`` if it is a clean copy cut from a neighbour mirror."""
+        owner = self._neighbour_owner(dest)
+        if owner is not None:
+            # Without --force: a neighbour with changes stays for a person.
+            _git(owner, "worktree", "remove", str(dest), check=False)
+            prune_pins(owner)
+
+    def _neighbour_owner(self, dest: Path) -> Path | None:
+        """The neighbour mirror ``dest`` is a worktree of; None if it is none of them."""
+        if self.neighbour_mirrors is None or not (dest / ".git").is_file():
+            return None
+        common = _git(dest, "rev-parse", "--git-common-dir", check=False)
+        if not common:
+            return None
+        owner = (dest / common).resolve()
+        return owner if owner.parent == self.neighbour_mirrors else None
+
+    def _enforce_disk_budget(self, *, keep: Collection[str]) -> None:
+        """Bound how much disk idle copies may hold. Branches are never touched.
+
+        The copies named in ``keep`` are neither pruned nor counted, and
+        neither are those of :meth:`pinned_tasks`: they are read here, so no
+        caller of :meth:`release` can forget them. A list that cannot be
+        read prunes nothing this time.
+        """
+        pinned = self.pinned_tasks()
+        if pinned is None:
+            return
+        candidates = sorted(self._idle_workspaces(keep={*keep, *pinned}), key=lambda item: item[1])
         excess = len(candidates) - self.max_workspaces
         for container, _ in candidates[: max(0, excess)]:
+            self._drop_nested(container / self.repo_dir)
             _git(self.origin, "worktree", "remove", str(container / self.repo_dir), check=False)
             if (container / self.repo_dir).exists():
                 continue
             self._drop_neighbours(container)
             logger.info("pruned idle workspace %s", container.name)
 
-    def _idle_workspaces(self, *, keep: str) -> Iterable[tuple[Path, float]]:
+    def pinned_tasks(self) -> set[str] | None:
+        """Tasks of this pool whose branches wait on the unpublished list; None if unreadable.
+
+        The list lies in the root of the replica's copies (``publish.py``).
+        An entry is pushed again only while its task has a copy here, and a
+        copy pruned under it would drop the entry without a trace in the core.
+        """
+        # publish.py builds on this module: imported when first needed.
+        from control_plane_agent.publish import UnpublishedLedger
+
+        try:
+            entries = UnpublishedLedger(self.root).read()
+        except OSError as exc:
+            logger.warning("the unpublished list cannot be locked (%s); no copy pruned", exc)
+            return None
+        if entries is None:
+            # A list that is there but not parsed: which copies wait is unknown.
+            logger.warning("the unpublished list cannot be parsed; no copy pruned")
+            return None
+        return {
+            e.task
+            for e in entries
+            if e.repository_key == self.repository_key and self.branch_for(e.task) == e.branch
+        }
+
+    def _owns(self, copy: Path) -> bool:
+        """Whether ``copy`` is a worktree of this pool's origin.
+
+        Pools of a catalog share one root (``catalog.py``), and a directory
+        named like this pool's copy may be a neighbour placed for another
+        repository's task.
+        """
+        common = _git(copy, "rev-parse", "--git-common-dir", check=False)
+        if not common:
+            return False
+        resolved = (copy / common).resolve()
+        return resolved in (self.origin, self.origin / ".git")
+
+    def _idle_workspaces(self, *, keep: Collection[str]) -> Iterable[tuple[Path, float]]:
         import fcntl
 
         for path in self.root.iterdir():
-            if not path.is_dir() or path.name in {".locks", keep}:
+            if not path.is_dir() or path.name == ".locks" or path.name in keep:
                 continue
             copy = path / self.repo_dir
-            if not copy.is_dir():
+            if not copy.is_dir() or not self._owns(copy):
                 continue  # not a container of ours: leave it alone
             if _git(copy, "status", "--porcelain", check=False):
                 continue  # holds uncommitted work

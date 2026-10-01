@@ -31,7 +31,7 @@ from pathlib import Path
 from typing import Any
 
 from control_plane_agent.workspace import redact_local_paths
-from control_plane_client import ControlPlaneClient
+from control_plane_client import ControlPlaneClient, ControlPlaneError
 
 logger = logging.getLogger("control_plane_agent.blocked")
 
@@ -43,9 +43,14 @@ ENV_BLOCKED_FILE = "CONTROL_PLANE_BLOCKED_FILE"
 BLOCKED_CATEGORY = "blocked"
 MAX_REASON_CHARS = 2000
 NO_REASON = "the executor gave no reason"
-#: The first words of the daemon's comment on a blocked task; the next run of
-#: the same executor leaves it out of the prompt (``comments.py``).
-BLOCKED_COMMENT_PREFIX = "The executor stopped without doing the work"
+#: The first words of the daemon's comment on a blocked task
+#: (:func:`settle_blocked`); the next run of the same executor leaves it out of
+#: the prompt (``comments.py``).
+BLOCKED_COMMENT_PREFIX = "The run stopped without doing the work"
+#: The same comment as daemons before universal-runner wrote it, only for
+#: ``executor_blocked``: such comments stay on tasks and are left out as well.
+LEGACY_BLOCKED_COMMENT_PREFIX = "The executor stopped without doing the work"
+BLOCKED_COMMENT_PREFIXES = (BLOCKED_COMMENT_PREFIX, LEGACY_BLOCKED_COMMENT_PREFIX)
 
 
 def _reason(value: Any) -> str:
@@ -98,3 +103,68 @@ async def record_blocked_file(client: ControlPlaneClient, run_id: str, path: Pat
         return False
     await client.create_checkpoint(run_id, kind=CHECKPOINT_KIND, data={"reason": _reason(text)})
     return True
+
+
+async def settle_blocked(
+    client: ControlPlaneClient,
+    task: dict[str, Any],
+    run: dict[str, Any],
+    claim: dict[str, Any],
+    reason: str,
+    *,
+    failure_reason: str = FAILURE_REASON,
+) -> None:
+    """Hand a task whose run stopped without doing the work to a person.
+
+    The run fails ``failure_reason`` and the task goes, under our claim, to
+    the first ``blocked`` status its lifecycle allows from where it is — the
+    verification stage's way to hand a task to a person (CP-ADR-0067 §5) —
+    with the reason in a comment; then the claim is released, which leaves a
+    status the claim did not set alone. Each step is best-effort after the
+    run is failed: what could not be done is logged, and a task its lifecycle
+    cannot block goes back to the queue as after any failure.
+    """
+    run_id, task_id = str(run["id"]), str(task["id"])
+    logger.warning("%s stopped (%s): %s", task["publicId"], failure_reason, reason)
+    await client.fail_run(run_id, failure_reason=failure_reason, output={"reason": reason})
+    status: str | None = None
+    try:
+        targets = (await client.get_task_transitions(task_id)).get("targets") or []
+        status = next(
+            (
+                str(t["status"])
+                for t in targets
+                if t.get("systemStatusCategory") == BLOCKED_CATEGORY and t.get("route") == "update"
+            ),
+            None,
+        )
+        if status is None:
+            logger.warning("the lifecycle of %s has no blocked status", task["publicId"])
+        else:
+            fresh = await client.get_task(task_id)
+            await client.update_task(
+                task_id,
+                expected_version=int(fresh["version"]),
+                status=status,
+                claim_id=str(claim["id"]),
+                fencing_token=int(claim["fencingToken"]),
+            )
+    except ControlPlaneError as exc:
+        logger.warning("could not block %s: %s", task["publicId"], exc.code)
+        status = None
+    with contextlib.suppress(ControlPlaneError):
+        await client.add_task_comment(
+            task_id,
+            body=(
+                f"{BLOCKED_COMMENT_PREFIX} ({failure_reason}): {reason}\n"
+                + (
+                    f"The task waits for a person in {status!r}; return it to work "
+                    "to have it taken again."
+                    if status is not None
+                    else "The task could not be moved to a blocked status."
+                )
+            ),
+            run_id=run_id,
+        )
+    with contextlib.suppress(ControlPlaneError):
+        await client.release_claim(str(claim["id"]), reason=failure_reason)

@@ -1,0 +1,10 @@
+subject: rule
+rule: invoice-disputed
+name: претензия к внутреннему счёту не разбирается
+given:
+  observation:
+    kind: invoice.disputed
+    content: двойной счёт
+    data: {invoice: INV-9, supplier: internal}
+steps:
+  - expect: {result: not_matched, ensureWork: [], invokeSkill: []}
